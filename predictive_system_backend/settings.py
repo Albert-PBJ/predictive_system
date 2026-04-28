@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "rest_framework",
     "apps.products",
+    "apps.competitor_market_data",
 ]
 
 MIDDLEWARE = [
