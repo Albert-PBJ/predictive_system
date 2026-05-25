@@ -1,6 +1,8 @@
 from rest_framework import viewsets
+
+from apps.core.models import Product
+
 from .serializer import ProductSerializer
-from .models import Product
 
 
 # Create your views here.

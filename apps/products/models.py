@@ -1,12 +1,1 @@
-from django.db import models
-
-# Create your models here.
-
-
-class Product(models.Model):
-    class Meta:
-        db_table = "products"
-
-    name = models.CharField(max_length=100)
-    price = models.DecimalField(max_digits=10, decimal_places=2)
-    stock = models.IntegerField()
+# Product model moved to apps.core. See apps/core/models.py.

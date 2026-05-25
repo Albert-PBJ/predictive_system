@@ -48,6 +48,11 @@ INSTALLED_APPS = [
     "rest_framework",
     "apps.products",
     "apps.competitor_market_data",
+    "apps.core",
+    "apps.sales",
+    "apps.inventory",
+    "apps.benchmarking",
+    "apps.analytics",
 ]
 
 MIDDLEWARE = [

@@ -6,7 +6,7 @@ from typing import Optional
 
 from apify_client import ApifyClient
 
-from apps.competitor_market_data.models import CompetitorMarketData
+from apps.benchmarking.models import CompetitorMarketData
 
 logger = logging.getLogger(__name__)
 
