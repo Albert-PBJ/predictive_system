@@ -47,7 +47,17 @@ This API has all of its comments as well as API responses in Spanish. Functions,
 
 ### Scraper Flow
 
-`apps/competitor_market_data/scrapers/` holds the Apify integration. Scrapers call Apify actors (`apify/instagram-scraper`, `apify/facebook-marketplace-scraper`), extract structured fields via regex (price, currency, lead time, promotions, stock status), and bulk-create `CompetitorMarketData` records. The full Apify JSON is preserved in `raw_metadata` for debugging and ML training.
+`apps/competitor_market_data/scrapers/` holds the Apify integration. Three scrapers are available:
+
+| Scraper | Actor | Source tag | Notes |
+|---------|-------|-----------|-------|
+| `instagram_scraper.py` | `apify/instagram-scraper` | `IG` | Extracts price/lead time/promotions from post captions via regex; `competitor` FK is always null |
+| `facebook_marketplace_scraper.py` | `apify/facebook-marketplace-scraper` | `FB` | Extracts price/availability from listing fields via regex; `competitor` FK is always null |
+| `website_scraper.py` | `apify/ai-web-scraper` | `WEB` | AI prompt extracts `title`, `price`, `promotion`; **resolves `Competitor` FK via `get_or_create`** keyed on name or URL domain |
+
+All three bulk-create `CompetitorMarketData` records and preserve the full Apify JSON in `raw_metadata`.
+
+The website scraper's `_flatten_dataset_items()` normalises the AI actor's output, which can arrive as a flat list of product dicts, a single wrapper dict with a nested list (`items`/`data`/`results`/`products`/`extractedData`), or a dataset item that is itself a list.
 
 REST endpoints:
 - `POST /scrapers/instagram/start` — accepts `{"urls": [...], "limit": N}`
@@ -73,6 +83,10 @@ REST endpoints:
 **Inventory is append-only:** Never mutate stock directly — always create an `InventoryMovement` with type `ENT/SAL/AJU/DEV`. `Product.stock` is the current value; movements are the audit trail.
 
 **`apps/products` vs `apps/core`:** `apps/core` owns the `Product` model. `apps/products` is a thin REST API layer — serializer and viewset only. New model fields go in `apps/core/models.py`.
+
+## Logging
+
+`settings.py` includes a `LOGGING` config that routes everything under `apps.*` to the console at INFO level. The root logger stays at WARNING to suppress Django/DRF noise. Scraper functions use `logger = logging.getLogger(__name__)` and emit INFO on dataset receipt/save counts and WARNING/ERROR on structural anomalies or failures.
 
 ## Environment
 
