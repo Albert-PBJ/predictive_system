@@ -24,9 +24,12 @@ python manage.py makemigrations
 # Run scrapers via CLI
 python manage.py scrape_instagram <url1> <url2> --limit 50
 python manage.py scrape_facebook_marketplace <url1> <url2> --limit 50
+python manage.py scrape_website <url1> <url2> --limit 50 --competitor-name "Nombre Competidor"
 ```
 
 There are no tests yet — placeholder `tests.py` files exist in some apps but are unpopulated.
+
+This API has all of its comments as well as API responses in Spanish. Functions, variables and code practices can remain in English.
 
 ## Architecture
 
@@ -46,14 +49,17 @@ There are no tests yet — placeholder `tests.py` files exist in some apps but a
 
 `apps/competitor_market_data/scrapers/` holds the Apify integration. Scrapers call Apify actors (`apify/instagram-scraper`, `apify/facebook-marketplace-scraper`), extract structured fields via regex (price, currency, lead time, promotions, stock status), and bulk-create `CompetitorMarketData` records. The full Apify JSON is preserved in `raw_metadata` for debugging and ML training.
 
-REST endpoints: `POST /scrapers/instagram/start` and `POST /scrapers/facebook/start` — both accept `{"urls": [...], "limit": N}`.
+REST endpoints:
+- `POST /scrapers/instagram/start` — accepts `{"urls": [...], "limit": N}`
+- `POST /scrapers/facebook/start` — accepts `{"urls": [...], "limit": N}`
+- `POST /scrapers/website/start` — accepts `{"urls": [...], "limit": N, "competitor_name": "..."}` (uses `apify/ai-web-scraper`; resolves `Competitor` FK via get_or_create)
 
 ### URL Structure
 
 ```
 /admin/          → Django admin
 /api/products/   → ProductViewset (DRF DefaultRouter)
-/scrapers/       → Instagram & Facebook scraper endpoints
+/scrapers/       → Instagram, Facebook & website scraper endpoints
 ```
 
 ### Key Design Decisions

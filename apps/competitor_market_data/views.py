@@ -5,6 +5,7 @@ from rest_framework.views import APIView
 
 from apps.competitor_market_data.scrapers.facebook_marketplace_scraper import scrape_facebook_marketplace
 from apps.competitor_market_data.scrapers.instagram_scraper import scrape_instagram_profiles
+from apps.competitor_market_data.scrapers.website_scraper import scrape_website
 
 
 class InstagramScraperStartView(APIView):
@@ -80,6 +81,58 @@ class FacebookMarketplaceScraperStartView(APIView):
             records = scrape_facebook_marketplace(urls=urls, results_limit=limit)
         except ValueError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response(
+            {"saved": len(records)},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class WebsiteScraperStartView(APIView):
+    """
+    POST /scrapers/website/start
+
+    Inicia el AI web scraper de Apify para páginas web de competidores y almacena
+    los productos extraídos en CompetitorMarketData, resolviendo el FK a Competitor.
+
+    Cuerpo esperado:
+    {
+        "urls": ["https://competidor.com/productos/", ...],
+        "limit": 50,              (opcional, default 50)
+        "competitor_name": "..."  (opcional; si se omite, se deriva del dominio)
+    }
+    """
+
+    def post(self, request: Request) -> Response:
+        urls = request.data.get("urls")
+        if not urls or not isinstance(urls, list):
+            return Response(
+                {"error": "El campo 'urls' es requerido y debe ser una lista."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        limit = request.data.get("limit", 50)
+        if not isinstance(limit, int) or limit < 1:
+            return Response(
+                {"error": "El campo 'limit' debe ser un entero positivo."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        competitor_name = request.data.get("competitor_name") or None
+
+        try:
+            records = scrape_website(
+                urls=urls,
+                results_limit=limit,
+                competitor_name=competitor_name,
+            )
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as exc:
+            return Response(
+                {"error": f"Error inesperado: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         return Response(
             {"saved": len(records)},
