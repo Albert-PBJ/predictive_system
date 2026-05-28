@@ -37,6 +37,7 @@ This API has all of its comments as well as API responses in Spanish. Functions,
 
 | App | Purpose |
 |-----|---------|
+| `apps/accounts` | Auth & RBAC: UserProfile (role), JWT login/logout/refresh/me, role-based permissions |
 | `apps/core` | Master data: Product, Category, Customer, Seller, ExchangeRate, ProductPriceHistory |
 | `apps/sales` | Transactions: Sale, SaleItem, Quote, QuoteItem |
 | `apps/inventory` | Audit trail: InventoryMovement (every stock change logged) |
@@ -68,6 +69,7 @@ REST endpoints:
 
 ```
 /admin/          → Django admin
+/api/auth/       → JWT auth: login, refresh, logout, me (apps/accounts)
 /api/products/   → ProductViewset (DRF DefaultRouter)
 /scrapers/       → Instagram, Facebook & website scraper endpoints
 ```
@@ -83,6 +85,20 @@ REST endpoints:
 **Inventory is append-only:** Never mutate stock directly — always create an `InventoryMovement` with type `ENT/SAL/AJU/DEV`. `Product.stock` is the current value; movements are the audit trail.
 
 **`apps/products` vs `apps/core`:** `apps/core` owns the `Product` model. `apps/products` is a thin REST API layer — serializer and viewset only. New model fields go in `apps/core/models.py`.
+
+## Authentication & Roles
+
+JWT auth via `djangorestframework-simplejwt`. DRF defaults to `JWTAuthentication` + `IsAuthenticated`, so **every endpoint requires a valid token** unless a view opts out with `AllowAny` (only `login` does).
+
+**Roles & profile:** `apps/accounts/models.py` defines `Role` (ADMIN, MANAGER, SELLER, VIEWER) on a `UserProfile` (OneToOne to `auth.User`). **`UserProfile` is the source of truth for user data** — it holds `role`, `first_name`, `last_name`, `email`, `phone`; `auth_user` is kept for authentication only (username/password/permissions/dates). Django's `User` still physically has empty `first_name`/`last_name`/`email` columns (they can't be dropped without a custom user model), but they are intentionally unused — read/write personal data via the profile. A `post_save` signal (`signals.py`) auto-creates the profile (superusers → ADMIN, else VIEWER) and copies any personal data Django collected at creation (e.g. `createsuperuser`) into it. The Django admin hides the personal-info fieldset on the User form and edits those fields through the `UserProfile` inline. The role is embedded as a JWT claim and returned in the login response; `UserSerializer` sources name/email/phone from the profile.
+
+**Permission classes** (`apps/accounts/permissions.py`): `IsAdmin`, `IsManager`, `IsSeller`, `IsViewer` (cumulative; superusers always pass). Apply per-viewset with `permission_classes`.
+
+**Endpoints** (`/api/auth/`): `login`, `refresh`, `logout` (blacklists refresh token), `me`. Public sign-up is intentionally **not** implemented — only admins create users.
+
+**Security config** (`settings.py`): 15-min access tokens, 7-day refresh with rotation + blacklist (`token_blacklist` app), `login` throttle at 10/min, CORS restricted to the Vite origin with credentials, and production-gated (`if not DEBUG`) SSL redirect / HSTS / secure cookies / `CSRF_TRUSTED_ORIGINS`. Passwords use Django's default PBKDF2 hasher; minimum length raised to 10.
+
+To create the first admin: `python manage.py createsuperuser` (gets ADMIN role automatically).
 
 ## Logging
 
@@ -101,3 +117,5 @@ DB_HOST=127.0.0.1
 DB_PORT=5432
 APIFY_API_KEY=...
 ```
+
+Optional (have safe dev defaults): `DJANGO_DEBUG` (default `True`), `DJANGO_ALLOWED_HOSTS` (csv, default `127.0.0.1,localhost`), `CORS_ALLOWED_ORIGINS` (csv, default `http://localhost:5173,http://127.0.0.1:5173`). For production set `DJANGO_DEBUG=False`, a real `DJANGO_SECRET_KEY`, and the correct hosts/origins.

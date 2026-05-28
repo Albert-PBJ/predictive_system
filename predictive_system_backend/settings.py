@@ -30,9 +30,13 @@ SECRET_KEY = os.environ.get(
 )
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get("DJANGO_DEBUG", "True").lower() in ("1", "true", "yes")
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",")
+    if h.strip()
+]
 
 
 # Application definition
@@ -46,6 +50,8 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "corsheaders",
     "rest_framework",
+    "rest_framework_simplejwt.token_blacklist",
+    "apps.accounts",
     "apps.products",
     "apps.competitor_market_data",
     "apps.core",
@@ -110,6 +116,7 @@ AUTH_PASSWORD_VALIDATORS = [
     },
     {
         "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": 10},
     },
     {
         "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
@@ -137,9 +144,73 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 
-# cors authorization urls
 
-CORS_ALLOWED_ORIGINS = ["http://127.0.0.1"]
+# Django REST Framework + JWT
+# https://www.django-rest-framework.org/ | https://django-rest-framework-simplejwt.readthedocs.io/
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": (
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ),
+    # Por defecto, todo endpoint exige autenticación. Cada vista lo relaja
+    # explícitamente con AllowAny cuando corresponde (ej. login).
+    "DEFAULT_PERMISSION_CLASSES": (
+        "rest_framework.permissions.IsAuthenticated",
+    ),
+    "DEFAULT_THROTTLE_CLASSES": (
+        "rest_framework.throttling.ScopedRateThrottle",
+    ),
+    # Limita los intentos de login para frenar ataques de fuerza bruta.
+    "DEFAULT_THROTTLE_RATES": {
+        "login": "10/min",
+    },
+}
+
+from datetime import timedelta  # noqa: E402
+
+SIMPLE_JWT = {
+    # Tokens de acceso de vida corta para reducir el impacto de un robo de token.
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    # Rotación + blacklist: cada refresh emite un token nuevo e invalida el anterior.
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "UPDATE_LAST_LOGIN": True,
+    "ALGORITHM": "HS256",
+    "SIGNING_KEY": SECRET_KEY,
+    "AUTH_HEADER_TYPES": ("Bearer",),
+}
+
+
+# CORS — solo el frontend (Vite) puede consumir la API desde el navegador.
+
+CORS_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if o.strip()
+]
+CORS_ALLOW_CREDENTIALS = True
+
+
+# Endurecimiento de seguridad. En producción (DEBUG=False) se fuerza HTTPS,
+# cookies seguras y cabeceras de protección. En desarrollo se relaja para
+# permitir http://localhost.
+
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = "DENY"
+
+if not DEBUG:
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = 31536000  # 1 año
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS
 
 LOGGING = {
     "version": 1,
