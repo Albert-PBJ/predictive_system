@@ -1,16 +1,13 @@
 import logging
-import os
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-from apify_client import ApifyClient
-
 from apps.benchmarking.models import CompetitorMarketData
+from apps.competitor_market_data.scrapers import get_client
 
 logger = logging.getLogger(__name__)
 
-APIFY_API_KEY = os.environ.get("APIFY_API_KEY", "")
 FACEBOOK_MARKETPLACE_ACTOR_ID = "apify/facebook-marketplace-scraper"
 
 # ── Extracción de campos ──────────────────────────────────────────────────────
@@ -180,38 +177,23 @@ def _map_listing_to_instance(listing: dict) -> CompetitorMarketData:
 # ── Función pública ───────────────────────────────────────────────────────────
 
 
-def scrape_facebook_marketplace(
-    urls: list[str],
-    results_limit: int = 5,
-) -> list[CompetitorMarketData]:
-    """
-    Ejecuta el scraper de Facebook Marketplace en Apify para las URLs dadas,
-    mapea cada listing a un registro de CompetitorMarketData, los inserta en
-    masa y los retorna.
-    """
-    if not APIFY_API_KEY or APIFY_API_KEY == "your_apify_api_key_here":
-        raise ValueError(
-            "APIFY_API_KEY no está configurado. Reemplaza el placeholder en el archivo .env."
-        )
-
-    client = ApifyClient(APIFY_API_KEY)
-
+def start_facebook_run(urls: list[str], results_limit: int = 50) -> dict:
+    """Inicia (sin bloquear) el run del scraper de Facebook Marketplace y lo retorna."""
+    client = get_client()
     actor_input = {
         "startUrls": [{"url": u} for u in urls],
         "resultsLimit": results_limit,
         "includeListingDetails": True,
     }
-
     logger.info(
-        "Iniciando scraper de Facebook Marketplace en Apify para %d URL(s)…", len(urls)
+        "Iniciando run de Facebook Marketplace en Apify para %d URL(s)…", len(urls)
     )
-    run = client.actor(FACEBOOK_MARKETPLACE_ACTOR_ID).call(run_input=actor_input)
+    return client.actor(FACEBOOK_MARKETPLACE_ACTOR_ID).start(run_input=actor_input)
 
-    dataset_id = run.get("defaultDatasetId")
-    if not dataset_id:
-        logger.error("El run de Apify no retornó un dataset ID.")
-        return []
 
+def finalize_facebook(dataset_id: str) -> list[CompetitorMarketData]:
+    """Lee el dataset de un run finalizado, mapea cada listing y guarda los registros."""
+    client = get_client()
     items = list(client.dataset(dataset_id).iterate_items())
     logger.info("Se obtuvieron %d listings del dataset de Apify.", len(items))
 
@@ -219,3 +201,18 @@ def scrape_facebook_marketplace(
     created = CompetitorMarketData.objects.bulk_create(instances)
     logger.info("Se guardaron %d registros en CompetitorMarketData.", len(created))
     return created
+
+
+def scrape_facebook_marketplace(
+    urls: list[str],
+    results_limit: int = 5,
+) -> list[CompetitorMarketData]:
+    """Versión bloqueante (start + esperar + finalizar) usada por el comando CLI."""
+    run = start_facebook_run(urls=urls, results_limit=results_limit)
+    dataset_id = run.get("defaultDatasetId")
+    if not dataset_id:
+        logger.error("El run de Apify no retornó un dataset ID.")
+        return []
+
+    get_client().run(run["id"]).wait_for_finish()
+    return finalize_facebook(dataset_id)

@@ -60,10 +60,17 @@ All three bulk-create `CompetitorMarketData` records and preserve the full Apify
 
 The website scraper's `_flatten_dataset_items()` normalises the AI actor's output, which can arrive as a flat list of product dicts, a single wrapper dict with a nested list (`items`/`data`/`results`/`products`/`extractedData`), or a dataset item that is itself a list.
 
-REST endpoints:
-- `POST /scrapers/instagram/start` — accepts `{"urls": [...], "limit": N}`
-- `POST /scrapers/facebook/start` — accepts `{"urls": [...], "limit": N}`
-- `POST /scrapers/website/start` — accepts `{"urls": [...], "limit": N, "competitor_name": "..."}` (uses `apify/ai-web-scraper`; resolves `Competitor` FK via get_or_create)
+**Each scraper module exposes three functions** so the work can be driven non-blocking from the frontend (poll-based progress):
+- `start_<src>_run(urls, results_limit, …)` — kicks off the Apify run via `.start()` (non-blocking) and returns the run dict (`id`, `defaultDatasetId`).
+- `finalize_<src>(dataset_id, …)` — reads the finished dataset, maps and bulk-creates the records (website also takes `urls` + `competitor_name` to resolve the `Competitor` FK).
+- `scrape_<src>(…)` — the original **blocking** wrapper (start → `wait_for_finish()` → finalize), kept for the management commands / CLI.
+
+Shared helpers live in `scrapers/__init__.py`: `get_client()` (validates `APIFY_API_KEY`) and `get_run_progress(run_id, dataset_id)` (read-only run status + dataset `itemCount`).
+
+REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by `<source>` ∈ `instagram|facebook|website`). **All require role `ADMIN`** (`permission_classes = [IsAdmin]`):
+- `POST /scrapers/<source>/start` — `{"urls": [...], "limit": N, "competitor_name": "…"}` → `{run_id, dataset_id, status}` (202).
+- `GET  /scrapers/<source>/status?run_id=…&dataset_id=…` → `{status, items_scraped, is_terminal, succeeded}` (polled by the frontend).
+- `POST /scrapers/<source>/finalize` — `{"dataset_id": "…", "urls": [...], "competitor_name": "…"}` → `{saved, results: [...]}` (serialized records for display).
 
 ### URL Structure
 
@@ -71,7 +78,7 @@ REST endpoints:
 /admin/          → Django admin
 /api/auth/       → JWT auth: login, refresh, logout, me (apps/accounts)
 /api/products/   → ProductViewset (DRF DefaultRouter)
-/scrapers/       → Instagram, Facebook & website scraper endpoints
+/scrapers/       → <source>/start, <source>/status, <source>/finalize (ADMIN only)
 ```
 
 ### Key Design Decisions

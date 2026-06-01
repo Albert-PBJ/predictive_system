@@ -1,17 +1,14 @@
 import logging
-import os
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 from urllib.parse import urlparse
 
-from apify_client import ApifyClient
-
 from apps.benchmarking.models import Competitor, CompetitorMarketData
+from apps.competitor_market_data.scrapers import get_client
 
 logger = logging.getLogger(__name__)
 
-APIFY_API_KEY = os.environ.get("APIFY_API_KEY", "")
 WEBSITE_ACTOR_ID = "apify/ai-web-scraper"
 
 AI_PROMPT = (
@@ -206,44 +203,35 @@ def _map_item_to_instance(
 # ── Función pública ───────────────────────────────────────────────────────────
 
 
-def scrape_website(
-    urls: list[str],
-    results_limit: int = 50,
-    competitor_name: Optional[str] = None,
-) -> list[CompetitorMarketData]:
-    """
-    Ejecuta el AI web scraper de Apify para las URLs dadas, mapea cada producto
-    extraído a un registro de CompetitorMarketData con el FK de Competitor resuelto
-    (get_or_create por nombre), e inserta los registros en masa.
-
-    A diferencia de los scrapers de Instagram y Facebook, este resuelve el FK
-    a Competitor en lugar de dejar competitor=None.
-    """
-    if not APIFY_API_KEY or APIFY_API_KEY == "your_apify_api_key_here":
-        raise ValueError(
-            "APIFY_API_KEY no está configurado. Reemplaza el placeholder en el archivo .env."
-        )
-
-    client = ApifyClient(APIFY_API_KEY)
-
+def start_website_run(urls: list[str], results_limit: int = 50) -> dict:
+    """Inicia (sin bloquear) el run del AI web scraper en Apify y lo retorna."""
+    client = get_client()
     actor_input = {
         "startUrls": [{"url": url} for url in urls],
         "prompt": AI_PROMPT,
         "maxCrawlPages": results_limit,
     }
-
-    logger.info("Iniciando AI web scraper en Apify para %d URL(s)…", len(urls))
-
+    logger.info("Iniciando run del AI web scraper en Apify para %d URL(s)…", len(urls))
     try:
-        run = client.actor(WEBSITE_ACTOR_ID).call(run_input=actor_input)
+        return client.actor(WEBSITE_ACTOR_ID).start(run_input=actor_input)
     except Exception as exc:
-        logger.error("Error al llamar al actor de Apify: %s", exc, exc_info=True)
+        logger.error("Error al iniciar el actor de Apify: %s", exc, exc_info=True)
         raise ValueError(f"Apify actor falló: {exc}") from exc
 
-    dataset_id = run.get("defaultDatasetId")
-    if not dataset_id:
-        logger.error("El run de Apify no retornó un dataset ID. Run info: %s", run)
-        return []
+
+def finalize_website(
+    dataset_id: str,
+    urls: list[str],
+    competitor_name: Optional[str] = None,
+) -> list[CompetitorMarketData]:
+    """
+    Lee el dataset de un run finalizado, normaliza la estructura del AI scraper,
+    resuelve el FK a Competitor (get_or_create por nombre) y guarda los registros.
+
+    A diferencia de Instagram y Facebook, este scraper resuelve el FK a Competitor
+    en lugar de dejar competitor=None.
+    """
+    client = get_client()
 
     try:
         raw_items = list(client.dataset(dataset_id).iterate_items())
@@ -312,3 +300,19 @@ def scrape_website(
 
     logger.info("Se guardaron %d registros en CompetitorMarketData.", len(created))
     return created
+
+
+def scrape_website(
+    urls: list[str],
+    results_limit: int = 50,
+    competitor_name: Optional[str] = None,
+) -> list[CompetitorMarketData]:
+    """Versión bloqueante (start + esperar + finalizar) usada por el comando CLI."""
+    run = start_website_run(urls=urls, results_limit=results_limit)
+    dataset_id = run.get("defaultDatasetId")
+    if not dataset_id:
+        logger.error("El run de Apify no retornó un dataset ID. Run info: %s", run)
+        return []
+
+    get_client().run(run["id"]).wait_for_finish()
+    return finalize_website(dataset_id, urls=urls, competitor_name=competitor_name)
