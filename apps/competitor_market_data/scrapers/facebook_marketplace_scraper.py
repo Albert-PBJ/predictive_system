@@ -5,7 +5,7 @@ from typing import Optional
 
 from apps.benchmarking.models import Competitor, CompetitorMarketData
 from apps.competitor_market_data.enrichment import deepseek
-from apps.competitor_market_data.scrapers import get_client
+from apps.competitor_market_data.scrapers import classify_category, get_client
 
 logger = logging.getLogger(__name__)
 
@@ -113,30 +113,6 @@ def _extract_promotions(description: str) -> Optional[str]:
     return None
 
 
-# Vocabulario controlado del dominio (muebles de oficina). Derivamos una categoría legible desde el
-# título + descripción. El orden importa: gana la primera categoría que coincida.
-_CATEGORY_KEYWORDS = {
-    "Sillas": ["silla", "sillas", "butaca", "taburete", "banqueta", "sillón", "sillon", "chair"],
-    "Escritorios": ["escritorio", "escritorios", "desk"],
-    "Mesas": ["mesa", "mesas", "table"],
-    "Archivadores": ["archivador", "archivadores", "archivo", "gaveta", "gavetero", "filing"],
-    "Estantes y Libreros": ["estante", "estantería", "estanteria", "repisa", "librero", "shelf", "bookcase"],
-    "Sofás y Recepción": ["sofá", "sofa", "poltrona", "couch", "recepción", "recepcion"],
-    "Gabinetes y Armarios": ["gabinete", "gabinetes", "armario", "closet", "cabinet", "credenza", "locker"],
-}
-
-
-def _classify_category(text: str) -> Optional[str]:
-    """Clasifica el anuncio en una categoría de mobiliario por palabras clave."""
-    text = (text or "").lower()
-    if not text:
-        return None
-    for category, keywords in _CATEGORY_KEYWORDS.items():
-        if any(kw in text for kw in keywords):
-            return category
-    return None
-
-
 def _is_in_stock(listing: dict) -> bool:
     """Disponibilidad del anuncio.
 
@@ -177,7 +153,7 @@ def _map_listing_to_instance(listing: dict) -> CompetitorMarketData:
         source=CompetitorMarketData.SourceChoices.FACEBOOK,
         url=listing.get("itemUrl") or listing.get("url"),
         product_name=title[:255] or None,
-        category=_classify_category(f"{title} {description}"),
+        category=classify_category(f"{title} {description}"),
         price=price,
         currency=currency or "USD",
         lead_time_days=_extract_lead_time(description),

@@ -20,6 +20,7 @@ Variables de entorno (en el `.env` del backend):
 import json
 import logging
 import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,186 @@ def enrich_listing(
     except Exception as exc:
         logger.warning("Falló la identificación de competidor vía DeepSeek: %s", exc)
         return dict(_EMPTY_RESULT)
+
+
+# ── Enriquecimiento de posts de Instagram ─────────────────────────────────────
+#
+# Instagram no está pensado para vender productos: el post es texto libre (caption)
+# y casi todo (producto, precio, promociones) hay que inferirlo. Por eso el LLM
+# hace MÁS trabajo aquí que en Facebook: además de identificar al competidor y las
+# promociones, extrae un nombre de producto limpio, la categoría y —de respaldo—
+# el precio si aparece explícito.
+
+_IG_EMPTY_RESULT = {
+    "competitor_name": None,
+    "matched_competitor_id": None,
+    "confidence": 0.0,
+    "promotions": None,
+    "product_name": None,
+    "category": None,
+    "price": None,
+    "currency": None,
+}
+
+_IG_SYSTEM_PROMPT = (
+    "Eres un asistente que analiza publicaciones de Instagram de tiendas de muebles "
+    "de oficina y hogar en Venezuela. Las publicaciones son texto libre (caption) y "
+    "suelen mezclar producto, precio, promociones, ubicación y datos de contacto, a "
+    "menudo con emojis. Tu tarea es extraer datos estructurados del anuncio e "
+    "identificar a la EMPRESA VENDEDORA (competidor). Respondes únicamente con un "
+    "objeto JSON. Regla crítica: NO inventes datos; si algo no está explícito en el "
+    "texto, usa null."
+)
+
+
+def _build_instagram_prompt(
+    caption: str,
+    owner_username: str,
+    owner_full_name: str,
+    hashtags: list[str],
+    location: str,
+    category_options: list[str],
+    known: list[dict],
+) -> str:
+    """Arma el prompt para un post de Instagram. Incluye la palabra 'json' (modo JSON)."""
+    known_block = "\n".join(f"- id={c['id']}: {c['name']}" for c in known) or "(ninguno)"
+    caption = (caption or "")[:_MAX_DESCRIPTION_CHARS]
+    hashtag_block = ", ".join(hashtags or []) or "(ninguno)"
+    category_block = ", ".join(category_options) or "(ninguna)"
+    return (
+        "Competidores ya conocidos (haz match con uno de estos si corresponde):\n"
+        f"{known_block}\n\n"
+        "Publicación de Instagram a analizar:\n"
+        f"- Usuario (handle): @{owner_username or '(desconocido)'}\n"
+        f"- Nombre del perfil: {owner_full_name or '(sin nombre)'}\n"
+        f"- Ubicación: {location or '(desconocida)'}\n"
+        f"- Hashtags: {hashtag_block}\n"
+        f"- Caption: {caption or '(sin texto)'}\n\n"
+        "Devuelve un JSON con EXACTAMENTE estas claves:\n"
+        '{"product_name": <string|null>, "category": <string|null>, '
+        '"competitor_name": <string|null>, "matched_competitor_id": <int|null>, '
+        '"confidence": <number 0..1>, "promotions": <string|null>, '
+        '"price": <number|null>, "currency": <"USD"|"VES"|null>}\n'
+        "- product_name: el producto principal del anuncio, en español, breve y limpio "
+        "(sin emojis ni hashtags). Si el caption es solo un eslogan o no menciona un "
+        "producto concreto, usa null.\n"
+        f"- category: clasifícalo en UNA de estas categorías EXACTAS: {category_block}. "
+        "Si ninguna aplica, usa null.\n"
+        "- Competidor: el dueño del perfil suele ser la empresa vendedora. Si coincide "
+        "con un competidor conocido de la lista, pon su id en matched_competitor_id y "
+        "su nombre exacto en competitor_name. Si es un negocio que no está en la lista, "
+        "pon matched_competitor_id=null y un nombre normalizado y legible del negocio "
+        "en competitor_name (puedes basarte en el nombre del perfil o el handle).\n"
+        "- promotions: resume en español, separadas por comas, las promociones, "
+        "descuentos y beneficios explícitos (p. ej. 'envío nacional', 'delivery', "
+        "'garantía', '20% de descuento'). Si no hay, usa null. Máximo 200 caracteres.\n"
+        "- price/currency: SOLO si el precio aparece explícito en el texto. La moneda es "
+        "'USD' para dólares ($, USD) o 'VES' para bolívares (Bs, VES). Si no hay precio "
+        "explícito, price=null y currency=null. No inventes precios."
+    )
+
+
+def _sanitize_instagram(data: dict, category_options: list[str]) -> dict:
+    """Valida y normaliza la respuesta del modelo para un post de Instagram."""
+    base = _sanitize(data)  # competitor_name, matched_competitor_id, confidence, promotions
+
+    product_name = data.get("product_name")
+    product_name = product_name.strip()[:255] or None if isinstance(product_name, str) else None
+
+    category = data.get("category")
+    if isinstance(category, str):
+        category = category.strip()
+        category = category if category in category_options else None
+    else:
+        category = None
+
+    price = data.get("price")
+    if isinstance(price, bool):
+        price = None
+    elif isinstance(price, (int, float)):
+        price = float(price) if price > 0 else None
+    elif isinstance(price, str):
+        m = re.search(r"\d[\d.,]*", price)
+        price = None
+        if m:
+            try:
+                parsed = float(m.group(0).replace(",", ""))
+                price = parsed if parsed > 0 else None
+            except ValueError:
+                price = None
+    else:
+        price = None
+
+    currency = data.get("currency")
+    currency = currency.strip().upper() if isinstance(currency, str) else None
+    if currency not in ("USD", "VES"):
+        currency = None
+
+    return {
+        **base,
+        "product_name": product_name,
+        "category": category,
+        "price": price,
+        "currency": currency,
+    }
+
+
+def enrich_instagram_post(
+    caption: str,
+    owner_username: str,
+    owner_full_name: str,
+    hashtags: list[str],
+    location: str,
+    category_options: list[str],
+    known_competitors: list[dict],
+) -> dict:
+    """Analiza un post de Instagram con DeepSeek: extrae producto, categoría,
+    competidor, promociones y (de respaldo) precio.
+
+    Retorna un dict con las claves de ``_IG_EMPTY_RESULT``. Ante cualquier problema
+    (deshabilitado, sin SDK, error de red, JSON inválido) retorna un resultado vacío
+    sin lanzar excepción, igual que :func:`enrich_listing`.
+    """
+    if not is_enabled():
+        return dict(_IG_EMPTY_RESULT)
+
+    try:
+        client = _get_client()
+    except ImportError:
+        logger.warning(
+            "El paquete 'openai' no está instalado; se omite el enriquecimiento LLM. "
+            "Instálalo con: pip install openai"
+        )
+        return dict(_IG_EMPTY_RESULT)
+    except Exception as exc:
+        logger.warning("No se pudo crear el cliente de DeepSeek: %s", exc)
+        return dict(_IG_EMPTY_RESULT)
+
+    known = (known_competitors or [])[:_MAX_KNOWN_COMPETITORS]
+
+    try:
+        response = client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[
+                {"role": "system", "content": _IG_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": _build_instagram_prompt(
+                        caption, owner_username, owner_full_name, hashtags,
+                        location, category_options, known,
+                    ),
+                },
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=350,
+            stream=False,
+        )
+        content = response.choices[0].message.content or "{}"
+        return _sanitize_instagram(json.loads(content), category_options)
+    except Exception as exc:
+        logger.warning("Falló el enriquecimiento de post de Instagram vía DeepSeek: %s", exc)
+        return dict(_IG_EMPTY_RESULT)
 
 
 # ── Diagnóstico de conexión (para el endpoint de prueba) ──────────────────────
