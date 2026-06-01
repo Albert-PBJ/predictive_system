@@ -53,10 +53,12 @@ This API has all of its comments as well as API responses in Spanish. Functions,
 | Scraper | Actor | Source tag | Notes |
 |---------|-------|-----------|-------|
 | `instagram_scraper.py` | `apify/instagram-scraper` | `IG` | Extracts price/lead time/promotions from post captions via regex; `competitor` FK is always null |
-| `facebook_marketplace_scraper.py` | `apify/facebook-marketplace-scraper` | `FB` | Extracts price/availability from listing fields via regex; `competitor` FK is always null |
+| `facebook_marketplace_scraper.py` | `apify/facebook-marketplace-scraper` | `FB` | Maps structured listing fields (`listingPrice`, `listingTitle`, `itemUrl`, `isSold`/`isLive`); keyword-classifies `category`; **optionally resolves `Competitor` FK via an LLM** (see below). FK is null when the LLM is off or no seller is identifiable |
 | `website_scraper.py` | `apify/ai-web-scraper` | `WEB` | AI prompt extracts `title`, `price`, `promotion`; **resolves `Competitor` FK via `get_or_create`** keyed on name or URL domain |
 
 All three bulk-create `CompetitorMarketData` records and preserve the full Apify JSON in `raw_metadata`.
+
+**Optional LLM listing enrichment (Facebook):** `enrichment/deepseek.py` makes **one call per listing** that both (a) identifies/normalizes the seller business and links it to a `Competitor` (matching an existing one or creating a new one above a confidence threshold), and (b) extracts promotions/additional benefits from the free-text description (overriding the keyword-based `promotions` baseline when it finds something). It is **off by default** and fully optional — gated by `USE_LLM_ENRICHMENT`, the `DEEPSEEK_API_KEY`, and the `openai` package being installed. If any is missing or the API call fails, the deterministic mapping still saves every record with `competitor`/`competitor_name` left empty. DeepSeek is OpenAI-API-compatible, so the `openai` SDK is pointed at its `base_url`; only the cleaned `title`/`description`/`location` are sent (never the raw JSON), and the model is instructed to return `null` rather than invent a name.
 
 The website scraper's `_flatten_dataset_items()` normalises the AI actor's output, which can arrive as a flat list of product dicts, a single wrapper dict with a nested list (`items`/`data`/`results`/`products`/`extractedData`), or a dataset item that is itself a list.
 
@@ -71,6 +73,7 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 - `POST /scrapers/<source>/start` — `{"urls": [...], "limit": N, "competitor_name": "…"}` → `{run_id, dataset_id, status}` (202).
 - `GET  /scrapers/<source>/status?run_id=…&dataset_id=…` → `{status, items_scraped, is_terminal, succeeded}` (polled by the frontend).
 - `POST /scrapers/<source>/finalize` — `{"dataset_id": "…", "urls": [...], "competitor_name": "…"}` → `{saved, results: [...]}` (serialized records for display).
+- `GET|POST /scrapers/llm/test` — **diagnostic** for the DeepSeek connection (ADMIN). Makes one real LLM call with static sample data (POST may override `{title, description, location}`) and returns `{ok, config, request, result, raw_content, usage, error}`. Unlike the scraper path, `deepseek.check_connection()` does **not** swallow the error — it surfaces the exception type/`status_code`/`body` (e.g. 402 *Insufficient Balance*) so the integration can be verified from Postman. 200 on success, 400 on config error, 502 on API failure.
 
 ### URL Structure
 
@@ -124,5 +127,16 @@ DB_HOST=127.0.0.1
 DB_PORT=5432
 APIFY_API_KEY=...
 ```
+
+Optional — LLM competitor enrichment for the Facebook scraper (all off/safe by default):
+
+```
+USE_LLM_ENRICHMENT=True            # master switch (default False)
+DEEPSEEK_API_KEY=sk-...            # from https://platform.deepseek.com
+DEEPSEEK_MODEL=deepseek-chat       # optional (default deepseek-chat)
+DEEPSEEK_BASE_URL=https://api.deepseek.com   # optional
+```
+
+Requires `pip install openai` (already in `requirements.txt`). Read directly from the environment in `enrichment/deepseek.py` (same pattern as `APIFY_API_KEY`), not via `settings.py`.
 
 Optional (have safe dev defaults): `DJANGO_DEBUG` (default `True`), `DJANGO_ALLOWED_HOSTS` (csv, default `127.0.0.1,localhost`), `CORS_ALLOWED_ORIGINS` (csv, default `http://localhost:5173,http://127.0.0.1:5173`). For production set `DJANGO_DEBUG=False`, a real `DJANGO_SECRET_KEY`, and the correct hosts/origins.

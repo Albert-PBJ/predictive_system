@@ -14,6 +14,9 @@ djangorestframework-stubs==3.16.9
 impit==0.12.0
 more-itertools==11.0.2
 numpy==2.4.4
+# Opcional: solo se usa si USE_LLM_ENRICHMENT=True (identificación de competidores vía DeepSeek).
+# DeepSeek es compatible con la API de OpenAI, por eso reutilizamos este SDK.
+openai>=1.40,<2
 pandas==3.0.2
 psycopg==3.3.3
 psycopg-binary==3.3.3

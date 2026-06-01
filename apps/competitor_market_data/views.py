@@ -1,10 +1,20 @@
+import os
+
 from rest_framework import status
+from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.permissions import IsAdmin
+from apps.competitor_market_data.enrichment import deepseek
 from apps.competitor_market_data.scrapers import get_run_progress
+
+# Interruptor para abrir el endpoint de prueba del LLM (/scrapers/llm/test) sin
+# autenticación, útil para probarlo desde Postman en desarrollo. Por defecto está
+# CERRADO (solo ADMIN), porque la prueba consume crédito de la API. Se lee del
+# .env al iniciar, así que cambiarlo requiere reiniciar el servidor.
+LLM_TEST_PUBLIC = os.environ.get("LLM_TEST_PUBLIC", "False").lower() in ("1", "true", "yes")
 from apps.competitor_market_data.scrapers.facebook_marketplace_scraper import (
     finalize_facebook,
     start_facebook_run,
@@ -213,3 +223,56 @@ class ScraperFinalizeView(APIView):
             {"saved": len(records), "results": _serialize_records(records)},
             status=status.HTTP_201_CREATED,
         )
+
+
+class LLMConnectionTestView(APIView):
+    """
+    GET  /scrapers/llm/test
+    POST /scrapers/llm/test   {"title": "...", "description": "...", "location": "..."}
+
+    Endpoint de DIAGNÓSTICO para verificar la conexión con DeepSeek (LLM) sin
+    ejecutar el scraper real. Hace UNA llamada con datos de ejemplo estáticos (o
+    con el texto enviado en el cuerpo del POST) y devuelve el estado de
+    configuración junto con el resultado del modelo o el detalle del error
+    (tipo, mensaje y código HTTP). Pensado para probar la integración desde
+    Postman —y ver el error esperado de saldo/clave antes de pagar la API—.
+
+    Acceso: por defecto solo ADMIN (la llamada consume crédito de la API). Si
+    `LLM_TEST_PUBLIC` está activo en el .env, se abre como AllowAny para poder
+    probarlo desde Postman sin token.
+    """
+
+    permission_classes = [IsAdmin]
+
+    def get_permissions(self):
+        # Permiso conmutable vía .env: abierto (AllowAny) o solo ADMIN.
+        return [AllowAny()] if LLM_TEST_PUBLIC else [IsAdmin()]
+
+    def get(self, request: Request) -> Response:
+        return self._run()
+
+    def post(self, request: Request) -> Response:
+        return self._run(
+            title=request.data.get("title"),
+            description=request.data.get("description"),
+            location=request.data.get("location"),
+        )
+
+    def _run(self, title=None, description=None, location=None) -> Response:
+        diagnostic = deepseek.check_connection(
+            title=title, description=description, location=location
+        )
+        # Deja constancia del modo de acceso en la respuesta del diagnóstico.
+        diagnostic["config"]["public_test_endpoint"] = LLM_TEST_PUBLIC
+        if diagnostic["ok"]:
+            return Response(diagnostic, status=status.HTTP_200_OK)
+
+        # Un problema de configuración es 400 (lo arregla el usuario); un fallo al
+        # llamar a la API (saldo, clave, red) es 502 (falla la dependencia externa).
+        stage = (diagnostic.get("error") or {}).get("stage")
+        code = (
+            status.HTTP_400_BAD_REQUEST
+            if stage == "config"
+            else status.HTTP_502_BAD_GATEWAY
+        )
+        return Response(diagnostic, status=code)
