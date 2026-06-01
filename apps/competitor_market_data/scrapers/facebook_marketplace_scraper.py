@@ -5,7 +5,12 @@ from typing import Optional
 
 from apps.benchmarking.models import Competitor, CompetitorMarketData
 from apps.competitor_market_data.enrichment import deepseek
-from apps.competitor_market_data.scrapers import classify_category, get_client
+from apps.competitor_market_data.scrapers import (
+    backfill_competitor_location,
+    classify_category,
+    get_client,
+    resolve_location,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -170,12 +175,16 @@ def _resolve_competitor_fk(
     result: dict,
     known: list[dict],
     created_cache: dict,
+    municipality: str,
+    state: str,
 ) -> tuple[Optional[Competitor], str, str]:
     """Traduce la salida del LLM a un Competitor (enlazándolo o creándolo).
 
     - Si el LLM hizo match con un id conocido → enlaza ese Competitor.
     - Si propone un negocio nuevo con confianza suficiente → lo crea (get_or_create).
     - Si no hay nombre identificable → (None, "") y el registro queda sin competidor.
+
+    Rellena el estado/municipio del competidor (sin pisar datos existentes).
 
     Retorna ``(competitor, name, outcome)`` donde ``outcome`` indica cómo se
     resolvió, para poder medirlo al final:
@@ -188,6 +197,7 @@ def _resolve_competitor_fk(
     if matched_id is not None:
         competitor = Competitor.objects.filter(id=matched_id).first()
         if competitor is not None:
+            backfill_competitor_location(competitor, municipality, state)
             return competitor, competitor.name, "existing"
 
     name = result.get("competitor_name")
@@ -203,12 +213,16 @@ def _resolve_competitor_fk(
         name=name,
         defaults={
             "is_active": True,
+            "state": state,
+            "municipality": municipality,
             "notes": "Detectado automáticamente desde Facebook Marketplace (LLM).",
         },
     )
     if created:
         logger.info("Creado nuevo Competitor vía LLM: '%s'", name)
         known.append({"id": competitor.id, "name": competitor.name})
+    else:
+        backfill_competitor_location(competitor, municipality, state)
     created_cache[key] = competitor
     return competitor, competitor.name, ("created" if created else "existing")
 
@@ -252,7 +266,12 @@ def _enrich_listings(pairs: list[tuple[CompetitorMarketData, dict]]) -> None:
         )
         item_found = False
 
-        competitor, name, outcome = _resolve_competitor_fk(result, known, created_cache)
+        municipality, state = resolve_location(
+            result.get("state"), result.get("municipality"), _as_str(listing.get("locationText"))
+        )
+        competitor, name, outcome = _resolve_competitor_fk(
+            result, known, created_cache, municipality, state
+        )
         if competitor is not None:
             instance.competitor = competitor
             instance.competitor_name = competitor.name

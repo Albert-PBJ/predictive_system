@@ -39,6 +39,8 @@ _EMPTY_RESULT = {
     "matched_competitor_id": None,
     "confidence": 0.0,
     "promotions": None,
+    "state": None,
+    "municipality": None,
 }
 
 _SYSTEM_PROMPT = (
@@ -82,7 +84,8 @@ def _build_user_prompt(title: str, description: str, location: str, known: list[
         f"- Ubicación: {location or '(desconocida)'}\n\n"
         "Devuelve un JSON con EXACTAMENTE estas claves:\n"
         '{"competitor_name": <string|null>, "matched_competitor_id": <int|null>, '
-        '"confidence": <number 0..1>, "promotions": <string|null>}\n'
+        '"confidence": <number 0..1>, "promotions": <string|null>, '
+        '"state": <string|null>, "municipality": <string|null>}\n'
         "- Si coincide con un competidor conocido de la lista, pon su id en "
         "matched_competitor_id y su nombre exacto en competitor_name.\n"
         "- Si es un negocio nuevo que no está en la lista, pon matched_competitor_id=null "
@@ -93,7 +96,14 @@ def _build_user_prompt(title: str, description: str, location: str, known: list[
         "descuentos y beneficios adicionales del anuncio (p. ej. 'envío gratis', "
         "'entrega a nivel nacional', 'delivery', 'garantía 1 año', 'instalación "
         "incluida', '20% de descuento'). Incluye solo lo que esté explícito en el "
-        "texto. Si no hay ninguno, usa null. Máximo 200 caracteres."
+        "texto. Si no hay ninguno, usa null. Máximo 200 caracteres.\n"
+        "- state: el ESTADO de Venezuela donde se ubica el vendedor, con su nombre "
+        "oficial completo (p. ej. 'Carabobo', 'Distrito Capital'). La ubicación puede "
+        "venir como 'Ciudad, AB' con una abreviatura (p. ej. 'Naguanagua, CA' → "
+        "Carabobo); dedúcela también del nombre de la ciudad si hace falta. Si no se "
+        "puede determinar, null.\n"
+        "- municipality: el municipio o ciudad del vendedor (p. ej. 'Naguanagua', "
+        "'Valencia'). Si no se puede determinar, null."
     )
 
 
@@ -114,11 +124,19 @@ def _sanitize(data: dict) -> dict:
     promotions = data.get("promotions")
     promotions = promotions.strip()[:255] or None if isinstance(promotions, str) else None
 
+    state = data.get("state")
+    state = state.strip()[:100] or None if isinstance(state, str) else None
+
+    municipality = data.get("municipality")
+    municipality = municipality.strip()[:100] or None if isinstance(municipality, str) else None
+
     return {
         "competitor_name": name,
         "matched_competitor_id": matched_id,
         "confidence": confidence,
         "promotions": promotions,
+        "state": state,
+        "municipality": municipality,
     }
 
 
@@ -188,6 +206,8 @@ _IG_EMPTY_RESULT = {
     "category": None,
     "price": None,
     "currency": None,
+    "state": None,
+    "municipality": None,
 }
 
 _IG_SYSTEM_PROMPT = (
@@ -228,7 +248,8 @@ def _build_instagram_prompt(
         '{"product_name": <string|null>, "category": <string|null>, '
         '"competitor_name": <string|null>, "matched_competitor_id": <int|null>, '
         '"confidence": <number 0..1>, "promotions": <string|null>, '
-        '"price": <number|null>, "currency": <"USD"|"VES"|null>}\n'
+        '"price": <number|null>, "currency": <"USD"|"VES"|null>, '
+        '"state": <string|null>, "municipality": <string|null>}\n'
         "- product_name: el producto principal del anuncio, en español, breve y limpio "
         "(sin emojis ni hashtags). Si el caption es solo un eslogan o no menciona un "
         "producto concreto, usa null.\n"
@@ -244,7 +265,13 @@ def _build_instagram_prompt(
         "'garantía', '20% de descuento'). Si no hay, usa null. Máximo 200 caracteres.\n"
         "- price/currency: SOLO si el precio aparece explícito en el texto. La moneda es "
         "'USD' para dólares ($, USD) o 'VES' para bolívares (Bs, VES). Si no hay precio "
-        "explícito, price=null y currency=null. No inventes precios."
+        "explícito, price=null y currency=null. No inventes precios.\n"
+        "- state: el ESTADO de Venezuela del vendedor, con su nombre oficial completo "
+        "(p. ej. 'Carabobo', 'Distrito Capital'). Dedúcelo de la ubicación, del caption "
+        "(p. ej. 'Valencia Estado Carabobo', 'San Diego edo Carabobo') o de la ciudad. "
+        "Si no se puede determinar, null.\n"
+        "- municipality: el municipio o ciudad del vendedor (p. ej. 'Valencia', "
+        "'San Diego'). Si no se puede determinar, null."
     )
 
 

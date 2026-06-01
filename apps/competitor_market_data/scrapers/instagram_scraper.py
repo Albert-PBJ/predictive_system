@@ -5,7 +5,13 @@ from typing import Optional
 
 from apps.benchmarking.models import Competitor, CompetitorMarketData
 from apps.competitor_market_data.enrichment import deepseek
-from apps.competitor_market_data.scrapers import CATEGORY_NAMES, classify_category, get_client
+from apps.competitor_market_data.scrapers import (
+    CATEGORY_NAMES,
+    backfill_competitor_location,
+    classify_category,
+    get_client,
+    resolve_location,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +205,8 @@ def _resolve_instagram_competitor(
     known: list[dict],
     handle_index: dict,
     created_cache: dict,
+    municipality: str,
+    state: str,
 ) -> tuple[Optional[Competitor], str, str]:
     """Resuelve el Competitor del post, deduplicando por handle de Instagram.
 
@@ -208,6 +216,8 @@ def _resolve_instagram_competitor(
     3. Match propuesto por el LLM contra un competidor conocido (por id).
     4. Crear un competidor nuevo para el perfil (nombre del LLM o de respaldo).
 
+    Rellena el estado/municipio del competidor (sin pisar datos existentes).
+
     Retorna ``(competitor, name, outcome)`` con ``outcome`` ∈ {"existing",
     "created", "none"}, para medirlo al final.
     """
@@ -216,11 +226,13 @@ def _resolve_instagram_competitor(
     # 1) Dedupe dentro del mismo run.
     if handle and handle in created_cache:
         comp = created_cache[handle]
+        backfill_competitor_location(comp, municipality, state)
         return comp, comp.name, "existing"
 
     # 2) Competidor existente con ese handle (dedupe entre runs).
     if handle and handle in handle_index:
         comp = handle_index[handle]
+        backfill_competitor_location(comp, municipality, state)
         created_cache[handle] = comp
         return comp, comp.name, "existing"
 
@@ -230,6 +242,7 @@ def _resolve_instagram_competitor(
         comp = Competitor.objects.filter(id=matched_id).first()
         if comp is not None:
             _backfill_handle(comp, handle, handle_index)
+            backfill_competitor_location(comp, municipality, state)
             if handle:
                 created_cache[handle] = comp
             return comp, comp.name, "existing"
@@ -250,6 +263,8 @@ def _resolve_instagram_competitor(
         defaults={
             "is_active": True,
             "instagram": profile_url,
+            "state": state,
+            "municipality": municipality,
             "notes": "Detectado automáticamente desde Instagram (LLM).",
         },
     )
@@ -257,6 +272,8 @@ def _resolve_instagram_competitor(
     if created:
         logger.info("Creado nuevo Competitor desde Instagram: '%s' (@%s)", comp.name, handle)
         known.append({"id": comp.id, "name": comp.name})
+    else:
+        backfill_competitor_location(comp, municipality, state)
     if handle:
         created_cache[handle] = comp
     return comp, comp.name, ("created" if created else "existing")
@@ -320,8 +337,11 @@ def _enrich_posts(pairs: list[tuple[CompetitorMarketData, dict]]) -> None:
         )
         item_found = False
 
+        municipality, state = resolve_location(
+            result.get("state"), result.get("municipality"), post.get("locationName") or ""
+        )
         competitor, name, outcome = _resolve_instagram_competitor(
-            post, result, known, handle_index, created_cache
+            post, result, known, handle_index, created_cache, municipality, state
         )
         if competitor is not None:
             instance.competitor = competitor
