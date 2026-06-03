@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 from apps.benchmarking.models import Competitor, CompetitorMarketData
 from apps.competitor_market_data.scrapers import get_client
+from apps.competitor_market_data.scrapers.validation import clean_product_name, partition_valid
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +192,7 @@ def _map_item_to_instance(
         competitor_name=competitor.name,
         source=CompetitorMarketData.SourceChoices.WEBSITE,
         url=source_url,
-        product_name=(item.get("title") or "")[:255] or None,
+        product_name=clean_product_name(item.get("title")),
         price=price,
         currency=currency or "USD",
         is_in_stock=True,
@@ -290,6 +291,16 @@ def finalize_website(
 
     if not instances:
         logger.error("Ningún producto pudo ser mapeado. No se guardarán registros.")
+        return []
+
+    # Descarta registros con datos no plausibles (precio fuera de rango, sin
+    # nombre de producto) para no contaminar el dataset de los modelos de ML.
+    instances, _discarded = partition_valid(instances)
+    if not instances:
+        logger.warning(
+            "Todos los productos fueron descartados por la validación de calidad. "
+            "No se guardarán registros."
+        )
         return []
 
     try:

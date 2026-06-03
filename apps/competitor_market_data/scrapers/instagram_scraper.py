@@ -12,6 +12,7 @@ from apps.competitor_market_data.scrapers import (
     get_client,
     resolve_location,
 )
+from apps.competitor_market_data.scrapers.validation import clean_product_name, partition_valid
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +186,7 @@ def _map_post_to_instance(post: dict) -> CompetitorMarketData:
         competitor_name=_baseline_competitor_name(post),
         source=CompetitorMarketData.SourceChoices.INSTAGRAM,
         url=post.get("url"),
-        product_name=_extract_product_name(caption),
+        product_name=clean_product_name(_extract_product_name(caption)),
         category=classify_category(f"{caption} {' '.join(hashtags)}"),
         price=price,
         currency=currency or "USD",
@@ -356,9 +357,9 @@ def _enrich_posts(pairs: list[tuple[CompetitorMarketData, dict]]) -> None:
             item_found = True
 
         # El LLM lee el producto del caption desordenado mejor que la heurística.
-        product_name = result.get("product_name")
+        product_name = clean_product_name(result.get("product_name"))
         if product_name:
-            instance.product_name = product_name[:255]
+            instance.product_name = product_name
             with_product += 1
             item_found = True
 
@@ -435,8 +436,14 @@ def finalize_instagram(dataset_id: str) -> list[CompetitorMarketData]:
     _enrich_posts(pairs)
 
     instances = [instance for instance, _ in pairs]
-    created = CompetitorMarketData.objects.bulk_create(instances)
-    logger.info("Se guardaron %d registros en CompetitorMarketData.", len(created))
+    # Descarta registros con datos no plausibles (precio fuera de rango, sin
+    # nombre de producto) para no contaminar el dataset de los modelos de ML.
+    valid, _discarded = partition_valid(instances)
+    created = CompetitorMarketData.objects.bulk_create(valid)
+    logger.info(
+        "Se guardaron %d registros en CompetitorMarketData (de %d recolectados).",
+        len(created), len(instances),
+    )
     return created
 
 

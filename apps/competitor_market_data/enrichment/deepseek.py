@@ -39,18 +39,21 @@ _EMPTY_RESULT = {
     "matched_competitor_id": None,
     "confidence": 0.0,
     "promotions": None,
+    "product_name": None,
     "state": None,
     "municipality": None,
 }
 
 _SYSTEM_PROMPT = (
     "Eres un asistente que analiza anuncios de muebles de oficina publicados en "
-    "Facebook Marketplace en Venezuela. Tienes DOS tareas: (1) identificar a la "
-    "EMPRESA VENDEDORA (competidor) y (2) extraer las promociones y beneficios "
-    "adicionales que ofrezca el anuncio. Respondes únicamente con un objeto JSON. "
-    "Regla crítica: NO inventes datos; si algo no está explícito en el texto, usa "
-    "null. Muchos anuncios son de particulares sin marca: en esos casos "
-    "competitor_name = null."
+    "Facebook Marketplace en Venezuela. Solo nos interesan PRODUCTOS DE MOBILIARIO "
+    "de oficina/hogar. Tienes TRES tareas: (1) identificar a la EMPRESA VENDEDORA "
+    "(competidor), (2) extraer las promociones y beneficios adicionales que ofrezca "
+    "el anuncio y (3) devolver el nombre de un producto de mobiliario concreto, "
+    "limpio (sin el precio ni emojis), o null si el anuncio no nombra uno. "
+    "Respondes únicamente con un objeto JSON. Regla crítica: NO inventes datos; si "
+    "algo no está explícito en el texto, usa null. Muchos anuncios son de "
+    "particulares sin marca: en esos casos competitor_name = null."
 )
 
 
@@ -85,7 +88,16 @@ def _build_user_prompt(title: str, description: str, location: str, known: list[
         "Devuelve un JSON con EXACTAMENTE estas claves:\n"
         '{"competitor_name": <string|null>, "matched_competitor_id": <int|null>, '
         '"confidence": <number 0..1>, "promotions": <string|null>, '
+        '"product_name": <string|null>, '
         '"state": <string|null>, "municipality": <string|null>}\n'
+        "- product_name: el nombre de un PRODUCTO DE MOBILIARIO de oficina/hogar "
+        "concreto (p. ej. 'Silla ejecutiva', 'Escritorio en L', 'Archivador "
+        "metálico'), en español, breve y limpio. NO incluyas el precio (de 'Silla "
+        "de oficina20$' devuelve 'Silla de oficina'), ni emojis, ni hashtags, ni "
+        "datos de contacto. Si el texto NO nombra un producto de mobiliario "
+        "concreto —porque es un eslogan, una pregunta o un llamado a la acción "
+        "(p. ej. 'Buscas ahorrar costos', 'Una imagen para tu oficina')— devuelve "
+        "null.\n"
         "- Si coincide con un competidor conocido de la lista, pon su id en "
         "matched_competitor_id y su nombre exacto en competitor_name.\n"
         "- Si es un negocio nuevo que no está en la lista, pon matched_competitor_id=null "
@@ -124,6 +136,9 @@ def _sanitize(data: dict) -> dict:
     promotions = data.get("promotions")
     promotions = promotions.strip()[:255] or None if isinstance(promotions, str) else None
 
+    product_name = data.get("product_name")
+    product_name = product_name.strip()[:255] or None if isinstance(product_name, str) else None
+
     state = data.get("state")
     state = state.strip()[:100] or None if isinstance(state, str) else None
 
@@ -135,6 +150,7 @@ def _sanitize(data: dict) -> dict:
         "matched_competitor_id": matched_id,
         "confidence": confidence,
         "promotions": promotions,
+        "product_name": product_name,
         "state": state,
         "municipality": municipality,
     }
@@ -215,9 +231,12 @@ _IG_SYSTEM_PROMPT = (
     "de oficina y hogar en Venezuela. Las publicaciones son texto libre (caption) y "
     "suelen mezclar producto, precio, promociones, ubicación y datos de contacto, a "
     "menudo con emojis. Tu tarea es extraer datos estructurados del anuncio e "
-    "identificar a la EMPRESA VENDEDORA (competidor). Respondes únicamente con un "
-    "objeto JSON. Regla crítica: NO inventes datos; si algo no está explícito en el "
-    "texto, usa null."
+    "identificar a la EMPRESA VENDEDORA (competidor). Solo nos interesan PRODUCTOS "
+    "DE MOBILIARIO de oficina/hogar: si el caption no ofrece un producto de "
+    "mobiliario concreto (es un eslogan, una frase motivacional o un llamado a la "
+    "acción), product_name debe ser null. Respondes únicamente con un objeto JSON. "
+    "Regla crítica: NO inventes datos; si algo no está explícito en el texto, usa "
+    "null."
 )
 
 
@@ -250,9 +269,13 @@ def _build_instagram_prompt(
         '"confidence": <number 0..1>, "promotions": <string|null>, '
         '"price": <number|null>, "currency": <"USD"|"VES"|null>, '
         '"state": <string|null>, "municipality": <string|null>}\n'
-        "- product_name: el producto principal del anuncio, en español, breve y limpio "
-        "(sin emojis ni hashtags). Si el caption es solo un eslogan o no menciona un "
-        "producto concreto, usa null.\n"
+        "- product_name: el nombre de un PRODUCTO DE MOBILIARIO de oficina/hogar "
+        "concreto (p. ej. 'Silla ejecutiva', 'Escritorio en L', 'Archivador "
+        "metálico'), en español, breve y limpio. NO incluyas el precio (de 'Silla "
+        "de oficina20$' devuelve 'Silla de oficina'), ni emojis, ni hashtags. Si el "
+        "caption NO nombra un producto de mobiliario concreto —porque es un eslogan, "
+        "una frase motivacional, una pregunta o un llamado a la acción (p. ej. "
+        "'Buscas ahorrar costos', 'Una imagen para tu oficina')— devuelve null.\n"
         f"- category: clasifícalo en UNA de estas categorías EXACTAS: {category_block}. "
         "Si ninguna aplica, usa null.\n"
         "- Competidor: el dueño del perfil suele ser la empresa vendedora. Si coincide "
@@ -277,10 +300,7 @@ def _build_instagram_prompt(
 
 def _sanitize_instagram(data: dict, category_options: list[str]) -> dict:
     """Valida y normaliza la respuesta del modelo para un post de Instagram."""
-    base = _sanitize(data)  # competitor_name, matched_competitor_id, confidence, promotions
-
-    product_name = data.get("product_name")
-    product_name = product_name.strip()[:255] or None if isinstance(product_name, str) else None
+    base = _sanitize(data)  # incluye competitor, promotions, product_name, ubicación
 
     category = data.get("category")
     if isinstance(category, str):
@@ -313,7 +333,6 @@ def _sanitize_instagram(data: dict, category_options: list[str]) -> dict:
 
     return {
         **base,
-        "product_name": product_name,
         "category": category,
         "price": price,
         "currency": currency,

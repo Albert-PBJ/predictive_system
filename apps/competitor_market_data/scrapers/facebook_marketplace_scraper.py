@@ -11,6 +11,7 @@ from apps.competitor_market_data.scrapers import (
     get_client,
     resolve_location,
 )
+from apps.competitor_market_data.scrapers.validation import clean_product_name, partition_valid
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +158,7 @@ def _map_listing_to_instance(listing: dict) -> CompetitorMarketData:
         competitor_name="",
         source=CompetitorMarketData.SourceChoices.FACEBOOK,
         url=listing.get("itemUrl") or listing.get("url"),
-        product_name=title[:255] or None,
+        product_name=clean_product_name(title),
         category=classify_category(f"{title} {description}"),
         price=price,
         currency=currency or "USD",
@@ -254,6 +255,7 @@ def _enrich_listings(pairs: list[tuple[CompetitorMarketData, dict]]) -> None:
     created_cache: dict[str, Competitor] = {}
     linked_existing = 0   # enlazados a un competidor ya existente (dedupe)
     created_new = 0       # competidores nuevos creados por el LLM
+    with_product = 0      # anuncios con nombre de producto saneado por el LLM
     with_promotions = 0   # anuncios con promociones/beneficios extraídos
     found_something = 0   # anuncios donde el LLM aportó algún dato
 
@@ -292,17 +294,26 @@ def _enrich_listings(pairs: list[tuple[CompetitorMarketData, dict]]) -> None:
             with_promotions += 1
             item_found = True
 
+        # Nombre de producto saneado por el LLM (sin precio embebido ni emojis);
+        # prevalece sobre el título crudo cuando devuelve algo utilizable.
+        product_name = clean_product_name(result.get("product_name"))
+        if product_name:
+            instance.product_name = product_name
+            with_product += 1
+            item_found = True
+
         if item_found:
             found_something += 1
 
     logger.info(
         "Enriquecimiento LLM finalizado: %d de %d anuncio(s) con datos del LLM "
         "(enlazados a competidor existente: %d, competidor nuevo creado: %d, "
-        "promociones/beneficios extraídos: %d).",
+        "nombres de producto saneados: %d, promociones/beneficios extraídos: %d).",
         found_something,
         len(pairs),
         linked_existing,
         created_new,
+        with_product,
         with_promotions,
     )
 
@@ -338,8 +349,14 @@ def finalize_facebook(dataset_id: str) -> list[CompetitorMarketData]:
     _enrich_listings(pairs)
 
     instances = [instance for instance, _ in pairs]
-    created = CompetitorMarketData.objects.bulk_create(instances)
-    logger.info("Se guardaron %d registros en CompetitorMarketData.", len(created))
+    # Descarta registros con datos no plausibles (precio fuera de rango, sin
+    # nombre de producto) para no contaminar el dataset de los modelos de ML.
+    valid, _discarded = partition_valid(instances)
+    created = CompetitorMarketData.objects.bulk_create(valid)
+    logger.info(
+        "Se guardaron %d registros en CompetitorMarketData (de %d recolectados).",
+        len(created), len(instances),
+    )
     return created
 
 
