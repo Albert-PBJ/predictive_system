@@ -1,5 +1,7 @@
 import os
+from decimal import Decimal, InvalidOperation
 
+from django.db.models import Q
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
@@ -7,6 +9,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.permissions import IsAdmin
+from apps.benchmarking.models import CompetitorMarketData
 from apps.competitor_market_data.enrichment import deepseek
 from apps.competitor_market_data.scrapers import get_run_progress
 
@@ -47,6 +50,16 @@ SCRAPERS = {
         "needs_competitor": True,
     },
 }
+
+# Mapea el `source` de la URL al tag almacenado en CompetitorMarketData.source.
+SOURCE_TAGS = {
+    "instagram": CompetitorMarketData.SourceChoices.INSTAGRAM,
+    "facebook": CompetitorMarketData.SourceChoices.FACEBOOK,
+    "website": CompetitorMarketData.SourceChoices.WEBSITE,
+}
+
+DATA_PAGE_SIZE_DEFAULT = 10
+DATA_PAGE_SIZE_MAX = 50
 
 
 def _serialize_records(records) -> list[dict]:
@@ -276,3 +289,139 @@ class LLMConnectionTestView(APIView):
             else status.HTTP_502_BAD_GATEWAY
         )
         return Response(diagnostic, status=code)
+
+
+def _parse_decimal(value):
+    """Convierte un parámetro de query a Decimal; retorna None si es inválido/ausente."""
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _parse_int(value, default):
+    """Convierte un parámetro de query a int positivo; cae al default si es inválido."""
+    try:
+        parsed = int(value)
+        return parsed if parsed >= 1 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _serialize_market_data(record) -> dict:
+    """Serializa un CompetitorMarketData histórico (incluye estado/municipio del competidor)."""
+    competitor = record.competitor
+    return {
+        "id": record.id,
+        # Prioriza el nombre normalizado del competidor; cae al texto del scraper.
+        "competitor_name": (competitor.name if competitor else None) or record.competitor_name,
+        "product_name": record.product_name,
+        "category": record.category,
+        "price": str(record.price) if record.price is not None else None,
+        "currency": record.currency,
+        "promotions": record.promotions,
+        "state": competitor.state if competitor else "",
+        "municipality": competitor.municipality if competitor else "",
+        "url": record.url,
+        "scraped_at": record.scraped_at.isoformat() if record.scraped_at else None,
+    }
+
+
+class ScraperDataView(APIView):
+    """
+    GET /scrapers/<source>/data
+
+    Lista los datos de competidores ya almacenados (CompetitorMarketData) para la
+    fuente indicada (`instagram`, `facebook` o `website`), con paginación y filtros.
+    A diferencia de /finalize (que devuelve solo el último run), este endpoint lee
+    el histórico completo desde la base de datos.
+
+    Parámetros de query (todos opcionales):
+        page          (int, default 1)
+        page_size     (int, default 10, máx 50)
+        min_price     (decimal)   — precio mínimo
+        max_price     (decimal)   — precio máximo
+        state         (string)    — estado del competidor (coincidencia exacta, sin distinguir mayúsculas)
+        municipality  (string)    — municipio del competidor (idem)
+        search        (string)    — búsqueda general (producto, competidor, categoría, promoción)
+
+    Respuesta:
+        {count, page, page_size, num_pages, results: [...],
+         available_states: [...], available_municipalities: [...]}
+    """
+
+    permission_classes = [IsAdmin]
+
+    def get(self, request: Request, source: str) -> Response:
+        tag = SOURCE_TAGS.get(source)
+        if tag is None:
+            return Response(
+                {"error": f"Fuente de datos desconocida: '{source}'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        qs = (
+            CompetitorMarketData.objects.filter(source=tag)
+            .select_related("competitor")
+            .order_by("-scraped_at")
+        )
+
+        min_price = _parse_decimal(request.query_params.get("min_price"))
+        if min_price is not None:
+            qs = qs.filter(price__gte=min_price)
+        max_price = _parse_decimal(request.query_params.get("max_price"))
+        if max_price is not None:
+            qs = qs.filter(price__lte=max_price)
+
+        state = (request.query_params.get("state") or "").strip()
+        if state:
+            qs = qs.filter(competitor__state__iexact=state)
+        municipality = (request.query_params.get("municipality") or "").strip()
+        if municipality:
+            qs = qs.filter(competitor__municipality__iexact=municipality)
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            qs = qs.filter(
+                Q(product_name__icontains=search)
+                | Q(competitor_name__icontains=search)
+                | Q(competitor__name__icontains=search)
+                | Q(category__icontains=search)
+                | Q(promotions__icontains=search)
+            )
+
+        # Opciones para los filtros desplegables (estados/municipios con datos en esta fuente).
+        base_qs = CompetitorMarketData.objects.filter(source=tag, competitor__isnull=False)
+        available_states = sorted(
+            v
+            for v in base_qs.values_list("competitor__state", flat=True).distinct()
+            if v
+        )
+        available_municipalities = sorted(
+            v
+            for v in base_qs.values_list("competitor__municipality", flat=True).distinct()
+            if v
+        )
+
+        page_size = min(_parse_int(request.query_params.get("page_size"), DATA_PAGE_SIZE_DEFAULT), DATA_PAGE_SIZE_MAX)
+        page = _parse_int(request.query_params.get("page"), 1)
+        count = qs.count()
+        num_pages = max(1, -(-count // page_size))  # ceil division
+        page = min(page, num_pages)
+        offset = (page - 1) * page_size
+        records = qs[offset:offset + page_size]
+
+        return Response(
+            {
+                "count": count,
+                "page": page,
+                "page_size": page_size,
+                "num_pages": num_pages,
+                "results": [_serialize_market_data(r) for r in records],
+                "available_states": available_states,
+                "available_municipalities": available_municipalities,
+            },
+            status=status.HTTP_200_OK,
+        )
