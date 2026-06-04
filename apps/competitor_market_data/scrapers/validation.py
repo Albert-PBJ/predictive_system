@@ -19,8 +19,8 @@ Excepción de Instagram: como el precio rara vez es explícito en el caption, lo
 posts de Instagram SIN precio se conservan por defecto (toggle
 `DISCARD_INSTAGRAM_WITHOUT_PRICE`). Si tienen precio, igual se valida el rango.
 
-Los rangos de precio son globales: el mismo rango aplica a las tres fuentes (Instagram,
-Facebook, Web).
+Los rangos de precio son globales: el mismo rango aplica a las cuatro fuentes (Instagram,
+Facebook, Web, Mercado Libre).
 """
 
 import logging

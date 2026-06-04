@@ -33,6 +33,7 @@ class CompetitorMarketData(models.Model):
         INSTAGRAM = "IG", _("Instagram")
         FACEBOOK = "FB", _("Facebook Marketplace")
         WEBSITE = "WEB", _("Página Web Directa")
+        MERCADOLIBRE = "ML", _("Mercado Libre")
         OTHER = "OTH", _("Otra Fuente")
 
     competitor = models.ForeignKey(

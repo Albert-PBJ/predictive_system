@@ -5,20 +5,48 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from apps.benchmarking.models import Competitor, CompetitorMarketData
-from apps.competitor_market_data.scrapers import get_client
+from apps.competitor_market_data.scrapers import (
+    CATEGORY_NAMES,
+    backfill_competitor_location,
+    classify_category,
+    detect_in_stock,
+    extract_lead_time,
+    extract_promotions,
+    get_client,
+    is_marketplace_url,
+    prettify_site_name,
+    resolve_location,
+)
 from apps.competitor_market_data.scrapers.validation import clean_product_name, partition_valid
 
 logger = logging.getLogger(__name__)
 
 WEBSITE_ACTOR_ID = "apify/ai-web-scraper"
 
+# Prompt para el AI web scraper. Pide TODOS los campos que también tienen las
+# fuentes Instagram/Facebook, para que la fuente Web no quede más pobre y para
+# soportar marketplaces (p. ej. Mercado Libre), donde hay muchos productos por
+# página y cada uno trae disponibilidad, entrega y ubicación del vendedor.
 AI_PROMPT = (
-    "Extract all product titles and, if possible, their prices as well as promotions if available "
-    "(all in separate fields). Give me the json with the title, the price and the promo only. "
-    "I don't want any additional information on the title field. "
-    'For example: {title:"Mesa de Conferencias Headway", price: "40.00USD", promotion: "75% de descuento"}. '
-    "You may find content in spanish, and you should return the text contents in the language you find them. "
-    "As you can see, the money also has its currency on the field"
+    "Extrae TODOS los productos que encuentres en la página (incluye los de "
+    "marketplaces como Mercado Libre, donde hay muchos productos por página). "
+    "Devuelve ÚNICAMENTE un arreglo JSON donde cada elemento es un producto con "
+    "EXACTAMENTE estos campos: "
+    'title (nombre del producto, sin precio ni emojis), '
+    'price (con su moneda, p. ej. "40.00 USD" o "200 Bs"), '
+    'promotion (promociones, descuentos, envío gratis, garantía o cuotas; null si no hay), '
+    'category (tipo de mueble si aplica; null si no), '
+    'availability (texto de disponibilidad: "en stock", "agotado", etc.; null si no aparece), '
+    'delivery_time (tiempo de entrega, p. ej. "3 días"; null si no aparece), '
+    'location (ciudad o estado del vendedor si se muestra; null si no), '
+    'seller (nombre de la tienda o vendedor si se muestra; null si no). '
+    "Si un dato no está en la página, usa null. No incluyas el precio en el campo "
+    "title. El contenido puede estar en español; mantén el texto en su idioma "
+    "original. No agregues texto fuera del JSON. "
+    'Ejemplo de un elemento: {"title": "Mesa de Conferencias Headway", '
+    '"price": "40.00 USD", "promotion": "75% de descuento", "category": "Mesas", '
+    '"availability": "en stock", "delivery_time": "3 días", '
+    '"location": "Valencia, Carabobo", "seller": "MueblesPro"}.'
 )
 
 # Keys the AI scraper might use to wrap a list of extracted products
@@ -26,6 +54,51 @@ _WRAPPER_KEYS = ("items", "data", "results", "products", "extractedData", "listi
 
 
 # ── Extracción de campos ──────────────────────────────────────────────────────
+
+
+def _as_text(value) -> str:
+    """Convierte un valor a string de forma segura (la IA puede anidar texto en dicts)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return value.get("text") or value.get("value") or ""
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _text_blob(item: dict) -> str:
+    """Une los campos de texto del producto para clasificar categoría / detectar
+    stock, entrega y promociones por palabras clave."""
+    parts = [
+        _as_text(item.get(k))
+        for k in ("title", "promotion", "promo", "availability", "stock",
+                  "delivery_time", "description", "category")
+    ]
+    return " ".join(p for p in parts if p)
+
+
+def _resolve_category(item: dict, blob: str) -> Optional[str]:
+    """Categoría: usa la de la IA si es una categoría válida; si no, clasifica por texto."""
+    ai_category = _as_text(item.get("category")).strip()
+    if ai_category in CATEGORY_NAMES:
+        return ai_category
+    return classify_category(blob)
+
+
+def _lead_time_from_field(value: str) -> Optional[int]:
+    """Días de entrega desde el campo dedicado `delivery_time` (que ya ES el tiempo
+    de entrega, p. ej. '3 días', '3 días hábiles', '5'). Evita confundir otras
+    unidades (p. ej. '24-48 horas' → None). Retorna None si no hay días claros."""
+    text = (value or "").strip().lower()
+    if not text:
+        return None
+    m = re.search(r"(\d+)\s*(d[ií]as?|days?)?", text)
+    if not m:
+        return None
+    has_day_word = bool(m.group(2))
+    is_bare_number = text.replace(m.group(1), "", 1).strip(" -") == ""
+    return int(m.group(1)) if (has_day_word or is_bare_number) else None
 
 
 def _extract_price(price_str: str) -> tuple[Optional[Decimal], Optional[str]]:
@@ -150,14 +223,19 @@ def _flatten_dataset_items(raw_items: list) -> list[dict]:
 # ── Resolución del modelo Competitor ─────────────────────────────────────────
 
 
+def _competitor_name_for(source_url: str, competitor_name: Optional[str]) -> str:
+    """Nombre del competidor: el override manual, si no el nombre legible del sitio
+    (p. ej. 'mercadolibre.com.ve' → 'Mercado Libre'), si no el dominio crudo."""
+    name = (competitor_name or prettify_site_name(source_url) or _extract_domain(source_url)).strip()
+    return name[:150] or (source_url[:150] if source_url else "Sitio web")
+
+
 def _resolve_competitor(source_url: str, competitor_name: Optional[str]) -> Competitor:
     """
     Busca un Competitor por nombre. Si no existe, lo crea con los datos disponibles.
-    El nombre tiene prioridad sobre el dominio derivado de la URL.
+    El override manual tiene prioridad sobre el nombre legible derivado del dominio.
     """
-    name = (competitor_name or _extract_domain(source_url)).strip()[:150]
-    if not name:
-        name = source_url[:150]
+    name = _competitor_name_for(source_url, competitor_name)
 
     competitor, created = Competitor.objects.get_or_create(
         name=name,
@@ -179,23 +257,31 @@ def _map_item_to_instance(
     source_url: str,
     competitor: Competitor,
 ) -> CompetitorMarketData:
-    """Convierte un dict de producto extraído por la IA en una instancia de CompetitorMarketData."""
-    price_raw = item.get("price") or ""
-    price, currency = _extract_price(price_raw)
+    """Convierte un dict de producto extraído por la IA en una instancia de
+    CompetitorMarketData, poblando todos los campos (igual que Instagram/Facebook):
+    categoría, tiempo de entrega, disponibilidad y promociones, además del precio."""
+    price, currency = _extract_price(_as_text(item.get("price")))
+    blob = _text_blob(item)
 
-    promotion = item.get("promotion") or item.get("promo") or None
-    if promotion:
-        promotion = str(promotion)[:255]
+    # Promoción: prioriza el campo de la IA; si no, la deduce del texto por palabras clave.
+    promotion = _as_text(item.get("promotion")) or _as_text(item.get("promo"))
+    promotion = promotion.strip()[:255] if promotion.strip() else extract_promotions(blob)
+
+    # Tiempo de entrega: del campo dedicado de la IA (ya es la duración) o, si no,
+    # del texto libre por palabras clave.
+    lead_time = _lead_time_from_field(_as_text(item.get("delivery_time"))) or extract_lead_time(blob)
 
     return CompetitorMarketData(
         competitor=competitor,
         competitor_name=competitor.name,
         source=CompetitorMarketData.SourceChoices.WEBSITE,
         url=source_url,
-        product_name=clean_product_name(item.get("title")),
+        product_name=clean_product_name(_as_text(item.get("title"))),
+        category=_resolve_category(item, blob),
         price=price,
         currency=currency or "USD",
-        is_in_stock=True,
+        lead_time_days=lead_time,
+        is_in_stock=detect_in_stock(f"{_as_text(item.get('availability'))} {blob}"),
         promotions=promotion,
         raw_metadata=item,
     )
@@ -274,13 +360,21 @@ def finalize_website(
     for product in product_dicts:
         # The AI scraper may include a source URL inside each item
         source_url = product.get("url") or (urls[0] if urls else "")
-        cache_key = competitor_name or _extract_domain(source_url)
+        # La clave de caché es el nombre del competidor ya resuelto (legible).
+        cache_key = _competitor_name_for(source_url, competitor_name)
 
         try:
             if cache_key not in competitor_cache:
                 competitor_cache[cache_key] = _resolve_competitor(source_url, competitor_name)
             competitor = competitor_cache[cache_key]
             instances.append(_map_item_to_instance(product, source_url, competitor))
+
+            # Ubicación: solo para sitios de una sola empresa. En un marketplace la
+            # ubicación es por vendedor, así que NO se asigna al competidor (el sitio).
+            location_text = _as_text(product.get("location"))
+            if location_text and not is_marketplace_url(source_url):
+                municipality, state = resolve_location(None, None, location_text)
+                backfill_competitor_location(competitor, municipality, state)
         except Exception as exc:
             logger.error(
                 "Error al mapear producto '%s': %s",

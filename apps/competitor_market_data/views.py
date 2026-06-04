@@ -26,6 +26,10 @@ from apps.competitor_market_data.scrapers.instagram_scraper import (
     finalize_instagram,
     start_instagram_run,
 )
+from apps.competitor_market_data.scrapers.mercadolibre_scraper import (
+    finalize_mercadolibre,
+    start_mercadolibre_run,
+)
 from apps.competitor_market_data.scrapers.website_scraper import (
     finalize_website,
     start_website_run,
@@ -49,6 +53,11 @@ SCRAPERS = {
         "finalize": finalize_website,
         "needs_competitor": True,
     },
+    "mercadolibre": {
+        "start": start_mercadolibre_run,
+        "finalize": finalize_mercadolibre,
+        "needs_competitor": False,
+    },
 }
 
 # Mapea el `source` de la URL al tag almacenado en CompetitorMarketData.source.
@@ -56,6 +65,7 @@ SOURCE_TAGS = {
     "instagram": CompetitorMarketData.SourceChoices.INSTAGRAM,
     "facebook": CompetitorMarketData.SourceChoices.FACEBOOK,
     "website": CompetitorMarketData.SourceChoices.WEBSITE,
+    "mercadolibre": CompetitorMarketData.SourceChoices.MERCADOLIBRE,
 }
 
 DATA_PAGE_SIZE_DEFAULT = 10
