@@ -1,6 +1,6 @@
 from rest_framework import viewsets
 
-from apps.accounts.permissions import IsManager, IsSeller
+from apps.accounts.permissions import IsManager, IsOperational
 from apps.core.models import Product
 
 from .serializer import ProductSerializer
@@ -9,8 +9,9 @@ from .serializer import ProductSerializer
 class ProductViewset(viewsets.ModelViewSet):
     """CRUD del catálogo de productos.
 
-    Lectura para vendedores o superiores (necesitan el catálogo y los precios para
-    registrar ventas); la escritura (alta/edición/baja de productos del catálogo)
+    Lectura para personal operativo (vendedores y encargados de inventario, que
+    necesitan el catálogo y los precios para vender o gestionar el stock, más
+    gerente/admin); la escritura (alta/edición/baja de productos del catálogo)
     queda reservada a gerente/administrador.
 
     Filtros de query: `search` (nombre o SKU), `category`, `is_active`.
@@ -21,7 +22,7 @@ class ProductViewset(viewsets.ModelViewSet):
 
     def get_permissions(self):
         if self.action in ("list", "retrieve"):
-            return [IsSeller()]
+            return [IsOperational()]
         return [IsManager()]
 
     @staticmethod

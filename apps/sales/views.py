@@ -3,7 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.accounts.models import Role
-from apps.accounts.permissions import IsManager, IsSeller
+from apps.accounts.permissions import IsManager, IsOperational, IsSeller
 from apps.core.models import Seller
 from apps.inventory.services import InsufficientStockError
 
@@ -28,12 +28,23 @@ class SaleViewSet(viewsets.ModelViewSet):
     - GET  /api/sales/{id}/       → detalle de una venta con sus líneas.
     - POST /api/sales/{id}/anular → anula la venta y devuelve el stock (gerente+).
 
-    Acceso: Vendedor o superior para registrar/consultar; solo Gerente/Admin para
-    anular (revierte inventario y borra el ingreso).
+    Acceso: **consultar** ventas es para personal operativo (vendedores y
+    encargados de inventario, que las ven pero no las hacen, más gerente/admin);
+    **registrar** una venta queda para vendedores o superiores; **anular** queda
+    para gerente/admin (revierte inventario y borra el ingreso).
     """
 
-    permission_classes = [IsSeller]
+    permission_classes = [IsOperational]
     http_method_names = ["get", "post", "head", "options"]
+
+    def get_permissions(self):
+        # Registrar requiere capacidad de vender; anular, ser gerente; consultar,
+        # cualquier rol operativo (incluido el encargado de inventario).
+        if self.action == "create":
+            return [IsSeller()]
+        if self.action == "anular":
+            return [IsManager()]
+        return super().get_permissions()
 
     def get_serializer_class(self):
         return SaleCreateSerializer if self.action == "create" else SaleSerializer
@@ -113,7 +124,7 @@ class SaleViewSet(viewsets.ModelViewSet):
 
         return Response(SaleSerializer(sale).data, status=status.HTTP_201_CREATED)
 
-    @action(detail=True, methods=["post"], permission_classes=[IsManager])
+    @action(detail=True, methods=["post"])  # permiso resuelto en get_permissions
     def anular(self, request, pk=None):
         sale = self.get_object()
         try:

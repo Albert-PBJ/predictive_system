@@ -23,7 +23,8 @@ python manage.py makemigrations
 
 # Load demo data for the sales & inventory modules (idempotent):
 # categories, products (with stock/prices), customers, today's exchange rate,
-# a Seller linked to the admin user, and a demo SELLER user (vendedor1).
+# a Seller linked to the admin user, a demo SELLER user (vendedor1) and a demo
+# WAREHOUSE / inventory-manager user (inventario1).
 python manage.py seed_demo_data
 
 # Run scrapers via CLI
@@ -103,11 +104,11 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 ```
 /admin/                       → Django admin
 /api/auth/                    → JWT auth: login, refresh, logout, me (apps/accounts)
-/api/products/                → ProductViewset (read = Seller+, write = Manager+)
+/api/products/                → ProductViewset (read = operativo, write = Manager+)
 /api/customers/               → CustomerViewSet (read/create = Seller+, delete = Manager+)
-/api/sales/                   → SaleViewSet (Seller+); POST …/{id}/anular/ to void (Manager+)
-/api/inventory/stock          → current stock summary per product (Seller+)
-/api/inventory/movements/     → InventoryMovementViewSet: history + register ENT/AJU/DEV (Seller+)
+/api/sales/                   → SaleViewSet (ver = operativo, registrar = Seller+); POST …/{id}/anular/ to void (Manager+)
+/api/inventory/stock          → current stock summary per product (ver = operativo)
+/api/inventory/movements/     → InventoryMovementViewSet: history (ver = operativo) + register ENT/AJU/DEV (Inventario+)
 /api/exchange-rate/latest     → latest BCV/parallel rate, read-only (Seller+)
 /scrapers/                    → <source>/start, <source>/status, <source>/finalize (ADMIN only)
 ```
@@ -136,9 +137,23 @@ and both run inside a single `transaction.atomic` so a sale/movement never lands
   `InventoryMovement` and updates `Product.stock`. Used by both the sales service and the manual
   movement endpoint. Manual movements only allow `ENT`/`AJU`/`DEV` (`SAL` is reserved for sales).
 
-**Permissions (separation of duties):** registering sales and *all* stock control (viewing + manual
-movements) are **Seller+** (`IsSeller`); **voiding a sale is Manager+** (`IsManager`), since it erases
-revenue and returns stock. Product/customer *writes* are Manager+; reads are Seller+.
+**Permissions (separation of duties):** the model is **not a single linear ladder** —
+`ADMIN > MANAGER > {SELLER, WAREHOUSE} > VIEWER`, where `SELLER` (vendedor) and `WAREHOUSE`
+(encargado de inventario) are siblings with **disjoint write capabilities**:
+
+- **Registering a sale** is `SELLER`+ (`IsSeller`) — the warehouse role is deliberately excluded (it
+  sees sales but doesn't make them). Sales *indirectly* decrement stock (the `SAL` movement), so a
+  seller never writes stock directly.
+- **Modifying stock** (manual `ENT`/`AJU`/`DEV` movements) is `WAREHOUSE`+ (`IsWarehouse`) — sellers are
+  excluded (they only *read* stock to sell). The manager/admin can do both, as they sit above both.
+- **Reading** the shared operational data (sales list, stock summary, movement history, product
+  catalog) is any operational role (`IsOperational` = ADMIN/MANAGER/SELLER/WAREHOUSE), so a seller
+  can view stock and a warehouse manager can view sales.
+- **Voiding a sale** is `Manager`+ (`IsManager`), since it erases revenue and returns stock.
+- Product/customer *writes* are Manager+; customer reads/creates are Seller+ (the sale form's quick-add).
+
+The sale/inventory viewsets implement this per-action in `get_permissions()` (create vs anular vs the
+read default).
 
 ### Key Design Decisions
 
@@ -156,9 +171,9 @@ revenue and returns stock. Product/customer *writes* are Manager+; reads are Sel
 
 JWT auth via `djangorestframework-simplejwt`. DRF defaults to `JWTAuthentication` + `IsAuthenticated`, so **every endpoint requires a valid token** unless a view opts out with `AllowAny` (only `login` does).
 
-**Roles & profile:** `apps/accounts/models.py` defines `Role` (ADMIN, MANAGER, SELLER, VIEWER) on a `UserProfile` (OneToOne to `auth.User`). **`UserProfile` is the source of truth for user data** — it holds `role`, `first_name`, `last_name`, `email`, `phone`; `auth_user` is kept for authentication only (username/password/permissions/dates). Django's `User` still physically has empty `first_name`/`last_name`/`email` columns (they can't be dropped without a custom user model), but they are intentionally unused — read/write personal data via the profile. A `post_save` signal (`signals.py`) auto-creates the profile (superusers → ADMIN, else VIEWER) and copies any personal data Django collected at creation (e.g. `createsuperuser`) into it. The Django admin hides the personal-info fieldset on the User form and edits those fields through the `UserProfile` inline. The role is embedded as a JWT claim and returned in the login response; `UserSerializer` sources name/email/phone from the profile.
+**Roles & profile:** `apps/accounts/models.py` defines `Role` (ADMIN, MANAGER, SELLER, **WAREHOUSE**, VIEWER) on a `UserProfile` (OneToOne to `auth.User`). The roles are **not a strict linear hierarchy**: `WAREHOUSE` (encargado de inventario) is a sibling of `SELLER`, not a tier above/below it — see the separation-of-duties note above (sellers sell, warehouse manages stock, managers do both). **`UserProfile` is the source of truth for user data** — it holds `role`, `first_name`, `last_name`, `email`, `phone`; `auth_user` is kept for authentication only (username/password/permissions/dates). Django's `User` still physically has empty `first_name`/`last_name`/`email` columns (they can't be dropped without a custom user model), but they are intentionally unused — read/write personal data via the profile. A `post_save` signal (`signals.py`) auto-creates the profile (superusers → ADMIN, else VIEWER) and copies any personal data Django collected at creation (e.g. `createsuperuser`) into it. The Django admin hides the personal-info fieldset on the User form and edits those fields through the `UserProfile` inline. The role is embedded as a JWT claim and returned in the login response; `UserSerializer` sources name/email/phone from the profile.
 
-**Permission classes** (`apps/accounts/permissions.py`): `IsAdmin`, `IsManager`, `IsSeller`, `IsViewer` (cumulative; superusers always pass). Apply per-viewset with `permission_classes`.
+**Permission classes** (`apps/accounts/permissions.py`, superusers always pass): `IsAdmin` and `IsManager` are cumulative tiers; the rest are **capability-based** to model the non-linear roles — `IsSeller` (ADMIN/MANAGER/SELLER = "can register sales", excludes warehouse), `IsWarehouse` (ADMIN/MANAGER/WAREHOUSE = "can modify stock", excludes sellers), `IsOperational` (ADMIN/MANAGER/SELLER/WAREHOUSE = shared read access), and `IsViewer` (any valid role, read-only). Apply per-viewset with `permission_classes`, or per-action via `get_permissions()`.
 
 **Endpoints** (`/api/auth/`): `login`, `refresh`, `logout` (blacklists refresh token), `me`. Public sign-up is intentionally **not** implemented — only admins create users.
 

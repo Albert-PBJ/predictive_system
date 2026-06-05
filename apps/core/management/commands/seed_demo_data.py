@@ -58,6 +58,11 @@ CUSTOMERS = [
 # username, password, nombre, apellido, comisión %  (el primero se liga al admin)
 DEMO_SELLER = ("vendedor1", "Vendedor2026!", "Carlos", "Rivas", Decimal("8.00"))
 
+# Usuario de demostración con rol de encargado de inventario (WAREHOUSE): puede
+# ver las ventas y modificar el stock, pero no registrar ventas.
+# username, password, nombre, apellido, email
+DEMO_WAREHOUSE = ("inventario1", "Inventario2026!", "Lucía", "Salas", "lucia.salas@maescar.com")
+
 
 class Command(BaseCommand):
     help = "Carga datos de ejemplo (productos, clientes, tasa, vendedores) para ventas e inventario."
@@ -172,6 +177,27 @@ class Command(BaseCommand):
         creds = f" (contraseña: {password})" if created else " (ya existía)"
         self.stdout.write(self.style.SUCCESS(
             f"Vendedor de demo '{username}'{creds}."
+        ))
+
+        # Usuario encargado de inventario de demostración (rol WAREHOUSE): sin
+        # perfil de Seller, porque no registra ventas; solo gestiona el stock.
+        wh_username, wh_password, wh_fn, wh_ln, wh_email = DEMO_WAREHOUSE
+        wh_user, wh_created = User.objects.get_or_create(
+            username=wh_username,
+            defaults={"email": wh_email},
+        )
+        if wh_created:
+            wh_user.set_password(wh_password)
+            wh_user.save()
+        wh_profile = wh_user.profile  # creado por signal
+        wh_profile.role = Role.WAREHOUSE
+        wh_profile.first_name = wh_fn
+        wh_profile.last_name = wh_ln
+        wh_profile.email = wh_email
+        wh_profile.save()
+        wh_creds = f" (contraseña: {wh_password})" if wh_created else " (ya existía)"
+        self.stdout.write(self.style.SUCCESS(
+            f"Encargado de inventario de demo '{wh_username}'{wh_creds}."
         ))
 
         self.stdout.write(self.style.MIGRATE_HEADING("\nDatos de ejemplo cargados correctamente."))

@@ -9,6 +9,7 @@ class Role(models.TextChoices):
     ADMIN = "ADMIN", _("Administrador")
     MANAGER = "MANAGER", _("Gerente")
     SELLER = "SELLER", _("Vendedor")
+    WAREHOUSE = "WAREHOUSE", _("Encargado de Inventario")
     VIEWER = "VIEWER", _("Consulta")
 
 

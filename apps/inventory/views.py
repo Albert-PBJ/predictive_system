@@ -2,7 +2,7 @@ from rest_framework import status, viewsets
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.permissions import IsSeller
+from apps.accounts.permissions import IsOperational, IsWarehouse
 from apps.core.models import Product
 
 from .models import InventoryMovement
@@ -20,13 +20,23 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
     - GET  /api/inventory/movements/        → historial (auditoría) paginado y filtrable.
     - POST /api/inventory/movements/        → registra una entrada, ajuste o devolución.
 
-    Acceso: Vendedor o superior. Las salidas por venta no se crean aquí (las
-    genera el módulo de ventas); este endpoint solo admite ENT/AJU/DEV.
+    Acceso: **consultar** el historial es para personal operativo (vendedores +
+    encargados de inventario + gerentes/admin); **registrar** un movimiento queda
+    reservado al encargado de inventario o superior (los vendedores no tocan el
+    stock directamente). Las salidas por venta no se crean aquí (las genera el
+    módulo de ventas); este endpoint solo admite ENT/AJU/DEV.
     """
 
-    permission_classes = [IsSeller]
+    permission_classes = [IsOperational]
     serializer_class = InventoryMovementSerializer
     http_method_names = ["get", "post", "head", "options"]
+
+    def get_permissions(self):
+        # Ver el historial: operativo (incluye vendedores). Registrar movimientos:
+        # solo quien gestiona el inventario.
+        if self.action == "create":
+            return [IsWarehouse()]
+        return super().get_permissions()
 
     def get_queryset(self):
         qs = (
@@ -95,10 +105,11 @@ class StockListView(APIView):
         low_stock  (bool)    — solo productos en o por debajo del mínimo
         is_active  (bool)    — filtra por estado activo (por defecto, todos)
 
-    Acceso: Vendedor o superior.
+    Acceso: personal operativo (vendedores, encargados de inventario y
+    gerentes/admin). Los vendedores necesitan ver el stock para poder vender.
     """
 
-    permission_classes = [IsSeller]
+    permission_classes = [IsOperational]
 
     @staticmethod
     def _as_bool(value):

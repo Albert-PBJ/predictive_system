@@ -35,12 +35,33 @@ class IsManager(HasRole):
 
 
 class IsSeller(HasRole):
-    """Vendedores y superiores (admin, gerente, vendedor)."""
+    """Puede registrar ventas: vendedor, gerente o admin.
+
+    Es una capacidad de *negocio* (vender), no un escalón jerárquico: el encargado
+    de inventario queda **fuera** a propósito (ve las ventas, pero no las hace).
+    """
 
     allowed_roles = (Role.ADMIN, Role.MANAGER, Role.SELLER)
+
+
+class IsWarehouse(HasRole):
+    """Puede modificar el stock directamente (movimientos manuales de inventario):
+    encargado de inventario, gerente o admin. Los vendedores quedan fuera: solo
+    consultan el stock; las ventas lo descuentan de forma indirecta."""
+
+    allowed_roles = (Role.ADMIN, Role.MANAGER, Role.WAREHOUSE)
+
+
+class IsOperational(HasRole):
+    """Personal operativo: vendedores y encargados de inventario (más gerente/admin).
+
+    Para datos compartidos de solo lectura entre ambas áreas —consultar ventas,
+    existencias y catálogo de productos— sin habilitar la escritura de ninguna."""
+
+    allowed_roles = (Role.ADMIN, Role.MANAGER, Role.SELLER, Role.WAREHOUSE)
 
 
 class IsViewer(HasRole):
     """Cualquier rol válido con acceso de lectura."""
 
-    allowed_roles = (Role.ADMIN, Role.MANAGER, Role.SELLER, Role.VIEWER)
+    allowed_roles = (Role.ADMIN, Role.MANAGER, Role.SELLER, Role.WAREHOUSE, Role.VIEWER)
