@@ -53,6 +53,7 @@ INSTALLED_APPS = [
     "rest_framework_simplejwt.token_blacklist",
     "apps.accounts",
     "apps.products",
+    "apps.customers",
     "apps.competitor_market_data",
     "apps.core",
     "apps.sales",
@@ -164,6 +165,11 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "login": "10/min",
     },
+    # Paginación estándar para los listados (ventas, movimientos de inventario,
+    # productos, clientes). Las vistas APIView de scrapers traen su propia
+    # paginación y no se ven afectadas. El cliente puede pedir ?page= y ?page_size=.
+    "DEFAULT_PAGINATION_CLASS": "apps.core.pagination.StandardResultsSetPagination",
+    "PAGE_SIZE": 10,
 }
 
 from datetime import timedelta  # noqa: E402

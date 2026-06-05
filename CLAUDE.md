@@ -21,6 +21,11 @@ python manage.py runserver
 # Create migrations after model changes
 python manage.py makemigrations
 
+# Load demo data for the sales & inventory modules (idempotent):
+# categories, products (with stock/prices), customers, today's exchange rate,
+# a Seller linked to the admin user, and a demo SELLER user (vendedor1).
+python manage.py seed_demo_data
+
 # Run scrapers via CLI
 python manage.py scrape_instagram <url1> <url2> --limit 50
 python manage.py scrape_facebook_marketplace <url1> <url2> --limit 50
@@ -39,13 +44,14 @@ This API has all of its comments as well as API responses in Spanish. Functions,
 | App | Purpose |
 |-----|---------|
 | `apps/accounts` | Auth & RBAC: UserProfile (role), JWT login/logout/refresh/me, role-based permissions |
-| `apps/core` | Master data: Product, Category, Customer, Seller, ExchangeRate, ProductPriceHistory |
-| `apps/sales` | Transactions: Sale, SaleItem, Quote, QuoteItem |
-| `apps/inventory` | Audit trail: InventoryMovement (every stock change logged) |
+| `apps/core` | Master data: Product, Category, Customer, Seller, ExchangeRate, ProductPriceHistory. Also exposes a read-only `GET /api/exchange-rate/latest` and the `seed_demo_data` command |
+| `apps/sales` | Transactions: Sale, SaleItem, Quote, QuoteItem. **REST API for registering sales** (`SaleViewSet` + `services.py`) |
+| `apps/inventory` | Audit trail: InventoryMovement (every stock change logged). **REST API for stock control** (`InventoryMovementViewSet`, `StockListView` + `services.py`) |
 | `apps/benchmarking` | Competitor intelligence: Competitor, CompetitorMarketData |
 | `apps/analytics` | ML layer: PredictionLog (model registry), KPI, Alert |
 | `apps/competitor_market_data` | Apify scraper integration + REST endpoints to trigger scrapers |
 | `apps/products` | REST API (ModelViewSet) for Product CRUD — thin layer over `apps/core` models |
+| `apps/customers` | REST API (ModelViewSet) for Customer CRUD — thin layer over `apps/core` (no models of its own), same pattern as `apps/products` |
 
 ### Scraper Flow
 
@@ -95,11 +101,44 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 ### URL Structure
 
 ```
-/admin/          → Django admin
-/api/auth/       → JWT auth: login, refresh, logout, me (apps/accounts)
-/api/products/   → ProductViewset (DRF DefaultRouter)
-/scrapers/       → <source>/start, <source>/status, <source>/finalize (ADMIN only)
+/admin/                       → Django admin
+/api/auth/                    → JWT auth: login, refresh, logout, me (apps/accounts)
+/api/products/                → ProductViewset (read = Seller+, write = Manager+)
+/api/customers/               → CustomerViewSet (read/create = Seller+, delete = Manager+)
+/api/sales/                   → SaleViewSet (Seller+); POST …/{id}/anular/ to void (Manager+)
+/api/inventory/stock          → current stock summary per product (Seller+)
+/api/inventory/movements/     → InventoryMovementViewSet: history + register ENT/AJU/DEV (Seller+)
+/api/exchange-rate/latest     → latest BCV/parallel rate, read-only (Seller+)
+/scrapers/                    → <source>/start, <source>/status, <source>/finalize (ADMIN only)
 ```
+
+All `/api/` list endpoints are paginated by DRF (`apps/core/pagination.StandardResultsSetPagination`,
+`?page=`/`?page_size=`, default 10) — the APIView-based scraper endpoints keep their own pagination.
+Note DRF action routes need the trailing slash: void a sale at `/api/sales/{id}/anular/`.
+
+### Internal data entry (sales & inventory)
+
+Registering a sale and controlling stock are the two **internal** data-entry modules (the scrapers
+are the *external* one). Both keep their business logic in a `services.py` so the viewsets stay thin,
+and both run inside a single `transaction.atomic` so a sale/movement never lands half-applied.
+
+- **`apps/sales/services.create_sale`** — validates stock per line (locks the product rows with
+  `select_for_update()`, stripping the model's default ordering via `.order_by()` so PostgreSQL allows
+  `FOR UPDATE`), snapshots the unit cost from the product and the BCV/parallel rates from the latest
+  `ExchangeRate`, computes subtotals/profit/`commission` (seller's `commission_rate` × profit) and
+  `total_sale_ves` (parallel rate preferred), then decrements stock by writing one `InventoryMovement`
+  (type `SAL`, negative qty) per line. The seller is resolved from the authenticated user's `Seller`
+  profile (a Manager+ may register on behalf of another seller by passing `seller`).
+- **`apps/sales/services.void_sale`** — reverses a sale: writes a `DEV` movement per line (returns the
+  qty to stock) and sets status `ANU`. Gated to Manager+ via `@action(permission_classes=[IsManager])`.
+- **`apps/inventory/services.apply_movement`** — the single chokepoint for stock mutation (append-only):
+  locks the product, refuses to drive stock negative (`InsufficientStockError`), writes the
+  `InventoryMovement` and updates `Product.stock`. Used by both the sales service and the manual
+  movement endpoint. Manual movements only allow `ENT`/`AJU`/`DEV` (`SAL` is reserved for sales).
+
+**Permissions (separation of duties):** registering sales and *all* stock control (viewing + manual
+movements) are **Seller+** (`IsSeller`); **voiding a sale is Manager+** (`IsManager`), since it erases
+revenue and returns stock. Product/customer *writes* are Manager+; reads are Seller+.
 
 ### Key Design Decisions
 
