@@ -17,6 +17,11 @@ numpy==2.4.4
 # Opcional: solo se usa si USE_LLM_ENRICHMENT=True (identificación de competidores vía DeepSeek).
 # DeepSeek es compatible con la API de OpenAI, por eso reutilizamos este SDK.
 openai>=1.40,<2
+# Opcional y PESADO (~arrastra torch, cientos de MB): solo se usa si USE_VISION_PRICE_OCR=True.
+# OCR por red neuronal (EasyOCR: CRAFT + CRNN) para leer el precio de la imagen de un
+# post de Instagram cuando ni el caption ni el LLM lo encontraron. Instálalo aparte si
+# vas a activarlo: pip install easyocr
+# easyocr>=1.7,<2
 pandas==3.0.2
 psycopg==3.3.3
 psycopg-binary==3.3.3

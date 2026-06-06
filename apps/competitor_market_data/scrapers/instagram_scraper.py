@@ -1,10 +1,11 @@
 import logging
 import re
+import unicodedata
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from apps.benchmarking.models import Competitor, CompetitorMarketData
-from apps.competitor_market_data.enrichment import deepseek
+from apps.competitor_market_data.enrichment import deepseek, image_ocr
 from apps.competitor_market_data.scrapers import (
     CATEGORY_NAMES,
     backfill_competitor_location,
@@ -14,7 +15,7 @@ from apps.competitor_market_data.scrapers import (
 )
 from apps.competitor_market_data.scrapers.competitors import get_or_create_competitor
 from apps.competitor_market_data.scrapers.persistence import ensure_scrape_run, persist_records
-from apps.competitor_market_data.scrapers.validation import clean_product_name
+from apps.competitor_market_data.scrapers.validation import clean_product_name, looks_like_statement
 
 logger = logging.getLogger(__name__)
 
@@ -78,16 +79,45 @@ def _extract_lead_time(text: str) -> Optional[int]:
     return None
 
 
+# Palabras de TITULAR PROMOCIONAL. Las marcas suelen poner un gancho de oferta en la
+# PRIMERA línea (p. ej. "HAT TRICK DE DESCUENTOS") y el producto real debajo, así que
+# saltamos estas líneas al elegir el nombre del producto.
+_PROMO_HEADLINE_KEYWORDS = (
+    "oferta", "ofertas", "descuento", "descuentos", "promoción", "promocion",
+    "promo", "promos", "rebaja", "rebajas", "sale", "liquidación", "liquidacion",
+    "outlet", "2x1", "3x2", "% off", "% de descuento", "precio especial",
+    "super precio", "súper precio", "black friday", "cyber", "hot sale", "remate",
+    "hat trick", "combazo", "promoción especial",
+)
+
+
+def _is_promo_headline(line: str) -> bool:
+    """True si la línea es un gancho/titular promocional (no el nombre del producto)."""
+    lowered = line.lower()
+    return any(keyword in lowered for keyword in _PROMO_HEADLINE_KEYWORDS)
+
+
 def _extract_product_name(caption: str) -> Optional[str]:
-    """Usa la primera línea con contenido real del caption como nombre del producto."""
+    """Elige la línea del caption que mejor parece el NOMBRE del producto.
+
+    Salta líneas de solo hashtags/menciones, TITULARES PROMOCIONALES (p. ej.
+    'HAT TRICK DE DESCUENTOS', que suelen ir arriba del producto real) y eslóganes
+    (`looks_like_statement`). Si tras filtrar no queda ninguna, cae a la primera
+    línea con contenido (mejor algo que nada; la validación hará el resto).
+    """
     if not caption:
         return None
-    for line in caption.splitlines():
-        line = line.strip()
-        # Descarta líneas que solo son hashtags o menciones
-        if line and not line.startswith("#") and not line.startswith("@"):
+    candidates = [
+        line.strip()
+        for line in caption.splitlines()
+        if line.strip() and not line.strip().startswith(("#", "@"))
+    ]
+    if not candidates:
+        return None
+    for line in candidates:
+        if not _is_promo_headline(line) and not looks_like_statement(line):
             return line[:255]
-    return None
+    return candidates[0][:255]
 
 
 def _extract_promotions(caption: str, hashtags: list) -> Optional[str]:
@@ -403,6 +433,233 @@ def _enrich_posts(pairs: list[tuple[CompetitorMarketData, dict]]) -> None:
     )
 
 
+# ── OCR de imágenes: precio como último recurso (red neuronal EasyOCR) ─────────
+
+
+def _post_image_urls(post: dict) -> list[str]:
+    """Reúne las URLs de imagen de un post de Apify (principal, adicionales y carrusel).
+
+    En Instagram el precio suele estar dentro de la imagen del flyer; estas son las
+    imágenes candidatas a leer con OCR cuando el texto no trajo un precio.
+    """
+    urls: list[str] = []
+
+    def _add(value):
+        if isinstance(value, str) and value and value not in urls:
+            urls.append(value)
+
+    _add(post.get("displayUrl"))
+    for img in post.get("images") or []:
+        _add(img)
+    # Posts de carrusel: cada hijo trae su propia imagen.
+    for child in post.get("childPosts") or []:
+        if isinstance(child, dict):
+            _add(child.get("displayUrl"))
+    return urls
+
+
+# Secuencias largas tipo teléfono: sus dígitos no deben tomarse como precio.
+_PHONE_LIKE_RE = re.compile(r"\d[\d\s().\-]{7,}\d")
+# Unidades/sustantivos que, pegados a un número, lo descartan como precio.
+_NON_PRICE_UNIT_RE = re.compile(
+    r"\s*(?:%|cm|mm|mts?|kg|meses|mes|cuotas?|años?|anos?|piezas?|unidades?|und)\b",
+    re.IGNORECASE,
+)
+
+# Piso del precio adivinado.
+_BARE_PRICE_MIN = Decimal("5")
+# Techo de SANIDAD para números CON indicador de precio actual ("AHORA 750"): se
+# confía en ellos hasta aquí y el gate por categoría (validation.PRICE_BANDS) hace el
+# filtrado fino. Es amplio a propósito (por encima de toda banda) para no recortar un
+# precio legítimo; solo bloquea errores groseros de OCR. Los números SIN indicador
+# (más arriesgados) usan el tope más estricto `OCR_BARE_NUMBER_MAX_USD`.
+_INDICATOR_PRICE_MAX = Decimal("5000")
+
+# Palabras (sin acentos, en minúscula) que anteceden al PRECIO ACTUAL en un flyer.
+# Un número precedido por una de estas es casi seguro el precio: "AHORA 250",
+# "POR SOLO 80", "PRECIO120", "a solo 99". Las multipalabra van primero por prolijidad.
+_CURRENT_PRICE_INDICATORS = (
+    "por solo", "a solo", "llevalo por", "llevatelo por", "ahora",
+    "precio", "solo", "solamente", "hoy", "oferta de",
+)
+# Palabras que anteceden al PRECIO VIEJO/tachado: el número que las sigue NO es el
+# precio real (es el "antes"), así que se descarta. "ANTES 280", "precio regular 300".
+_PREVIOUS_PRICE_INDICATORS = (
+    "antes", "precio regular", "precio normal", "regular", "normal",
+)
+
+
+def _norm_indicator_text(text: str) -> str:
+    """Minúsculas y sin acentos, para comparar indicadores de precio de forma robusta."""
+    text = unicodedata.normalize("NFD", text or "")
+    return "".join(c for c in text if unicodedata.category(c) != "Mn").lower()
+
+
+def _ends_with_indicator(context: str, indicators: tuple[str, ...]) -> bool:
+    """True si `context` termina con alguno de los indicadores, en frontera de palabra.
+
+    La frontera evita falsos positivos como 'aprecio' coincidiendo con 'precio'.
+    """
+    for indicator in indicators:
+        if context.endswith(indicator):
+            prefix_len = len(context) - len(indicator)
+            if prefix_len == 0 or not context[prefix_len - 1].isalpha():
+                return True
+    return False
+
+
+def _parse_ocr_number(token: str) -> Optional[Decimal]:
+    """Convierte un token numérico del OCR a Decimal (coma = separador de miles)."""
+    cleaned = token.strip(".,").replace(",", "")
+    if not cleaned or not any(c.isdigit() for c in cleaned):
+        return None
+    try:
+        return Decimal(cleaned)
+    except InvalidOperation:
+        return None
+
+
+def _guess_bare_price_usd(text: str) -> Optional[Decimal]:
+    """Respaldo agresivo: adivina un precio en USD desde un número "desnudo" del OCR.
+
+    Cuando la red neuronal lee el número (p. ej. '250') pero NO el símbolo de moneda
+    (un '$' chico/estilizado que no transcribe), `_extract_price` no encuentra nada.
+    Aquí buscamos un número de aspecto de precio, descartando teléfonos, porcentajes,
+    dimensiones ('120x60'), años y cantidades ('12 meses').
+
+    Usa el TEXTO INDICATIVO contiguo: prefiere el número que sigue a una palabra de
+    precio actual ("AHORA 250", "POR SOLO 80", "PRECIO120") y descarta el que sigue a
+    una de precio viejo ("ANTES 280"). El tope depende del contexto: un número CON
+    indicador de precio actual se confía hasta `_INDICATOR_PRICE_MAX` (y el gate por
+    categoría lo afina); un número SIN indicador —más arriesgado— se corta en
+    `OCR_BARE_NUMBER_MAX_USD` (500 por defecto). Solo se invoca si
+    `OCR_ASSUME_USD_FOR_BARE_NUMBER` está activo. Devuelve el precio o None.
+    """
+    if not text:
+        return None
+    bare_cap = Decimal(str(image_ocr.OCR_BARE_NUMBER_MAX_USD))
+    cleaned = _PHONE_LIKE_RE.sub(" ", text)
+    current: list[Decimal] = []   # números precedidos por indicador de precio ACTUAL
+    neutral: list[Decimal] = []   # números sin indicador claro
+    for m in re.finditer(r"\d[\d.,]*", cleaned):
+        start, end = m.start(), m.end()
+        before = cleaned[max(0, start - 1):start]
+        after = cleaned[end:end + 8]
+        # Dimensiones / multiplicadores tipo '2x1', '120x60'.
+        if before.lower() == "x" or after[:1].lower() == "x":
+            continue
+        # Porcentajes, unidades, cantidades pegadas al número.
+        if after.startswith("%") or _NON_PRICE_UNIT_RE.match(after):
+            continue
+        value = _parse_ocr_number(m.group(0))
+        if value is None or value < _BARE_PRICE_MIN:
+            continue
+        # Años tipo 1999/2026: no son precios.
+        if value == value.to_integral_value() and Decimal("1900") <= value <= Decimal("2099"):
+            continue
+        # Clasifica por el texto indicativo inmediatamente anterior al número, y aplica
+        # el techo que corresponde a cada caso.
+        context = _norm_indicator_text(cleaned[max(0, start - 24):start]).rstrip(" \t\r\n:.-–—=>|")
+        if _ends_with_indicator(context, _PREVIOUS_PRICE_INDICATORS):
+            continue  # es el precio viejo (p. ej. "ANTES 280"); no lo tomamos
+        if _ends_with_indicator(context, _CURRENT_PRICE_INDICATORS):
+            if value <= _INDICATOR_PRICE_MAX:  # se confía; lo fino lo hace la validación
+                current.append(value)
+        elif value <= bare_cap:  # sin indicador: tope estricto de seguridad
+            neutral.append(value)
+    if current:
+        # Hay número(s) marcados como precio actual: el mayor de ellos.
+        return max(current)
+    if neutral:
+        # Sin indicadores: el número más prominente (mayor) dentro del tope.
+        return max(neutral)
+    return None
+
+
+def _extract_price_from_ocr(text: str) -> tuple[Optional[Decimal], Optional[str]]:
+    """Extrae (precio, moneda) del texto del OCR, tolerante a las fallas del OCR.
+
+    Primero usa el extractor estándar (que exige el símbolo/código de moneda junto al
+    número). Si no halla nada y `OCR_ASSUME_USD_FOR_BARE_NUMBER` está activo, cae al
+    respaldo de número desnudo asumiendo USD.
+    """
+    price, currency = _extract_price(text)
+    if price is not None:
+        return price, currency
+    if image_ocr.OCR_ASSUME_USD_FOR_BARE_NUMBER:
+        guess = _guess_bare_price_usd(text)
+        if guess is not None:
+            return guess, "USD"
+    return None, None
+
+
+def _ocr_fallback_prices(pairs: list[tuple[CompetitorMarketData, dict]]) -> None:
+    """Último recurso: recupera el precio desde la IMAGEN del post vía OCR (red neuronal).
+
+    Solo actúa sobre los posts que siguen SIN precio tras el caption (regex) y el LLM,
+    porque en Instagram el precio suele estar quemado en el flyer y no en el texto.
+    No-op silencioso si el OCR está desactivado o `easyocr` no está instalado. Cada
+    imagen está aislada: si una falla, el resto se procesa igual.
+    """
+    if not image_ocr.is_enabled():
+        logger.info(
+            "OCR de imágenes DESACTIVADO (USE_VISION_PRICE_OCR=%s); no se intenta leer "
+            "precios desde las imágenes de Instagram. Si esperabas que corriera, revisa "
+            "el .env y REINICIA el servidor.",
+            image_ocr.USE_VISION_PRICE_OCR,
+        )
+        return
+
+    # Solo los posts que NINGUNA fuente de texto (caption + LLM) logró cotizar.
+    pending = [(instance, post) for instance, post in pairs if instance.price is None]
+    if not pending:
+        logger.info(
+            "OCR de imágenes: los %d post(s) ya tienen precio del texto; nada que leer.",
+            len(pairs),
+        )
+        return
+
+    logger.info(
+        "OCR de imágenes ACTIVO (EasyOCR / red neuronal): intentando recuperar el precio "
+        "de %d post(s) sin precio en el texto…",
+        len(pending),
+    )
+
+    no_images = 0   # posts sin ninguna URL de imagen para leer
+    processed = 0   # posts con al menos una imagen leída por la red neuronal
+    recovered = 0   # posts cuyo precio recuperó la red neuronal desde la imagen
+    for instance, post in pending:
+        image_urls = _post_image_urls(post)
+        if not image_urls:
+            no_images += 1
+            logger.info("OCR: el post %s no trae imágenes para leer.", post.get("url") or "(sin url)")
+            continue
+        text = image_ocr.extract_text_from_images(image_urls)
+        if not text:
+            continue
+        processed += 1
+        price, currency = _extract_price_from_ocr(text)
+        if price is not None and price > 0:
+            instance.price = price
+            instance.currency = currency or instance.currency or "USD"
+            recovered += 1
+            logger.info(
+                "OCR recuperó precio %s %s desde la imagen del post %s",
+                price,
+                instance.currency,
+                post.get("url") or "(sin url)",
+            )
+
+    logger.info(
+        "OCR de imágenes finalizado: la red neuronal recuperó %d precio(s) de %d post(s) "
+        "con imagen leída (%d post(s) sin imagen; %d seguían sin precio tras caption + LLM).",
+        recovered,
+        processed,
+        no_images,
+        len(pending),
+    )
+
+
 # ── Función pública ───────────────────────────────────────────────────────────
 
 
@@ -427,9 +684,11 @@ def finalize_instagram(dataset_id: str, scrape_run=None) -> list[CompetitorMarke
     """Lee el dataset de un run finalizado, mapea cada post y guarda los registros.
 
     El mapeo de campos es determinista; el producto, la categoría y la
-    identificación del competidor se afinan de forma opcional vía LLM (DeepSeek)
-    antes de persistir. El guardado (snapshot USD, match al catálogo, validación,
-    archivo de descartes y enlace al run) lo centraliza `persist_records`.
+    identificación del competidor se afinan de forma opcional vía LLM (DeepSeek).
+    Como último recurso para el precio, si ni el caption ni el LLM lo encontraron,
+    se intenta leerlo de la imagen del post con OCR (red neuronal EasyOCR, opcional).
+    El guardado (snapshot USD, match al catálogo, validación, archivo de descartes
+    y enlace al run) lo centraliza `persist_records`.
     """
     scrape_run = ensure_scrape_run(
         scrape_run, CompetitorMarketData.SourceChoices.INSTAGRAM, dataset_id
@@ -440,6 +699,9 @@ def finalize_instagram(dataset_id: str, scrape_run=None) -> list[CompetitorMarke
 
     pairs = [(_map_post_to_instance(item), item) for item in items]
     _enrich_posts(pairs)
+    # Último recurso para el precio: leerlo de la imagen del post (red neuronal OCR),
+    # solo para los posts que el caption y el LLM dejaron sin precio.
+    _ocr_fallback_prices(pairs)
 
     instances = [instance for instance, _ in pairs]
     return persist_records(instances, scrape_run=scrape_run, llm_used=deepseek.is_enabled())
