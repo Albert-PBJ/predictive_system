@@ -1,6 +1,6 @@
 import logging
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -14,6 +14,7 @@ from apps.competitor_market_data.scrapers import (
     extract_promotions,
     get_client,
     is_marketplace_url,
+    parse_price_number,
     prettify_site_name,
     resolve_location,
 )
@@ -106,7 +107,12 @@ def _lead_time_from_field(value: str) -> Optional[int]:
 def _extract_price(price_str: str) -> tuple[Optional[Decimal], Optional[str]]:
     """
     Extrae precio y moneda desde el string retornado por la IA.
-    La IA devuelve valores como '40.00USD', '$40.00', '200Bs.', etc.
+    La IA devuelve valores como '40.00USD', '$40.00', '200Bs.', '145,00 $', etc.
+
+    El número se parsea con `parse_price_number`, que interpreta correctamente la
+    coma como separador decimal (formato venezolano/europeo): '145,00' → 145.00,
+    no 14500. Antes se borraba la coma a ciegas y precios válidos terminaban
+    descartados por la validación al disparar el techo de su categoría.
     """
     if not price_str:
         return None, None
@@ -123,10 +129,9 @@ def _extract_price(price_str: str) -> tuple[Optional[Decimal], Optional[str]]:
     ]:
         m = re.search(pattern, raw, re.IGNORECASE)
         if m:
-            try:
-                return Decimal(m.group(1).replace(",", "")), "VES"
-            except InvalidOperation:
-                pass
+            value = parse_price_number(m.group(1))
+            if value is not None:
+                return value, "VES"
 
     for pattern in [
         r"\$\s*([\d,.]+)",
@@ -136,17 +141,15 @@ def _extract_price(price_str: str) -> tuple[Optional[Decimal], Optional[str]]:
     ]:
         m = re.search(pattern, raw, re.IGNORECASE)
         if m:
-            try:
-                return Decimal(m.group(1).replace(",", "")), "USD"
-            except InvalidOperation:
-                pass
+            value = parse_price_number(m.group(1))
+            if value is not None:
+                return value, "USD"
 
     m = re.search(r"([\d,.]+)", raw)
     if m:
-        try:
-            return Decimal(m.group(1).replace(",", "")), "USD"
-        except InvalidOperation:
-            pass
+        value = parse_price_number(m.group(1))
+        if value is not None:
+            return value, "USD"
 
     return None, None
 

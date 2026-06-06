@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import unicodedata
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -56,6 +57,75 @@ def classify_category(text: str) -> str | None:
         if any(kw in text for kw in keywords):
             return category
     return None
+
+
+# ── Parseo de números de precio (compartido por los scrapers) ─────────────────
+#
+# El error clásico es borrar las comas a ciegas (`.replace(",", "")`): en
+# Venezuela/Europa la COMA es el separador DECIMAL, así que "145,00" (= 145 USD)
+# se convertía en "14500" y la validación lo descartaba por exceder el techo de
+# precio de su categoría. Aquí decidimos qué separador es decimal y cuál de miles
+# según su posición y el número de dígitos, en vez de asumir el formato anglosajón.
+
+
+def _resolve_single_separator(s: str, sep: str) -> str:
+    """Resuelve un número con UN solo tipo de separador (todo ',' o todo '.'),
+    decidiendo si actúa como separador decimal o de miles, y lo devuelve en
+    formato `Decimal` (punto decimal, sin separadores de miles)."""
+    parts = s.split(sep)
+    if len(parts) > 2:
+        # Varias apariciones ⇒ separador de miles (1.234.567 / 1,234,567).
+        return "".join(parts)
+    integer, decimals = parts
+    # Exactamente 3 decimales con una parte entera de 1–3 dígitos sin cero inicial
+    # (p. ej. 1,234 / 1.234): es ambiguo, pero en precios de muebles "1234" es
+    # plausible y "1,234" con 3 decimales no, así que lo tratamos como miles.
+    if len(decimals) == 3 and re.fullmatch(r"[1-9]\d{0,2}", integer):
+        return integer + decimals
+    # Cualquier otro caso ⇒ separador decimal (145,00 / 40.5 / 0,500).
+    return f"{integer}.{decimals}"
+
+
+def parse_price_number(num_str) -> Optional[Decimal]:
+    """Convierte la parte numérica de un precio a `Decimal`, interpretando bien
+    el separador decimal sea coma (formato venezolano/europeo) o punto
+    (anglosajón), además de los separadores de miles.
+
+    Ejemplos::
+
+        '145,00'    -> Decimal('145.00')   # coma decimal (VE/UE) — antes daba 14500
+        '145.00'    -> Decimal('145.00')   # punto decimal (anglosajón)
+        '1.234,56'  -> Decimal('1234.56')  # punto miles + coma decimal (VE/UE)
+        '1,234.56'  -> Decimal('1234.56')  # coma miles + punto decimal (anglosajón)
+        '1.234.567' -> Decimal('1234567')  # miles con punto
+        '1,234'     -> Decimal('1234')     # miles con coma (3 dígitos)
+        '40'        -> Decimal('40')
+
+    Retorna ``None`` si no hay dígitos parseables.
+    """
+    if num_str is None:
+        return None
+    # Conserva solo dígitos y los separadores . , (descarta $, espacios, NBSP…).
+    s = re.sub(r"[^\d.,]", "", str(num_str)).strip(".,")  # quita separadores sueltos
+    if not s or not any(c.isdigit() for c in s):
+        return None
+
+    has_dot, has_comma = "." in s, "," in s
+    if has_dot and has_comma:
+        # Ambos presentes: el separador MÁS A LA DERECHA es el decimal.
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")  # VE/UE: 1.234,56
+        else:
+            s = s.replace(",", "")                     # anglosajón: 1,234.56
+    elif has_comma:
+        s = _resolve_single_separator(s, ",")
+    elif has_dot:
+        s = _resolve_single_separator(s, ".")
+
+    try:
+        return Decimal(s)
+    except InvalidOperation:
+        return None
 
 
 # ── Extracción determinista de texto (compartida por los tres scrapers) ───────

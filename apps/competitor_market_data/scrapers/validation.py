@@ -141,6 +141,26 @@ _NON_PRODUCT_STARTERS = {
     "dale", "obten", "obtene", "anímate", "animate",
 }
 
+# Palabras (normalizadas) que delatan una ORACIÓN/eslogan en CUALQUIER posición, no
+# solo al inicio: negaciones, pronombres personales y adverbios relativos/
+# interrogativos. Casi nunca forman parte del nombre de un mueble, pero abundan en
+# las frases de marketing que los captions sueltan como si fueran el producto
+# (p. ej. 'Tú escoges DONDE vivirlo', 'El mejor trono NO está en el estadio'). Lista
+# de ALTA PRECISIÓN: se excluyen palabras que sí aparecen en nombres reales — p. ej.
+# 'te' (colisiona con 'té' de 'Mesa de té'), 'para', 'como'.
+_STATEMENT_WORDS = {
+    # negaciones
+    "no", "nunca", "jamas", "tampoco",
+    # pronombres personales / formas de tratamiento
+    "tu", "vos", "usted", "ustedes", "yo", "nosotros",
+    # adverbios relativos / interrogativos
+    "donde", "cuando", "porque", "cual", "cuales", "quien", "quienes",
+    "cuanto", "cuantos", "cuanta", "cuantas",
+}
+
+# Puntuación a recortar de los bordes de cada token al tokenizar el nombre.
+_TOKEN_EDGE_PUNCT = ".,;:!?¡¿()[]{}\"'«»-—–*"
+
 
 def _norm(text: str) -> str:
     """Minúsculas y sin acentos, para comparar de forma robusta."""
@@ -153,16 +173,73 @@ def looks_like_statement(name: Optional[str]) -> bool:
     """True si el "nombre" parece un eslogan/llamado a la acción, no un producto.
 
     Detecta frases de marketing que los captions sueltan en vez de nombrar un
-    producto (p. ej. 'Buscas ahorrar costos!!', 'Una Imagen para tu Oficina!!').
-    Conservador: alta precisión para no descartar nombres de producto reales
-    (p. ej. 'Silla ejecutiva Stanford' no se marca).
+    producto (p. ej. 'Buscas ahorrar costos!!', 'Una Imagen para tu Oficina!!',
+    'Tú escoges donde vivirlo', 'El mejor trono no está en el estadio'). Tres señales,
+    todas de alta precisión para no descartar nombres reales ('Silla ejecutiva
+    Stanford', 'Mesa de té' no se marcan): puntuación de exclamación/pregunta, un
+    verbo/llamado de marketing como PRIMERA palabra, o cualquier "palabra de oración"
+    (negación, pronombre o adverbio relativo) en el texto.
     """
     if not name:
         return False
     if _STATEMENT_PUNCT_RE.search(name):
         return True
-    first = _norm(name).split(" ", 1)[0].strip(".,;:")
-    return first in _NON_PRODUCT_STARTERS
+    tokens = [t.strip(_TOKEN_EDGE_PUNCT) for t in _norm(name).split()]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return False
+    if tokens[0] in _NON_PRODUCT_STARTERS:
+        return True
+    return any(t in _STATEMENT_WORDS for t in tokens)
+
+
+# ── ¿El nombre menciona realmente un mueble? (señal POSITIVA, robusta) ─────────
+#
+# Detectar eslóganes por una lista de "palabras malas" es una carrera perdida: las
+# frases de marketing son infinitas. Aquí invertimos la lógica: el vocabulario de
+# MUEBLES es finito y acotado (es una empresa de muebles). Si el nombre NO menciona
+# ningún mueble, casi seguro es un eslogan/llamado a la acción, no un producto, y se
+# descarta por completo (no se busca "otra línea"). Es deliberadamente estricto: el
+# costo de descartar de más es bajo (Instagram trae mucho ruido) frente al de ensuciar
+# el dataset de ML con frases que no son productos.
+#
+# Raíces (normalizadas, sin acento). Se comparan por PREFIJO de token para tolerar
+# plurales/inflexiones: 'comedores'→'comedor', 'sillas'→'silla', 'gavetas'→'gaveta'.
+_FURNITURE_TERMS = (
+    # asientos
+    "silla", "sillon", "butaca", "taburete", "banqueta", "banco", "poltrona",
+    "puff", "mecedora", "reposet", "sofa", "futon", "divan",
+    # mesas / superficies de trabajo
+    "escritorio", "mesa", "mesit", "meson", "mostrador", "modulo", "modular",
+    "recepcion", "pupitre",
+    # almacenamiento
+    "archivador", "archivo", "gaveta", "gavetero", "cajonera", "fichero",
+    "estante", "estanteria", "repisa", "librero", "biblioteca", "anaquel",
+    "vitrina", "exhibidor", "gabinete", "armario", "closet", "ropero",
+    "alacena", "aparador", "trinchador", "credenza", "vajillero", "locker",
+    "casillero", "vestier", "escaparate", "repostero", "zapatera", "perchero",
+    "organizador", "rack",
+    # hogar / dormitorio / sala
+    "mueble", "recibidor", "comedor", "juego", "cama", "camarote", "litera",
+    "somier", "colchon", "nochero", "peinadora", "tocador", "comoda",
+)
+
+
+def mentions_furniture(name: Optional[str]) -> bool:
+    """True si el nombre menciona algún mueble reconocible (vocabulario `_FURNITURE_TERMS`).
+
+    Señal POSITIVA: un nombre que sí nombra un mueble ('Silla ejecutiva',
+    'Comedores HOLLAND', 'Mesa de té') es un producto; uno que no nombra ninguno
+    ('Realiza tus pedidos por WhatsApp', 'El mejor trono no está en el estadio')
+    casi seguro es un eslogan. Compara por prefijo de token (tolera plurales).
+    """
+    if not name:
+        return False
+    for token in _norm(name).split():
+        token = token.strip(_TOKEN_EDGE_PUNCT)
+        if token and any(token.startswith(term) for term in _FURNITURE_TERMS):
+            return True
+    return False
 
 
 # ── Conversión de moneda (para validar el rango siempre en USD) ───────────────
@@ -249,6 +326,12 @@ def validate_record(
         return False, "sin nombre de producto"
     if looks_like_statement(instance.product_name):
         return False, "el nombre parece un eslogan, no un producto"
+    # En Instagram el nombre se infiere de un caption libre y ruidoso. Exigimos que
+    # mencione un mueble reconocible; si no, casi seguro es un eslogan/llamado a la
+    # acción y se DESCARTA por completo (no se rescata otro texto del post). En las
+    # demás fuentes el título es estructurado, así que no se aplica esta exigencia.
+    if instance.source == _INSTAGRAM_SOURCE and not mentions_furniture(instance.product_name):
+        return False, "el nombre no menciona ningún mueble (no parece un producto)"
 
     # 2) Precio presente. En Instagram (y solo ahí) un post sin precio se conserva
     #    por defecto, porque el precio rara vez es explícito en el caption.
