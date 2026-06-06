@@ -1,10 +1,32 @@
-from rest_framework import status
+from rest_framework import generics, serializers, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.permissions import IsSeller
+from apps.accounts.permissions import IsOperational, IsSeller
 
-from .models import ExchangeRate
+from .models import Category, ExchangeRate
+
+
+class CategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Category
+        fields = ("id", "name", "slug")
+
+
+class CategoryListView(generics.ListAPIView):
+    """
+    GET /api/categories
+
+    Lista (sin paginar) las categorías de producto, para poblar el desplegable del
+    formulario de productos. Solo lectura.
+
+    Acceso: personal operativo (cualquier rol que pueda ver el catálogo).
+    """
+
+    queryset = Category.objects.all().order_by("name")
+    serializer_class = CategorySerializer
+    permission_classes = [IsOperational]
+    pagination_class = None
 
 
 class LatestExchangeRateView(APIView):

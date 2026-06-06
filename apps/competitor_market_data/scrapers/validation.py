@@ -168,19 +168,47 @@ def looks_like_statement(name: Optional[str]) -> bool:
 # ── Conversión de moneda (para validar el rango siempre en USD) ───────────────
 
 
+def get_latest_rate():
+    """`ExchangeRate` más reciente (su objeto completo) o ``None`` si no hay ninguna.
+
+    Import diferido para evitar dependencias de arranque y poder usar este módulo
+    fuera del ciclo de request.
+    """
+    from apps.core.models import ExchangeRate
+
+    return ExchangeRate.objects.order_by("-date").first()
+
+
 def get_latest_usd_rate() -> Optional[Decimal]:
     """Tasa Bs/USD más reciente (paralela; cae a la BCV). ``None`` si no hay ninguna.
 
     Los precios de marketplace en bolívares siguen la tasa paralela/informal, por
-    eso se prefiere `parallel_rate`. Import diferido para evitar dependencias de
-    arranque y poder usar este módulo fuera del ciclo de request.
+    eso se prefiere `parallel_rate`.
     """
-    from apps.core.models import ExchangeRate
-
-    rate = ExchangeRate.objects.order_by("-date").first()
+    rate = get_latest_rate()
     if rate is None:
         return None
     return rate.parallel_rate or rate.bcv_rate
+
+
+def stamp_price_usd(instance, usd_rate: Optional[Decimal], rate_date) -> None:
+    """Fija `price_usd` (y, si hubo conversión, la tasa usada + su fecha) in-place.
+
+    Snapshot reproducible: un precio en USD se copia tal cual; uno en VES se
+    convierte con la tasa dada y se guarda la tasa + su fecha. Si el precio viene
+    en VES y no hay tasa, `price_usd` queda en ``None`` (no se puede normalizar).
+    """
+    if instance.price is None:
+        return
+    cur = (instance.currency or "USD").upper()
+    if cur == "VES":
+        if usd_rate and usd_rate > 0:
+            instance.price_usd = (instance.price / usd_rate).quantize(Decimal("0.01"))
+            instance.exchange_rate_used = usd_rate
+            instance.rate_date = rate_date
+    else:
+        # USD (o moneda desconocida tratada como USD): sin conversión.
+        instance.price_usd = instance.price.quantize(Decimal("0.01"))
 
 
 def to_usd(
@@ -251,14 +279,16 @@ def validate_record(
     return True, ""
 
 
-def partition_valid(instances: list) -> tuple[list, list]:
+def partition_valid(instances: list, usd_rate: Optional[Decimal] = None) -> tuple[list, list]:
     """Separa los registros válidos de los descartados.
 
     Retorna ``(validos, descartados)`` donde ``descartados`` es una lista de
-    ``(instance, motivo)``. Resuelve la tasa de cambio UNA sola vez para todo el
-    lote y registra cada descarte (con su motivo) más un resumen final.
+    ``(instance, motivo)``. La tasa de cambio se resuelve UNA sola vez para todo el
+    lote (o se recibe ya resuelta vía ``usd_rate`` para no consultarla dos veces) y
+    se registra cada descarte (con su motivo) más un resumen final.
     """
-    usd_rate = get_latest_usd_rate()
+    if usd_rate is None:
+        usd_rate = get_latest_usd_rate()
     valid: list = []
     discarded: list[tuple[object, str]] = []
 

@@ -89,6 +89,7 @@ class Alert(models.Model):
         PRICE_CHANGE = "PRICE", _("Cambio de Precio Competidor")
         DEMAND_DROP = "DEMAND", _("Caída de Demanda")
         GOAL_MET = "GOAL", _("Meta Cumplida")
+        RATE_STALE = "RATE", _("Tasa de Cambio Desactualizada")
 
     class SeverityChoices(models.TextChoices):
         INFO = "INFO", _("Información")

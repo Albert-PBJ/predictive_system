@@ -12,7 +12,9 @@ from apps.competitor_market_data.scrapers import (
     get_client,
     resolve_location,
 )
-from apps.competitor_market_data.scrapers.validation import clean_product_name, partition_valid
+from apps.competitor_market_data.scrapers.competitors import get_or_create_competitor
+from apps.competitor_market_data.scrapers.persistence import ensure_scrape_run, persist_records
+from apps.competitor_market_data.scrapers.validation import clean_product_name
 
 logger = logging.getLogger(__name__)
 
@@ -259,8 +261,8 @@ def _resolve_instagram_competitor(
         return None, "", "none"
 
     profile_url = f"https://www.instagram.com/{handle}/" if handle else ""
-    comp, created = Competitor.objects.get_or_create(
-        name=name[:150],
+    comp, created = get_or_create_competitor(
+        name[:150],
         defaults={
             "is_active": True,
             "instagram": profile_url,
@@ -421,13 +423,17 @@ def start_instagram_run(urls: list[str], results_limit: int = 50) -> dict:
     return client.actor(INSTAGRAM_ACTOR_ID).start(run_input=actor_input)
 
 
-def finalize_instagram(dataset_id: str) -> list[CompetitorMarketData]:
+def finalize_instagram(dataset_id: str, scrape_run=None) -> list[CompetitorMarketData]:
     """Lee el dataset de un run finalizado, mapea cada post y guarda los registros.
 
     El mapeo de campos es determinista; el producto, la categoría y la
     identificación del competidor se afinan de forma opcional vía LLM (DeepSeek)
-    antes de persistir.
+    antes de persistir. El guardado (snapshot USD, match al catálogo, validación,
+    archivo de descartes y enlace al run) lo centraliza `persist_records`.
     """
+    scrape_run = ensure_scrape_run(
+        scrape_run, CompetitorMarketData.SourceChoices.INSTAGRAM, dataset_id
+    )
     client = get_client()
     items = list(client.dataset(dataset_id).iterate_items())
     logger.info("Se obtuvieron %d posts del dataset de Apify.", len(items))
@@ -436,15 +442,7 @@ def finalize_instagram(dataset_id: str) -> list[CompetitorMarketData]:
     _enrich_posts(pairs)
 
     instances = [instance for instance, _ in pairs]
-    # Descarta registros con datos no plausibles (precio fuera de rango, sin
-    # nombre de producto) para no contaminar el dataset de los modelos de ML.
-    valid, _discarded = partition_valid(instances)
-    created = CompetitorMarketData.objects.bulk_create(valid)
-    logger.info(
-        "Se guardaron %d registros en CompetitorMarketData (de %d recolectados).",
-        len(created), len(instances),
-    )
-    return created
+    return persist_records(instances, scrape_run=scrape_run, llm_used=deepseek.is_enabled())
 
 
 def scrape_instagram_profiles(

@@ -12,6 +12,10 @@ class ProductSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = "__all__"
+        # El stock es de solo lectura aquí a propósito: el inventario es
+        # append-only (se ajusta vía InventoryMovement en el módulo de Inventario),
+        # así que editar un producto nunca puede mover el stock sin dejar rastro.
+        read_only_fields = ("stock", "created_at", "updated_at")
 
     def get_low_stock(self, obj):
         return obj.stock <= obj.min_stock

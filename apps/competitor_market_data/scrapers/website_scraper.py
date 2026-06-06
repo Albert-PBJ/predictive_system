@@ -17,7 +17,9 @@ from apps.competitor_market_data.scrapers import (
     prettify_site_name,
     resolve_location,
 )
-from apps.competitor_market_data.scrapers.validation import clean_product_name, partition_valid
+from apps.competitor_market_data.scrapers.competitors import get_or_create_competitor
+from apps.competitor_market_data.scrapers.persistence import ensure_scrape_run, persist_records
+from apps.competitor_market_data.scrapers.validation import clean_product_name
 
 logger = logging.getLogger(__name__)
 
@@ -237,8 +239,8 @@ def _resolve_competitor(source_url: str, competitor_name: Optional[str]) -> Comp
     """
     name = _competitor_name_for(source_url, competitor_name)
 
-    competitor, created = Competitor.objects.get_or_create(
-        name=name,
+    competitor, created = get_or_create_competitor(
+        name,
         defaults={
             "website": _base_url(source_url),
             "is_active": True,
@@ -310,14 +312,19 @@ def finalize_website(
     dataset_id: str,
     urls: list[str],
     competitor_name: Optional[str] = None,
+    scrape_run=None,
 ) -> list[CompetitorMarketData]:
     """
     Lee el dataset de un run finalizado, normaliza la estructura del AI scraper,
-    resuelve el FK a Competitor (get_or_create por nombre) y guarda los registros.
+    resuelve el FK a Competitor (dedupe difuso por nombre) y guarda los registros.
 
     A diferencia de Instagram y Facebook, este scraper resuelve el FK a Competitor
-    en lugar de dejar competitor=None.
+    en lugar de dejar competitor=None. El guardado (snapshot USD, match al catálogo,
+    validación, archivo de descartes y enlace al run) lo centraliza `persist_records`.
     """
+    scrape_run = ensure_scrape_run(
+        scrape_run, CompetitorMarketData.SourceChoices.WEBSITE, dataset_id, query=urls or [],
+    )
     client = get_client()
 
     try:
@@ -387,20 +394,12 @@ def finalize_website(
         logger.error("Ningún producto pudo ser mapeado. No se guardarán registros.")
         return []
 
-    # Descarta registros con datos no plausibles (precio fuera de rango, sin
-    # nombre de producto) para no contaminar el dataset de los modelos de ML.
-    instances, _discarded = partition_valid(instances)
-    if not instances:
-        logger.warning(
-            "Todos los productos fueron descartados por la validación de calidad. "
-            "No se guardarán registros."
-        )
-        return []
-
+    # Snapshot USD + match al catálogo + validación de calidad (descarta lo no
+    # plausible y archiva los descartes) + enlace al run, todo en persist_records.
     try:
-        created = CompetitorMarketData.objects.bulk_create(instances)
+        created = persist_records(instances, scrape_run=scrape_run, llm_used=False)
     except Exception as exc:
-        logger.error("Error en bulk_create de CompetitorMarketData: %s", exc, exc_info=True)
+        logger.error("Error al persistir CompetitorMarketData: %s", exc, exc_info=True)
         raise ValueError(f"Error al guardar los datos en la base de datos: {exc}") from exc
 
     logger.info("Se guardaron %d registros en CompetitorMarketData.", len(created))

@@ -174,10 +174,13 @@ def enrich_listing(
 
     try:
         client = _get_client()
-    except ImportError:
+    except ImportError as exc:
         logger.warning(
-            "El paquete 'openai' no está instalado; se omite el enriquecimiento LLM. "
-            "Instálalo con: pip install openai"
+            "No se pudo importar el SDK 'openai' (falta el paquete o una de sus "
+            "dependencias, p. ej. un binario de pydantic_core que no coincide con la "
+            "versión de Python): %s. Se omite el enriquecimiento LLM. Verifica la "
+            "instalación con: pip install openai",
+            exc,
         )
         return dict(_EMPTY_RESULT)
     except Exception as exc:  # configuración inválida, etc.
@@ -360,10 +363,13 @@ def enrich_instagram_post(
 
     try:
         client = _get_client()
-    except ImportError:
+    except ImportError as exc:
         logger.warning(
-            "El paquete 'openai' no está instalado; se omite el enriquecimiento LLM. "
-            "Instálalo con: pip install openai"
+            "No se pudo importar el SDK 'openai' (falta el paquete o una de sus "
+            "dependencias, p. ej. un binario de pydantic_core que no coincide con la "
+            "versión de Python): %s. Se omite el enriquecimiento LLM. Verifica la "
+            "instalación con: pip install openai",
+            exc,
         )
         return dict(_IG_EMPTY_RESULT)
     except Exception as exc:
@@ -395,6 +401,125 @@ def enrich_instagram_post(
     except Exception as exc:
         logger.warning("Falló el enriquecimiento de post de Instagram vía DeepSeek: %s", exc)
         return dict(_IG_EMPTY_RESULT)
+
+
+# ── Match de productos contra el catálogo propio (opcional) ───────────────────
+#
+# Para las filas scrapeadas que el matcher determinista NO logró asociar a un
+# producto propio, el LLM propone —en UN solo llamado por lote— cuál producto del
+# catálogo es el equivalente (o ninguno). Mismo interruptor (`is_enabled`) y misma
+# degradación segura que el resto del módulo.
+
+_MAX_CATALOG = 200          # tope de productos del catálogo enviados en el prompt
+_MAX_MATCH_ITEMS = 40       # tope de anuncios por llamada (el llamador trocea)
+
+_PRODUCT_MATCH_SYSTEM_PROMPT = (
+    "Eres un asistente que asocia nombres de productos de mobiliario scrapeados de "
+    "anuncios con el CATÁLOGO PROPIO de una empresa de muebles de oficina en "
+    "Venezuela. Para cada anuncio, decide cuál producto del catálogo es el MISMO "
+    "producto o el equivalente más cercano, o ninguno. Respondes únicamente con un "
+    "objeto JSON. Regla crítica: NO inventes; si ninguno corresponde con razonable "
+    "certeza, usa product_id=null."
+)
+
+
+def _build_product_match_prompt(scraped: list[dict], catalog: list[dict]) -> str:
+    """Arma el prompt de match de productos. Incluye la palabra 'json' (modo JSON)."""
+    catalog_block = "\n".join(f"- id={c['id']}: {c['name']}" for c in catalog) or "(vacío)"
+    items_block = "\n".join(
+        f"- index={s['index']}: {s['name']}"
+        + (f" (categoría: {s['category']})" if s.get("category") else "")
+        for s in scraped
+    )
+    return (
+        "Catálogo propio (productos a los que se puede asociar):\n"
+        f"{catalog_block}\n\n"
+        "Anuncios scrapeados a asociar:\n"
+        f"{items_block}\n\n"
+        'Devuelve un JSON con esta forma EXACTA: '
+        '{"matches": [{"index": <int>, "product_id": <int|null>, "confidence": <number 0..1>}]}\n'
+        "- Incluye UNA entrada por cada anuncio (usa su index).\n"
+        "- product_id debe ser uno de los id del catálogo, o null si ninguno es el "
+        "mismo producto ni un equivalente claro.\n"
+        "- Asocia aunque haya diferencias de mayúsculas, acentos, plural o palabras "
+        "de relleno (p. ej. 'Juego de comedor RETRO' ↔ 'Juego de comedor retro', "
+        "'Silla Trendy' ↔ 'Silla de oficina Trendy'). Ante la duda real, usa null.\n"
+        "- confidence: qué tan seguro estás del match (0 a 1)."
+    )
+
+
+def _sanitize_product_matches(data: dict, valid_ids: set) -> dict:
+    """Normaliza la respuesta del modelo a ``{index: {"product_id", "confidence"}}``.
+
+    Descarta entradas mal formadas y los product_id que no estén en el catálogo.
+    """
+    out: dict = {}
+    matches = data.get("matches") if isinstance(data, dict) else None
+    if not isinstance(matches, list):
+        return out
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        idx = m.get("index")
+        pid = m.get("product_id")
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            continue
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid not in valid_ids:
+            continue
+        try:
+            conf = float(m.get("confidence"))
+        except (TypeError, ValueError):
+            conf = 0.0
+        out[idx] = {"product_id": pid, "confidence": conf}
+    return out
+
+
+def match_products(scraped: list[dict], catalog: list[dict]) -> dict:
+    """Asocia, vía LLM, nombres scrapeados a productos del catálogo (un solo llamado).
+
+    ``scraped``: ``[{"index": int, "name": str, "category": str|None}]``.
+    ``catalog``: ``[{"id": int, "name": str}]``.
+    Retorna ``{index: {"product_id": int, "confidence": float}}`` solo para los
+    matches que el modelo propuso. Ante cualquier problema (deshabilitado, sin SDK,
+    error de red/JSON) retorna ``{}`` sin lanzar excepción.
+    """
+    if not is_enabled() or not scraped or not catalog:
+        return {}
+
+    try:
+        client = _get_client()
+    except ImportError as exc:
+        logger.warning(
+            "No se pudo importar el SDK 'openai' (falta el paquete o una dependencia, "
+            "p. ej. el binario de pydantic_core): %s. Se omite el match de productos LLM.",
+            exc,
+        )
+        return {}
+    except Exception as exc:
+        logger.warning("No se pudo crear el cliente de DeepSeek: %s", exc)
+        return {}
+
+    catalog = catalog[:_MAX_CATALOG]
+    scraped = scraped[:_MAX_MATCH_ITEMS]
+    valid_ids = {c["id"] for c in catalog}
+
+    try:
+        response = client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[
+                {"role": "system", "content": _PRODUCT_MATCH_SYSTEM_PROMPT},
+                {"role": "user", "content": _build_product_match_prompt(scraped, catalog)},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=1500,
+            stream=False,
+        )
+        content = response.choices[0].message.content or "{}"
+        return _sanitize_product_matches(json.loads(content), valid_ids)
+    except Exception as exc:
+        logger.warning("Falló el match de productos vía DeepSeek: %s", exc)
+        return {}
 
 
 # ── Diagnóstico de conexión (para el endpoint de prueba) ──────────────────────
@@ -500,11 +625,15 @@ def check_connection(
 
     try:
         client = _get_client()
-    except ImportError:
+    except ImportError as exc:
         diagnostic["error"] = {
             "stage": "client",
-            "type": "ImportError",
-            "message": "El paquete 'openai' no está instalado. Instálalo con: pip install openai",
+            "type": type(exc).__name__,
+            "message": (
+                f"No se pudo importar el SDK 'openai' (falta el paquete o una de sus "
+                f"dependencias, p. ej. un binario de pydantic_core que no coincide con "
+                f"la versión de Python): {exc}"
+            ),
         }
         return diagnostic
     except Exception as exc:
