@@ -8,6 +8,11 @@ class PredictionLog(models.Model):
         PRICE_TREND = "PRICE", _("Tendencia de Precios")
         SEASONAL_PATTERN = "SEASON", _("Patrón Estacional")
         COMPETITOR_BENCHMARK = "BENCH", _("Benchmarking de Competidores")
+        SALES_FORECAST = "SALES", _("Pronóstico de Ventas e Ingresos")
+        EXCHANGE_RATE = "RATE", _("Pronóstico de Tasa de Cambio")
+        PROFIT_FORECAST = "PROFIT", _("Pronóstico de Utilidad y Margen")
+        INVENTORY_FORECAST = "INVENT", _("Reabastecimiento de Inventario")
+        QUOTE_CONVERSION = "QUOTE", _("Conversión de Presupuestos")
 
     name = models.CharField(
         max_length=200,

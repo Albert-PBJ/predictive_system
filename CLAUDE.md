@@ -47,6 +47,15 @@ python manage.py seed_company_data --purge-demo    # elimina además los datos d
 python manage.py seed_company_data --no-fresh      # añade sin borrar la historia previa
 python manage.py seed_company_data --resources "C:/ruta/resources" --seed 7
 
+# Entrena, evalúa y registra los modelos del módulo predictivo (apps/analytics).
+# Para cada objetivo de serie temporal entrena las TRES técnicas (regresión lineal,
+# árbol de decisión, XGBoost), imprime una tabla comparativa de R²/RMSE/MAE y escribe
+# las métricas en PredictionLog (marca activa la técnica asignada a ese gráfico). NO es
+# obligatorio: la API entrena bajo demanda y cachea; este comando puebla el panel de
+# registro de modelos y deja evidencia reproducible.
+python manage.py train_models
+python manage.py train_models --product 133   # producto base para demanda/precio
+
 # Update the exchange rate (BCV + parallel) and raise a freshness Alert if stale.
 # Pulls from pyDolarVe by default (override with EXCHANGE_RATE_API_URL); degrades
 # gracefully with no network. --bcv/--parallel load manually; --check-only just
@@ -87,7 +96,7 @@ This API has all of its comments as well as API responses in Spanish. Functions,
 | `apps/sales` | Transactions: Sale, SaleItem, Quote, QuoteItem. **REST API for registering sales** (`SaleViewSet` + `services.py`) |
 | `apps/inventory` | Audit trail: InventoryMovement (every stock change logged). **REST API for stock control** (`InventoryMovementViewSet`, `StockListView` + `services.py`) |
 | `apps/benchmarking` | Competitor intelligence: Competitor, CompetitorMarketData (with USD snapshot, `listing_key`, own-`Product` match, provenance), ScrapeRun (run traceability), RejectedMarketData (archived discards). Admin `merge_competitors` action |
-| `apps/analytics` | ML layer: PredictionLog (model registry), KPI, Alert |
+| `apps/analytics` | ML / predictive layer: PredictionLog (model registry), KPI, Alert; the `ml/` package (datasets→features→estimators→forecasters→registry), the `/api/analytics/` forecast API (`IsManager`), and the `train_models` command. See **Predictive / ML module** below |
 | `apps/competitor_market_data` | Apify scraper integration + REST endpoints to trigger scrapers |
 | `apps/products` | REST API (ModelViewSet) for Product CRUD — thin layer over `apps/core` models. **`stock` is read-only** in the serializer (it only moves via `InventoryMovement`), so editing a product can't bypass the audit trail. Read = operativo, write = Manager+ |
 | `apps/customers` | REST API (ModelViewSet) for Customer CRUD — thin layer over `apps/core` (no models of its own), same pattern as `apps/products` |
@@ -166,6 +175,7 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 /api/inventory/stock          → current stock summary per product (ver = operativo)
 /api/inventory/movements/     → InventoryMovementViewSet: history (ver = operativo) + register ENT/AJU/DEV (Inventario+)
 /api/exchange-rate/latest     → latest BCV/parallel rate, read-only (Seller+)
+/api/analytics/               → predictive module (Manager+): overview, forecast/{demand,sales,profit,exchange-rate,product-price,inventory,quote-conversion}, benchmark/competitors, forecastable-products
 /scrapers/                    → <source>/start, <source>/status, <source>/finalize (ADMIN only)
 ```
 
@@ -210,6 +220,48 @@ and both run inside a single `transaction.atomic` so a sale/movement never lands
 
 The sale/inventory viewsets implement this per-action in `get_permissions()` (create vs anular vs the
 read default).
+
+### Predictive / ML module (`apps/analytics`)
+
+The ML layer turns the seeded history into decision-support forecasts. Code lives in
+`apps/analytics/ml/` and is served by `IsManager`-gated `APIView`s at `/api/analytics/`.
+
+- **`ml/datasets.py`** — read-only ORM→pandas builders, aggregated to monthly granularity
+  with gaps filled (`monthly_company`, `monthly_demand_panel`, `monthly_exchange_rate`,
+  `product_price_series`, `quotes_dataframe`, `competitor_observations` — deduped to the
+  latest per `listing_key`). Also the per-period drill-down helpers used by **"Ver datos"**.
+- **`ml/features.py`** — period helpers (`"YYYY-MM"`), Spanish labels, calendar features
+  (month sin/cos, quarter, time index).
+- **`ml/estimators.py`** — the estimator factory: `"linear"`→Ridge (scaled Pipeline) /
+  LogisticRegression, `"tree"`→DecisionTree, `"xgboost"`→XGBoost; `feature_importances()`.
+- **`ml/forecasters.py`** — one builder per target returning a **uniform dict**
+  (`history`/`forecast`/`detail`/`model`/`meta`). `forecast_series` is the shared workhorse:
+  builds a supervised matrix (calendar + lags + optional exogenous rate-shock), measures error
+  with a **time-based holdout** (one-step backtest → R²/RMSE/MAE), refits on all data, then
+  **recursively forecasts H months** with a residual-σ confidence band (~90%, widening by √step).
+  Demand uses a **single global XGBoost panel** (all products; product/category + lags + base
+  price + shock) sliced per product at serve time. Exchange rate & price model **log(value)**
+  (the bolívar devalues exponentially → linear-on-log beats trees, which can't extrapolate).
+  `competitor_analysis` is **separate** (cross-sectional positioning + like-with-like via the
+  existing product match + a linear price trend); `forecast_quote_conversion` is a **classifier**
+  (probability + expected pipeline).
+- **`ml/registry.py`** — in-process cache keyed by a cheap **data fingerprint** (counts + last
+  mod), so endpoints **lazy-train on demand and cache** (training is sub-second) and invalidate
+  when data changes; plus joblib helpers and `upsert_prediction_log`.
+
+**Model assignment** (each required technique used where it performs best; `ASSIGNED_MODEL`):
+XGBoost→demand/inventory, Decision Tree→quote conversion, linear regression→sales/profit/
+exchange-rate/product-price/competitor-trend. Override per request with `?model=linear|tree|xgboost`.
+
+**`manage.py train_models`** trains all three techniques per series target, prints a comparison
+table, and writes `PredictionLog` rows (`is_active` = the assigned technique). `ModelTypeChoices`
+was extended with `SALES`/`RATE`/`PROFIT`/`INVENT`/`QUOTE` (migration `0003`). Optional —
+serving works without it. Settings adds `ML_MODELS_DIR` (default `BASE_DIR/ml_models`, created
+on demand). Requires `scikit-learn`/`xgboost`/`joblib` (in `requirements.txt`; cp314 wheels OK).
+
+Every forecast response carries a `detail` map keyed by period: **historical** months hold the
+source rows (the month's sales / sale items / rate records / price changes), **forecast** months
+hold the model's input feature values — this powers the frontend's per-chart **"Ver datos"** table.
 
 ### Key Design Decisions
 

@@ -245,3 +245,10 @@ LOGGING = {
         },
     },
 }
+
+# ---------------------------------------------------------------------------
+# Capa de Machine Learning (módulo predictivo, apps/analytics)
+# ---------------------------------------------------------------------------
+# Carpeta donde se serializan (joblib) los modelos entrenados. Se crea bajo demanda
+# en apps/analytics/ml/registry.py. No se versiona (artefactos binarios).
+ML_MODELS_DIR = Path(os.environ.get("ML_MODELS_DIR", BASE_DIR / "ml_models"))
