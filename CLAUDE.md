@@ -27,6 +27,26 @@ python manage.py makemigrations
 # WAREHOUSE / inventory-manager user (inventario1).
 python manage.py seed_demo_data
 
+# Load the FULL historical company database (real + synthetic), 2022 → March 2026.
+# Reads the company's real files from ../resources/ (products from the 2018/2025 price
+# lists, 3.3k customers/prospects, real Jan–Feb 2022 sales, a real May-2026 quote) and
+# generates a coherent operating history on top: monthly BCV+parallel exchange rates
+# following the real bolívar trajectory, price history, ~1k sales with line items,
+# append-only inventory movements (stock = Σ movements, never negative), and quotes.
+# The synthetic data has REAL economic relationships baked in so the ML models have
+# something to learn (not just trend+seasonality): per-product popularity, price→quantity
+# elasticity, an exchange-rate-shock dip in demand (shock = devaluation ABOVE the recent
+# inflation norm, so it's not collinear with the growth trend), and feature-driven quote
+# conversion (installation/deal-size/customer-type/rate-shock decide if a quote closes;
+# converted quotes spawn their sale). Idempotent & deterministic (--fresh wipes the
+# transactional/time-series tables and regenerates; products/customers upserted by
+# SKU/RIF). See command docstring for detail.
+python manage.py seed_company_data                 # carga completa (recomendado)
+python manage.py seed_company_data --scale 1.5     # más volumen de ventas
+python manage.py seed_company_data --purge-demo    # elimina además los datos de seed_demo_data
+python manage.py seed_company_data --no-fresh      # añade sin borrar la historia previa
+python manage.py seed_company_data --resources "C:/ruta/resources" --seed 7
+
 # Update the exchange rate (BCV + parallel) and raise a freshness Alert if stale.
 # Pulls from pyDolarVe by default (override with EXCHANGE_RATE_API_URL); degrades
 # gracefully with no network. --bcv/--parallel load manually; --check-only just
