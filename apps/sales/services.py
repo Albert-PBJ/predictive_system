@@ -120,21 +120,39 @@ def create_sale(
 
     total_sale = Decimal("0")
     total_cost = Decimal("0")
+    total_discount = Decimal("0")
 
     for it in items:
         product = products[it["product"]]
         qty = it["quantity"]
-        unit_sale = it.get("unit_sale_price_usd")
-        unit_sale = _money(unit_sale if unit_sale is not None else product.sale_price_usd)
+        # El precio de lista (snapshot del catálogo) es la referencia del descuento.
+        list_price = _money(product.sale_price_usd or 0)
+        # La línea puede traer un % de descuento o, en su defecto, un precio neto
+        # explícito; se mantienen consistentes los tres valores (lista, %, neto).
+        disc_pct = it.get("discount_pct")
+        unit_sale_in = it.get("unit_sale_price_usd")
+        if disc_pct is not None:
+            disc_pct = Decimal(str(disc_pct))
+            unit_sale = _money(list_price * (Decimal("1") - disc_pct / Decimal("100")))
+        elif unit_sale_in is not None:
+            unit_sale = _money(unit_sale_in)
+            disc_pct = ((Decimal("1") - unit_sale / list_price) * Decimal("100")) if list_price > 0 else Decimal("0")
+        else:
+            unit_sale = list_price
+            disc_pct = Decimal("0")
+        disc_pct = max(Decimal("0"), disc_pct).quantize(CENTS, rounding=ROUND_HALF_UP)
         unit_cost = _money(product.purchase_price_usd or 0)
         subtotal_sale = _money(unit_sale * qty)
         subtotal_cost = _money(unit_cost * qty)
         line_profit = subtotal_sale - subtotal_cost
+        line_discount = max(Decimal("0"), _money((list_price - unit_sale) * qty))
 
         SaleItem.objects.create(
             sale=sale,
             product=product,
             quantity=qty,
+            unit_list_price_usd=list_price,
+            discount_pct=disc_pct,
             unit_sale_price_usd=unit_sale,
             unit_cost_price_usd=unit_cost,
             subtotal_sale_usd=subtotal_sale,
@@ -144,6 +162,7 @@ def create_sale(
 
         total_sale += subtotal_sale
         total_cost += subtotal_cost
+        total_discount += line_discount
 
         if discounts_stock:
             # Salida de inventario (append-only) ligada a esta venta.
@@ -164,6 +183,7 @@ def create_sale(
     sale.total_sale_usd = total_sale
     sale.total_cost_usd = total_cost
     sale.total_profit_usd = total_profit
+    sale.total_discount_usd = total_discount
     sale.commission_usd = commission
     sale.total_sale_ves = _money(total_sale * eff_rate) if eff_rate else None
     sale.save(
@@ -171,6 +191,7 @@ def create_sale(
             "total_sale_usd",
             "total_cost_usd",
             "total_profit_usd",
+            "total_discount_usd",
             "commission_usd",
             "total_sale_ves",
             "updated_at",

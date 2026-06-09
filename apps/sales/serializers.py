@@ -21,6 +21,8 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "product_name",
             "product_sku",
             "quantity",
+            "unit_list_price_usd",
+            "discount_pct",
             "unit_sale_price_usd",
             "unit_cost_price_usd",
             "subtotal_sale_usd",
@@ -54,6 +56,7 @@ class SaleSerializer(serializers.ModelSerializer):
             "total_sale_usd",
             "total_cost_usd",
             "total_profit_usd",
+            "total_discount_usd",
             "total_sale_ves",
             "commission_usd",
             "bcv_rate",
@@ -83,7 +86,14 @@ class SaleItemInputSerializer(serializers.Serializer):
 
     product = serializers.IntegerField(min_value=1)
     quantity = serializers.IntegerField(min_value=1)
-    # Opcional: si se omite, el servicio usa el precio de venta actual del producto.
+    # Descuento por línea (%). Si se envía, el servicio calcula el precio neto a
+    # partir del precio de lista del producto.
+    discount_pct = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=100
+    )
+    # Opcional: precio neto explícito. Si se omite (y no hay descuento), el servicio
+    # usa el precio de venta actual del producto. Si se envía `discount_pct`, este
+    # se ignora (manda el descuento).
     unit_sale_price_usd = serializers.DecimalField(
         max_digits=10, decimal_places=2, required=False, allow_null=True, min_value=0
     )

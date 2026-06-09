@@ -1,23 +1,32 @@
-"""Carga la base de datos histórica de **Inversiones Maescar C.A.** (2022 → marzo 2026).
+"""Carga la base de datos histórica de **Inversiones Maescar C.A.** (2022 → abril 2026).
 
 Combina dos fuentes:
 
 1. **Datos reales** tomados de los archivos de la empresa en ``resources/``:
-   - Productos y precios (``Cuadro ajuste de precios 27.03.2025.xlsx`` y ``PRECIOS 2018.xlsx``).
+   - Catálogo y precios de venta vigentes (``Lista de Precios Maescar.xlsx``) — precios por
+     encima del mercado; el costo se deriva de un margen objetivo (~33%).
    - 3.333 clientes/prospectos (``Base de datos de clientes  y prospectos.xlsx``).
    - Ventas reales de enero–febrero 2022 (``Cuadro de Ventas.xlsx``).
    - Un presupuesto real de mayo 2026 (``Formato de presupuesto nuevo 28.03.xlsx``).
    - Vendedores reales (Mariangel Escobar, Renny Durán) y la cuenta bancaria/RIF de la empresa.
 
 2. **Datos sintéticos pero verosímiles** que rellenan la operación mes a mes desde
-   enero 2022 hasta marzo 2026: ventas, líneas de venta, movimientos de inventario,
-   historial de precios y presupuestos. Las **tasas de cambio** (BCV + paralela) siguen
-   la trayectoria real del bolívar investigada para ese período (de ~4,2 Bs/USD en enero
-   2022 a 563 Bs/USD en junio 2026), por lo que los valores en VES son realistas.
+   enero 2022 hasta abril 2026: ventas (con su **descuento** por línea y total), líneas de
+   venta, movimientos de inventario, historial de precios y presupuestos. Las **tasas de
+   cambio** (BCV + paralela) siguen la trayectoria real del bolívar (~4,2 → 563 Bs/USD).
 
-El comando es **autocontenido**: no depende de ``seed_demo_data``. Por defecto regenera
-toda la historia transaccional (``--fresh``) para que volver a ejecutarlo sea determinista
-y no duplique ventas. Los productos y clientes se cargan con ``get_or_create`` (idempotente).
+   El relato de negocio que llevan los datos (para que el sistema ayude a decidir):
+   el **detal se estanca y cae** (clientes pequeños se van a la competencia más barata),
+   mientras lo **institucional/proyectos crece** y sostiene a la empresa; el total queda
+   "a flote" pero sin crecer, con un **bache por el shock político de ene-2026** (el dólar
+   paralelo se dispara y enfría la demanda). El shock va ligado a la tasa, así que los
+   modelos lo aprenden por su variable ``shock_cambiario`` (R² alto). El ruido mes a mes
+   es bajo a propósito para que las series sean aprendibles.
+
+El comando es **autocontenido**: no depende de ``seed_demo_data``. Por defecto (``--fresh``)
+**borra ventas, presupuestos, inventario, historial y todo el catálogo de productos** para
+reemplazarlo por la lista de precios vigente (los clientes se conservan/upsertean). Volver
+a ejecutarlo es determinista y no duplica datos.
 
 Uso:
     python manage.py seed_company_data
@@ -29,6 +38,7 @@ Uso:
 
 from __future__ import annotations
 
+import json
 import random
 import re
 import unicodedata
@@ -53,9 +63,18 @@ from apps.sales.models import Quote, QuoteItem, Sale, SaleItem
 # --------------------------------------------------------------------------- #
 
 COMPANY_RIF = "J-29982977-3"          # de la nota del presupuesto real
-SYNTH_END = date(2026, 3, 31)          # horizonte de los datos sintéticos
+SYNTH_END = date(2026, 4, 30)          # horizonte de los datos sintéticos (hasta abril 2026)
 PRICE_FACTOR_START = Decimal("0.85")   # los precios en USD eran ~15% menores en 2022-01
 PRICE_FACTOR_START_DATE = date(2022, 1, 1)
+
+# Lista de precios vigente (la última, con precios de venta por encima del mercado).
+PRICE_LIST_FILE = "Lista de Precios Maescar.xlsx"
+
+# Margen bruto objetivo del catálogo (la empresa está cara: márgenes holgados). El
+# costo se deriva del precio de venta de lista. Margen ~33% con poca varianza para que
+# la utilidad sea una fracción estable del ingreso (serie aprendible por los modelos).
+GROSS_MARGIN = 0.33
+GROSS_MARGIN_JITTER = 0.04   # ±4 p.p. por producto (determinista por semilla)
 
 # Categorías del catálogo (orden = prioridad visual) y su prefijo de SKU.
 CATEGORIES = [
@@ -123,10 +142,52 @@ BCV_ANCHORS = {
 TODAY_RATE = (date(2026, 6, 7), Decimal("563.0000"), Decimal("700.0000"))  # dato actual
 
 # Prima del dólar paralelo sobre el BCV (crece con el tiempo): (fecha, prima).
+# El salto de ene-2026 modela el **shock político**: el 3 de enero de 2026 la crisis
+# dispara el dólar paralelo (prima ~1,55), lo que golpea el poder de compra y enfría
+# las ventas — sobre todo el detal. Al estar ligado a la tasa, el modelo lo "ve" por
+# su variable `shock_cambiario` y aprende la caída (se mantiene el R² alto).
 PREMIUM_ANCHORS = [
     (date(2022, 1, 1), 1.05), (date(2023, 1, 1), 1.08), (date(2024, 1, 1), 1.12),
-    (date(2025, 1, 1), 1.18), (date(2026, 1, 1), 1.28), (date(2026, 6, 7), 1.2434),
+    (date(2025, 1, 1), 1.18), (date(2025, 12, 1), 1.27),
+    (date(2026, 1, 20), 1.56),   # pico del paralelo por el shock político
+    (date(2026, 3, 1), 1.32), (date(2026, 6, 7), 1.2434),
 ]
+
+# --------------------------------------------------------------------------- #
+#  Trayectorias de negocio por segmento (detal vs institucional/proyectos).    #
+#  El relato: el DETAL se estanca y cae (clientes pequeños se van a la          #
+#  competencia más barata), mientras lo INSTITUCIONAL (proyectos) crece y       #
+#  sostiene a la empresa. En el último año el total queda "a flote" pero sin     #
+#  crecer, con un bache por el shock político de ene-2026. El sistema ayuda a     #
+#  decidir (precios, demanda, inventario) para retomar el crecimiento.           #
+#  Puntos de control (índice de mes desde 2022-01) → multiplicador de volumen.   #
+# --------------------------------------------------------------------------- #
+# El detal sube hasta mediados de 2024 y luego CAE (el problema: la empresa pierde
+# al cliente pequeño por estar cara). Lo institucional crece a una tasa **constante**
+# (~2,3%/mes → exponencial, log-lineal) y sostiene a la empresa. Como lo institucional
+# domina el ingreso, el agregado crece de forma suave y CONSISTENTE en el tiempo (sin
+# cambio de régimen), por lo que el modelo lo aprende bien (R² alto); el estancamiento
+# del negocio se ve en el DETAL, no en el agregado (separa relato y aprendibilidad).
+RETAIL_TREND = {0: 1.00, 12: 1.45, 24: 1.80, 30: 1.85, 38: 1.65, 46: 1.42, 52: 1.20}
+INSTITUTIONAL_GROWTH = 0.023   # crecimiento mensual constante del segmento institucional
+
+# Ingreso mensual OBJETIVO por segmento (USD, antes de tendencia/estacionalidad). La
+# generación rellena ventas hasta alcanzar el objetivo, de modo que el ingreso mensual
+# es una serie SUAVE (señal >> ruido) y los modelos la aprenden bien (R² alto), en vez
+# de emerger de pocas ventas grandes y lumpy. Calibrado para una PYME a flote (~25-30k/mes).
+RETAIL_REV_BASE = 1750.0
+INSTITUTIONAL_REV_BASE = 8500.0
+# Nº base de presupuestos (proyectos) por mes — pipeline del clasificador de conversión.
+BASE_QUOTES = 6.5
+
+# Sensibilidad de la demanda al shock cambiario por segmento: el detal es
+# discrecional y sensible al precio; los proyectos institucionales ya están
+# contratados y resisten mejor.
+SHOCK_SENSITIVITY = {"retail": 0.45, "institutional": 0.18}
+
+# Descuentos típicos por segmento (media, dispersión). Lo institucional negocia
+# más por volumen; el detal, menos. Poca dispersión → utilidad predecible.
+DISCOUNT_BANDS = {"retail": (0.05, 0.02), "institutional": (0.11, 0.025)}
 
 # Vendedores reales de Maescar (comisión 10% de la utilidad, como en el Cuadro de Ventas).
 REAL_SELLERS = [
@@ -201,7 +262,6 @@ RESTOCK_NOTES = "Reposición de inventario (compra a proveedor)"
 # Señales económicas inyectadas para que los modelos de ML tengan relaciones reales que
 # aprender (no sólo tendencia + estacionalidad). Documentadas aquí para la tesis.
 DEMAND_PRICE_ELASTICITY = -0.9    # cantidad por línea vs precio relativo: más caro -> menos unidades
-DEMAND_SHOCK_MAX_DIP = 0.40       # caída máxima de la demanda en meses de fuerte devaluación
 
 
 def conversion_probability(total_usd, units, installation, delivery, customer_type,
@@ -211,20 +271,20 @@ def conversion_probability(total_usd, units, installation, delivery, customer_ty
     Da señal aprendible al árbol de decisión: el cierre sube con instalación/despacho,
     con clientes institucionales/empresariales y vendedores estrella; baja con montos
     grandes (decisiones más lentas) y en meses de shock cambiario (devaluación)."""
-    p = 0.34
+    p = 0.30
     if installation:
-        p += 0.12
+        p += 0.20
     if delivery:
-        p += 0.05
+        p += 0.08
     if customer_type == Customer.TypeChoices.INSTITUTIONAL:
-        p += 0.06
+        p += 0.12
     elif customer_type == Customer.TypeChoices.CORPORATE:
-        p += 0.03
-    p -= 0.12 * min(1.0, max(0.0, (float(total_usd) - 300) / 2500))   # montos grandes cierran menos
-    p -= 0.18 * shock                                                  # la devaluación frena el cierre
+        p += 0.06
+    p -= 0.20 * min(1.0, max(0.0, (float(total_usd) - 400) / 3000))   # montos grandes cierran menos
+    p -= 0.30 * shock                                                  # la devaluación frena el cierre
     if is_top_seller:
-        p += 0.05
-    return max(0.05, min(0.85, p))
+        p += 0.08
+    return max(0.03, min(0.93, p))
 
 
 # --------------------------------------------------------------------------- #
@@ -352,6 +412,8 @@ def classify_product(name: str):
     if has("MESA"):
         mat = M.OTHER if has("CERAMICO", "MARMOL") else M.WOOD
         return "Mesas", mat, True, 3
+    if has("BANCADA", "ESPERA"):
+        return "Sillas de Visita", M.METAL, True, 6
     if has("VISITANTE", "VISITA", "EAMES", "TANDEM", "ROMA", "MARONTI"):
         if has("ROMA MESH") or has("MESH"):
             mat = M.MESH
@@ -376,6 +438,26 @@ def classify_product(name: str):
     if has("SILLA"):
         return "Sillas Ejecutivas", M.MESH, True, 5
     return "Accesorios y Repuestos", M.OTHER, True, 4
+
+
+def map_material(text):
+    """Mapea la etiqueta de material de la lista de precios al enum del modelo.
+
+    El orden importa para los compuestos: "Madera / Metal" → Madera (la tapa manda),
+    "Bipiel / Metal" → Bipiel (el asiento manda)."""
+    M = Product.MaterialChoices
+    t = strip_accents(str(text or "")).upper()
+    if "MADERA" in t:
+        return M.WOOD
+    if "BIPIEL" in t:
+        return M.BIPIEL
+    if "MESH" in t or "MALLA" in t:
+        return M.MESH
+    if "TELA" in t:
+        return M.FABRIC
+    if "METAL" in t:
+        return M.METAL
+    return M.OTHER
 
 
 def iter_months(start: date, end: date):
@@ -460,21 +542,32 @@ def _load_openpyxl():
         ) from exc
 
 
-def read_price_sheet(openpyxl, path: Path, sheet: str, name_col, buy_col, sell_col):
+def read_new_price_list(openpyxl, path: Path):
+    """Lee la lista de precios vigente: (nombre, precio_venta, colores, material_txt).
+
+    Columnas: SKU | Nombre del producto | Precio USD | colores (JSON) | material.
+    Sólo trae el precio de **venta** (el costo se deriva del margen objetivo)."""
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-    ws = wb[sheet]
+    ws = wb.active
     out = []
-    for row in ws.iter_rows(values_only=True):
-        if len(row) <= max(name_col, buy_col, sell_col):
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        if i == 0:  # encabezado
             continue
-        name, buy, sell = row[name_col], row[buy_col], row[sell_col]
+        row = list(row) + [None] * 5
+        name, price, colors_raw, material = row[1], row[2], row[3], row[4]
         if not isinstance(name, str) or not name.strip():
             continue
-        if not isinstance(buy, (int, float)) or not isinstance(sell, (int, float)):
+        if not isinstance(price, (int, float)) or price <= 0:
             continue
-        if buy <= 0 or sell <= 0:
-            continue
-        out.append((name.strip(), float(buy), float(sell)))
+        try:
+            colors = json.loads(colors_raw) if isinstance(colors_raw, str) and colors_raw.strip().startswith("[") else []
+        except (ValueError, TypeError):
+            colors = []
+        if not isinstance(colors, list):
+            colors = []
+        out.append((name.strip(), float(price),
+                    [str(c).strip() for c in colors if c],
+                    str(material or "").strip()))
     wb.close()
     return out
 
@@ -492,7 +585,7 @@ def read_customers(openpyxl, path: Path):
 # --------------------------------------------------------------------------- #
 
 class Command(BaseCommand):
-    help = "Carga la base de datos histórica real+sintética de Maescar (2022→mar 2026)."
+    help = "Carga la base de datos histórica real+sintética de Maescar (2022→abr 2026)."
 
     def add_arguments(self, parser):
         parser.add_argument("--resources", type=str, default=None,
@@ -556,13 +649,17 @@ class Command(BaseCommand):
 
     # ---------------------------------------------------------------- wipe -- #
     def _wipe(self, *, purge_demo):
-        self.stdout.write("Borrando historia transaccional previa…")
+        self.stdout.write("Borrando ventas, productos e historia transaccional previa…")
         InventoryMovement.objects.all().delete()
         QuoteItem.objects.all().delete()
         Quote.objects.all().delete()
         SaleItem.objects.all().delete()
         Sale.objects.all().delete()
         ProductPriceHistory.objects.all().delete()
+        # Se borra TODO el catálogo para reemplazarlo por la lista de precios vigente.
+        # Las filas de competencia que apuntaban a un producto quedan en NULL
+        # (FK SET_NULL); se pueden re-asociar luego con `manage.py rematch_products`.
+        Product.objects.all().delete()
         ExchangeRate.objects.all().delete()
         # Reiniciar la condición de cliente activo para que la promoción sea idempotente.
         Customer.objects.update(is_active_customer=False)
@@ -584,39 +681,39 @@ class Command(BaseCommand):
 
     # ------------------------------------------------------------ productos -- #
     def _import_products(self, openpyxl, res, cats):
-        merged = {}  # norm_name -> (display_name, buy, sell)
-
-        def add(name, buy, sell):
-            merged[norm_name(name)] = (name, buy, sell)
-
-        # 2018 primero, luego 2025 (los precios recientes ganan).
-        p2018 = res / "PRECIOS 2018.xlsx"
-        p2025 = res / "Cuadro ajuste de precios 27.03.2025.xlsx"
-        for nm, b, s in read_price_sheet(openpyxl, p2018, "Hoja1", 1, 2, 5):
-            add(nm, b, s)
-        for nm, b, s in read_price_sheet(openpyxl, p2025, "CUADRO AJUSTE PRECIOS", 1, 2, 4):
-            add(nm, b, s)
-        for nm, b, s in CURATED_EXTRA_PRODUCTS:
-            if norm_name(nm) not in merged:
-                add(nm, b, s)
+        # norm_name -> (display_name, sale_usd, colors, material_text|None)
+        merged = {}
+        price_path = res / PRICE_LIST_FILE
+        if not price_path.exists():
+            raise CommandError(f"No se encontró la lista de precios vigente: {price_path}")
+        for name, sell, colors, material in read_new_price_list(openpyxl, price_path):
+            merged[norm_name(name)] = (name, sell, colors, material)
+        # Productos que sólo aparecen en las ventas reales (no en la lista vigente):
+        # se conservan para que esas ventas resuelvan a un producto real.
+        for name, _buy, sell in CURATED_EXTRA_PRODUCTS:
+            if norm_name(name) not in merged:
+                merged[norm_name(name)] = (name, float(sell), [], None)
 
         counters = {prefix: 0 for prefix in CAT_PREFIX.values()}
         created = 0
         self._products = []
-        for _key, (name, buy, sell) in sorted(merged.items()):
-            cat_name, material, manufactured, min_stock = classify_product(name)
+        for _key, (name, sell, colors, material_text) in sorted(merged.items()):
+            cat_name, mat_default, manufactured, min_stock = classify_product(name)
+            material = map_material(material_text) if material_text else mat_default
+            # La empresa está cara: el costo se deriva de un margen bruto objetivo
+            # (~33% ± jitter), por lo que la utilidad es una fracción estable del ingreso.
+            margin = GROSS_MARGIN + self.rng.uniform(-GROSS_MARGIN_JITTER, GROSS_MARGIN_JITTER)
+            buy = sell * (1.0 - margin)
             prefix = CAT_PREFIX[cat_name]
             counters[prefix] += 1
             sku = f"MSC-{prefix}-{counters[prefix]:03d}"
             display = title_es(name)
-            # update_or_create mantiene el catálogo sincronizado con la fuente en cada corrida
-            # (nombre, precios, clasificación). El stock se fija luego desde los movimientos.
             prod, was_created = Product.objects.update_or_create(
                 sku=sku,
                 defaults=dict(
                     name=trunc(display, 100), full_name=trunc(display, 255),
                     category=cats[cat_name], material=material,
-                    colors=CAT_COLORS.get(cat_name, []),
+                    colors=colors or CAT_COLORS.get(cat_name, []),
                     purchase_price_usd=d2(buy), sale_price_usd=d2(sell),
                     min_stock=min_stock, is_manufactured=manufactured,
                     is_active=True,
@@ -640,12 +737,22 @@ class Command(BaseCommand):
     }
 
     def _assign_popularity(self):
-        self._pop_weights = []
+        # Popularidad DETERMINISTA (sin azar) para que los productos "estrella" sean
+        # estables entre corridas y su demanda mensual sea de mayor magnitud y suave
+        # (menos ruido de Poisson) → el modelo de demanda la aprende mejor. El ~20% con
+        # mayor puntaje (sillas económicas de categorías populares) recibe un ×4.5.
+        base_scores = []
         for p in self._products:
             price = float(p.sale_price_usd)
             tier = 3.0 if price <= 80 else 1.6 if price <= 200 else 0.7
             cf = self._CAT_POPULARITY.get(p.category.name, 1.0)
-            self._pop_weights.append(max(0.05, tier * cf * self.rng.uniform(0.6, 1.4)))
+            base_scores.append(tier * cf)
+        order = sorted(range(len(base_scores)), key=lambda i: base_scores[i], reverse=True)
+        n_star = max(1, int(round(len(base_scores) * 0.20)))
+        stars = set(order[:n_star])
+        self._pop_weights = [
+            max(0.03, s * (4.5 if i in stars else 1.0)) for i, s in enumerate(base_scores)
+        ]
 
     def _weighted_sample(self, k):
         """Muestra k productos sin reemplazo, ponderando por popularidad."""
@@ -685,9 +792,31 @@ class Command(BaseCommand):
             cache[key] = max(0.0, min(1.0, (g - norm) / 0.20))
         return cache[key]
 
-    def _affordability(self, d):
-        """Multiplicador de demanda por poder de compra (cae en meses de devaluación)."""
-        return 1.0 - DEMAND_SHOCK_MAX_DIP * self._rate_shock(d)
+    def _affordability(self, d, segment):
+        """Multiplicador de demanda por poder de compra (cae con el shock cambiario).
+
+        El detal (discrecional, sensible al precio) cae más que lo institucional
+        (proyectos ya contratados). Como el shock se deriva de la tasa, el modelo lo
+        ve por su variable ``shock_cambiario`` y la caída queda aprendible."""
+        return 1.0 - SHOCK_SENSITIVITY[segment] * self._rate_shock(d)
+
+    @staticmethod
+    def _month_index(y, m):
+        """Índice de mes desde 2022-01 (0-based)."""
+        return (y - 2022) * 12 + (m - 1)
+
+    @staticmethod
+    def _interp(points: dict, t: float) -> float:
+        """Interpolación lineal entre puntos de control {índice: valor}."""
+        keys = sorted(points)
+        if t <= keys[0]:
+            return points[keys[0]]
+        if t >= keys[-1]:
+            return points[keys[-1]]
+        for a, b in zip(keys, keys[1:]):
+            if a <= t <= b:
+                return points[a] + (points[b] - points[a]) * (t - a) / (b - a)
+        return points[keys[-1]]
 
     def _resolve_product(self, fuzzy_name):
         """Resuelve un nombre suelto (de una venta real) al producto más parecido."""
@@ -812,69 +941,77 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(f"Tasas de cambio: {len(objs)} (2022 a hoy)."))
 
     # ----------------------------------------------------------- ventas ---- #
-    def _make_sale_dict(self, d, customer, seller, items_spec, *, status=None):
-        """items_spec: lista de (producto, cant, unit_sale, unit_cost)."""
+    def _make_sale_dict(self, d, customer, seller, items_spec, *, sale_type, status=None):
+        """items_spec: lista de (producto, cant, precio_lista, unit_sale, unit_cost, disc_pct)."""
         bcv, par = self.rates.for_date(d)
         items = []
-        total_sale = total_cost = Decimal("0")
-        units = 0
-        for prod, qty, usale, ucost in items_spec:
-            usale, ucost = d2(usale), d2(ucost)
+        total_sale = total_cost = total_disc = Decimal("0")
+        for prod, qty, list_price, usale, ucost, disc_pct in items_spec:
+            list_price, usale, ucost = d2(list_price), d2(usale), d2(ucost)
             sub_s, sub_c = d2(usale * qty), d2(ucost * qty)
-            items.append(dict(product=prod, quantity=qty, unit_sale=usale, unit_cost=ucost,
+            line_disc = max(Decimal("0"), d2((list_price - usale) * qty))
+            items.append(dict(product=prod, quantity=qty, list_price=list_price,
+                              discount_pct=d2(disc_pct), unit_sale=usale, unit_cost=ucost,
                               sub_sale=sub_s, sub_cost=sub_c, profit=d2(sub_s - sub_c)))
             total_sale += sub_s
             total_cost += sub_c
-            units += qty
+            total_disc += line_disc
         profit = d2(total_sale - total_cost)
         commission = d2(profit * seller.commission_rate / Decimal("100"))
         if status is None:
             roll = self.rng.random()
-            status = (Sale.StatusChoices.CANCELLED if roll < 0.05
-                      else Sale.StatusChoices.PENDING if roll < 0.09
+            status = (Sale.StatusChoices.CANCELLED if roll < 0.04
+                      else Sale.StatusChoices.PENDING if roll < 0.08
                       else Sale.StatusChoices.COMPLETED)
-        if customer.customer_type == Customer.TypeChoices.INDIVIDUAL:
-            stype = Sale.TypeChoices.RETAIL
-        elif total_sale >= 600 or units >= 6:
-            stype = Sale.TypeChoices.INSTITUTIONAL
-        else:
-            stype = Sale.TypeChoices.RETAIL
-        return dict(customer=customer, seller=seller, sale_date=d, sale_type=stype,
+        return dict(customer=customer, seller=seller, sale_date=d, sale_type=sale_type,
                     status=status, total_sale_usd=d2(total_sale), total_cost_usd=d2(total_cost),
-                    total_profit_usd=profit, total_sale_ves=d2(total_sale * par),
-                    commission_usd=commission, bcv_rate=bcv, parallel_rate=par, items=items)
+                    total_profit_usd=profit, total_discount_usd=d2(total_disc),
+                    total_sale_ves=d2(total_sale * par), commission_usd=commission,
+                    bcv_rate=bcv, parallel_rate=par, items=items)
 
-    def _random_basket(self, d):
-        """Genera una cesta de productos verosímil para una venta sintética."""
-        n_lines = self.rng.choices([1, 2, 3, 4, 5, 6], weights=[34, 26, 18, 12, 6, 4])[0]
-        chosen = self._weighted_sample(n_lines)        # ponderado por popularidad
+    def _basket(self, d, segment):
+        """Cesta verosímil según el segmento.
+
+        Detal: pocas líneas y unidades, descuento bajo. Institucional (proyectos):
+        más líneas y por lotes, descuento mayor. Devuelve tuplas de 6 elementos
+        ``(producto, cant, precio_lista, precio_neto, costo, disc_pct)``."""
         factor = price_factor(d)
         ref = float(PRICE_FACTOR_START)
+        disc_mean, disc_sd = DISCOUNT_BANDS[segment]
+        if segment == "retail":
+            n_lines = self.rng.choices([1, 2], weights=[68, 32])[0]
+        else:
+            n_lines = self.rng.choices([1, 2, 3], weights=[40, 38, 22])[0]
+        chosen = self._weighted_sample(n_lines)        # ponderado por popularidad
         spec = []
         for prod in chosen:
-            base_sale = Decimal(prod.sale_price_usd) * factor
-            base_cost = Decimal(prod.purchase_price_usd or prod.sale_price_usd * Decimal("0.6")) * factor
-            # Negociación: descuento 0–8% sobre el precio de lista.
-            disc = 1 - self.rng.uniform(0, 0.08)
-            usale = base_sale * Decimal(str(disc))
-            ucost = base_cost * Decimal(str(self.rng.uniform(0.97, 1.03)))
-            # Cantidad base: las sillas/visita se venden por lotes; los muebles grandes de a pocos.
-            if prod.sale_price_usd <= 80:
-                qty = self.rng.choices([1, 2, 4, 6, 8, 10, 12], weights=[18, 16, 18, 16, 12, 12, 8])[0]
-            elif prod.sale_price_usd <= 200:
-                qty = self.rng.choices([1, 2, 3, 4, 5], weights=[40, 26, 16, 10, 8])[0]
-            else:
-                qty = self.rng.choices([1, 2, 3], weights=[68, 24, 8])[0]
+            list_price = Decimal(prod.sale_price_usd) * factor
+            base_cost = Decimal(prod.purchase_price_usd or prod.sale_price_usd * Decimal("0.67")) * factor
+            disc = min(0.40, max(0.0, self.rng.gauss(disc_mean, disc_sd)))
+            usale = list_price * Decimal(str(1 - disc))
+            ucost = base_cost * Decimal(str(self.rng.uniform(0.99, 1.01)))
+            # Cantidades acotadas: ninguna venta domina el total del mes (ingreso suave).
+            if segment == "retail":
+                if prod.sale_price_usd <= 80:
+                    qty = self.rng.choices([1, 2, 3], weights=[52, 32, 16])[0]
+                else:
+                    qty = self.rng.choices([1, 2], weights=[80, 20])[0]
+            else:  # institucional: lotes moderados de proyecto
+                if prod.sale_price_usd <= 80:
+                    qty = self.rng.choices([3, 4, 6, 8], weights=[26, 30, 26, 18])[0]
+                elif prod.sale_price_usd <= 200:
+                    qty = self.rng.choices([2, 3, 4, 5], weights=[34, 30, 22, 14])[0]
+                else:
+                    qty = self.rng.choices([1, 2, 3], weights=[52, 32, 16])[0]
             # Elasticidad precio->cantidad: a mayor precio relativo (vs base 2022), menos unidades.
-            rel = (float(factor) * disc) / ref
+            rel = (float(factor) * (1 - disc)) / ref
             qty = max(1, int(round(qty * rel ** DEMAND_PRICE_ELASTICITY)))
-            spec.append((prod, qty, usale, ucost))
+            spec.append((prod, qty, list_price, usale, ucost, round(disc * 100, 2)))
         return spec
 
     # Calendario de actividad comercial (compartido por ventas y presupuestos).
     _SEASONAL = {1: 1.15, 2: 1.0, 3: 1.1, 4: 0.95, 5: 1.0, 6: 0.9,
                  7: 0.85, 8: 1.05, 9: 1.15, 10: 1.1, 11: 1.05, 12: 0.9}
-    _GROWTH = {2022: 1.0, 2023: 1.3, 2024: 1.6, 2025: 1.9, 2026: 2.1}
 
     @staticmethod
     def _month_last_day(y, m):
@@ -883,37 +1020,76 @@ class Command(BaseCommand):
             last = min(last, SYNTH_END.day)
         return last
 
-    def _monthly_count(self, y, m, base, scale, noise):
-        """Nº de eventos del mes: tendencia × estacionalidad × poder de compra (shock cambiario)."""
-        n = base * self._GROWTH[y] * self._SEASONAL[m] * scale * self._affordability(date(y, m, 15))
-        return max(0, int(self.rng.gauss(n, n * noise)))
+    def _segment_target_revenue(self, y, m, segment, scale):
+        """Ingreso USD OBJETIVO del mes para un segmento: base × tendencia(segmento) ×
+        estacionalidad × poder de compra (shock) × ruido pequeño. La generación rellena
+        ventas hasta acercarse a este objetivo → serie de ingreso suave y aprendible."""
+        t = self._month_index(y, m)
+        if segment == "retail":
+            trend = self._interp(RETAIL_TREND, t)
+            base = RETAIL_REV_BASE
+        else:
+            trend = (1.0 + INSTITUTIONAL_GROWTH) ** t   # exponencial: tasa constante
+            base = INSTITUTIONAL_REV_BASE
+        target = base * trend * self._SEASONAL[m] * scale * self._affordability(date(y, m, 15), segment)
+        return max(0.0, self.rng.gauss(target, target * 0.02))
+
+    def _quote_count(self, y, m, scale):
+        """Nº de presupuestos (proyectos) del mes — pipeline del clasificador."""
+        t = self._month_index(y, m)
+        trend = (1.0 + INSTITUTIONAL_GROWTH) ** t
+        n = BASE_QUOTES * trend * self._SEASONAL[m] * scale * self._affordability(date(y, m, 15), "institutional")
+        return max(0, int(self.rng.gauss(n, n * 0.12)))
+
+    def _segment_pools(self, active):
+        """Separa la cartera activa en detal (particulares + empresas) e institucional
+        (instituciones + empresas/proyectos). El solape en empresas es intencional."""
+        retail = [c for c in active if c.customer_type != Customer.TypeChoices.INSTITUTIONAL]
+        inst = [c for c in active if c.customer_type in (
+            Customer.TypeChoices.INSTITUTIONAL, Customer.TypeChoices.CORPORATE)]
+        return (retail or active), (inst or active)
 
     def _build_direct_sales(self, active, sellers, *, scale):
-        """Ventas directas (sin presupuesto previo): cabeceras+líneas en memoria, sin persistir."""
-        self.stdout.write("Generando ventas directas 2022 a marzo 2026...")
+        """Ventas directas por segmento (detal flojo, institucional sano): en memoria."""
+        self.stdout.write("Generando ventas (detal + institucional) 2022 → abril 2026...")
         seller_weights = [5 if s.first_name in ("Mariangel", "Renny") else 1 for s in sellers]
-        base = 9.5
         sale_dicts = []
 
-        # 1) Ventas reales seedeadas (ene–feb 2022).
+        # 1) Ventas reales seedeadas (ene–feb 2022). Sin descuento (precio = lista).
         cust_by_name = {c.company_name: c for c in Customer.objects.filter(is_active_customer=True)}
         for d, buyer, seller_name, items in REAL_SALES:
             customer = cust_by_name.get(buyer) or self.rng.choice(active)
             seller = self._sellers_by_name.get(seller_name, sellers[0])
-            spec = [(self._resolve_product(pn), qty, usale, ucost)
+            spec = [(self._resolve_product(pn), qty, d2(usale), d2(usale), d2(ucost), Decimal("0.00"))
                     for (pn, qty, usale, ucost) in items]
+            total = sum((s[3] * s[1] for s in spec), Decimal("0"))
+            units = sum(s[1] for s in spec)
+            stype = (Sale.TypeChoices.INSTITUTIONAL if (total >= 600 or units >= 6)
+                     else Sale.TypeChoices.RETAIL)
             sale_dicts.append(self._make_sale_dict(d, customer, seller, spec,
+                                                   sale_type=stype,
                                                    status=Sale.StatusChoices.COMPLETED))
 
-        # 2) Ventas sintéticas mes a mes.
+        # 2) Ventas sintéticas mes a mes, rellenando hasta el ingreso objetivo de
+        #    cada segmento (ingreso suave, con ventas pequeñas que no dominan el mes).
+        retail_pool, inst_pool = self._segment_pools(active)
+        streams = (("retail", retail_pool, Sale.TypeChoices.RETAIL),
+                   ("institutional", inst_pool, Sale.TypeChoices.INSTITUTIONAL))
         for y, m in iter_months(date(2022, 1, 1), SYNTH_END):
-            n = self._monthly_count(y, m, base, scale, 0.22)
             last_day = self._month_last_day(y, m)
-            for _ in range(n):
-                d = date(y, m, self.rng.randint(1, last_day))
-                customer = self.rng.choice(active)
-                seller = self.rng.choices(sellers, weights=seller_weights)[0]
-                sale_dicts.append(self._make_sale_dict(d, customer, seller, self._random_basket(d)))
+            for segment, pool, stype in streams:
+                target = self._segment_target_revenue(y, m, segment, scale)
+                acc = 0.0
+                guard = 0
+                while acc < target and guard < 400:
+                    guard += 1
+                    d = date(y, m, self.rng.randint(1, last_day))
+                    customer = self.rng.choice(pool)
+                    seller = self.rng.choices(sellers, weights=seller_weights)[0]
+                    sd = self._make_sale_dict(d, customer, seller,
+                                              self._basket(d, segment), sale_type=stype)
+                    sale_dicts.append(sd)
+                    acc += float(sd["total_sale_usd"])
         return sale_dicts
 
     def _persist_sales(self, sale_dicts):
@@ -928,6 +1104,7 @@ class Command(BaseCommand):
             for it in sd["items"]:
                 item_objs.append(SaleItem(
                     sale=sale, product=it["product"], quantity=it["quantity"],
+                    unit_list_price_usd=it["list_price"], discount_pct=it["discount_pct"],
                     unit_sale_price_usd=it["unit_sale"], unit_cost_price_usd=it["unit_cost"],
                     subtotal_sale_usd=it["sub_sale"], subtotal_cost_usd=it["sub_cost"],
                     line_profit_usd=it["profit"]))
@@ -1045,58 +1222,53 @@ class Command(BaseCommand):
         propia venta (que se añade a la lista de ventas), de modo que el FK presupuesto->venta
         y el inventario quedan consistentes. Así el árbol de decisión tiene una etiqueta
         (convertido / no) con señal real (instalación, monto, tipo de cliente, shock cambiario)."""
-        self.stdout.write("Generando presupuestos y conversiones…")
+        self.stdout.write("Generando presupuestos (proyectos) y conversiones…")
         seller_weights = [5 if s.first_name in ("Mariangel", "Renny") else 1 for s in sellers]
+        _retail_pool, inst_pool = self._segment_pools(active)
         specs, converted_sales = [], []
-        base = 9.5
+        # El pipeline de presupuestos es la fuente del CLASIFICADOR de conversión; el
+        # ingreso institucional ya lo aporta el flujo directo (suave), así que un
+        # presupuesto convertido NO genera otra venta (sólo su etiqueta). Sólo los
+        # presupuestos recientes (últimos ~55 días) siguen ABIERTOS; los más viejos sin
+        # convertir se dan por perdidos (rechazados) — como en una PYME real.
+        open_cutoff = SYNTH_END - timedelta(days=55)
 
         for y, m in iter_months(date(2022, 1, 1), SYNTH_END):
-            n = self._monthly_count(y, m, base, 1.0, 0.25)
+            n = self._quote_count(y, m, 1.0)
             last_day = self._month_last_day(y, m)
             shock = self._rate_shock(date(y, m, 15))
             for _ in range(n):
                 issued = date(y, m, self.rng.randint(1, last_day))
-                customer = self.rng.choice(active)
+                customer = self.rng.choice(inst_pool)
                 seller = self.rng.choices(sellers, weights=seller_weights)[0]
-                factor = price_factor(issued)
-                basket = self._random_basket(issued)            # (prod, qty, usale, ucost)
-                # El presupuesto se cotiza a precio de lista (el descuento aparece al vender).
-                items = [(p, q, d2(Decimal(p.sale_price_usd) * factor)) for (p, q, _us, _uc) in basket]
+                basket = self._basket(issued, "institutional")  # 6-tuplas con descuento
+                # El presupuesto se cotiza a precio de lista.
+                items = [(p, q, d2(list_price)) for (p, q, list_price, _us, _uc, _dp) in basket]
                 total_usd = sum((up * q for (_p, q, up) in items), Decimal("0"))
                 units = sum(q for (_p, q, _up) in items)
-                installation = self.rng.random() < 0.32
-                delivery = self.rng.random() < 0.5
+                installation = self.rng.random() < 0.40
+                delivery = self.rng.random() < 0.55
                 p_conv = conversion_probability(
                     total_usd, units, installation, delivery, customer.customer_type,
                     shock, seller.first_name in ("Mariangel", "Renny"))
-                if self.rng.random() < p_conv:
-                    # Convierte: se concreta como venta (precio realizado con descuento 0–6%).
-                    sale_spec = []
-                    for (p, q, up) in items:
-                        usale = up * Decimal(str(1 - self.rng.uniform(0, 0.06)))
-                        ucost = (Decimal(p.purchase_price_usd or p.sale_price_usd * Decimal("0.6"))
-                                 * factor * Decimal(str(self.rng.uniform(0.97, 1.03))))
-                        sale_spec.append((p, q, usale, ucost))
-                    sdate = min(issued + timedelta(days=self.rng.randint(2, 12)), SYNTH_END)
-                    sd = self._make_sale_dict(sdate, customer, seller, sale_spec)
-                    converted_sales.append(sd)
-                    status, sale_ref = Quote.StatusChoices.CONVERTED, sd
+                # Decisión de cierre "afilada" (probit): casi determinista en las
+                # features, con algo de ruido. Da una etiqueta separable → el árbol
+                # clasificador alcanza buena exactitud (en vez de puro azar de Bernoulli).
+                if (p_conv + self.rng.gauss(0.0, 0.12)) > 0.5:
+                    status = Quote.StatusChoices.CONVERTED
+                elif issued >= open_cutoff and self.rng.random() < 0.6:
+                    # Reciente y sin convertir: una parte sigue en gestión (abierto). El
+                    # resto se cierra como rechazado para que el conjunto resuelto mantenga
+                    # ambas clases en el tiempo (holdout estable del clasificador).
+                    status = self.rng.choices(
+                        [Quote.StatusChoices.SENT, Quote.StatusChoices.APPROVED,
+                         Quote.StatusChoices.DRAFT], [55, 30, 15])[0]
                 else:
-                    sale_ref = None
-                    if p_conv >= 0.45:        # casi cierra -> aprobado/enviado
-                        status = self.rng.choices(
-                            [Quote.StatusChoices.APPROVED, Quote.StatusChoices.SENT], [55, 45])[0]
-                    elif p_conv >= 0.25:
-                        status = self.rng.choices(
-                            [Quote.StatusChoices.SENT, Quote.StatusChoices.APPROVED,
-                             Quote.StatusChoices.REJECTED], [45, 20, 35])[0]
-                    else:                     # poco probable -> rechazado/borrador
-                        status = self.rng.choices(
-                            [Quote.StatusChoices.REJECTED, Quote.StatusChoices.DRAFT,
-                             Quote.StatusChoices.SENT], [50, 30, 20])[0]
+                    # Antiguo, o reciente no retenido: se da por perdido (rechazado).
+                    status = Quote.StatusChoices.REJECTED
                 specs.append(dict(customer=customer, seller=seller, issued=issued, items=items,
                                   installation=installation, delivery=delivery, status=status,
-                                  sale_ref=sale_ref))
+                                  sale_ref=None))
 
         # El presupuesto real de mayo 2026 (con su tasa documentada).
         rq = REAL_QUOTE
@@ -1142,13 +1314,18 @@ class Command(BaseCommand):
                     unit_price_ves=d2(up * q.bcv_rate), line_total_usd=d2(up * qty),
                     line_total_ves=d2(up * qty * q.bcv_rate)))
         QuoteItem.objects.bulk_create(qitems, batch_size=1000)
-        conv = sum(1 for s in specs if s.get("sale_ref"))
+        conv = sum(1 for s in specs if s["status"] == Quote.StatusChoices.CONVERTED)
         self.stdout.write(self.style.SUCCESS(
             f"Presupuestos: {len(quote_objs)} ({conv} convertidos, {len(qitems)} líneas)."))
 
     # --------------------------------------------------------------- resumen -- #
     def _summary(self):
+        from django.db.models import Sum
         self.stdout.write(self.style.MIGRATE_HEADING("\n=== Resumen de la base de datos ==="))
+        open_statuses = [Quote.StatusChoices.DRAFT, Quote.StatusChoices.SENT, Quote.StatusChoices.APPROVED]
+        retail = Sale.objects.filter(sale_type=Sale.TypeChoices.RETAIL).count()
+        inst = Sale.objects.filter(sale_type=Sale.TypeChoices.INSTITUTIONAL).count()
+        discount = Sale.objects.aggregate(t=Sum("total_discount_usd"))["t"] or 0
         lines = [
             ("Productos", Product.objects.count()),
             ("Clientes (total)", Customer.objects.count()),
@@ -1156,13 +1333,18 @@ class Command(BaseCommand):
             ("Vendedores", Seller.objects.count()),
             ("Tasas de cambio", ExchangeRate.objects.count()),
             ("Ventas", Sale.objects.count()),
+            ("  · detal", retail),
+            ("  · institucional", inst),
             ("Líneas de venta", SaleItem.objects.count()),
             ("Movimientos de inventario", InventoryMovement.objects.count()),
             ("Historial de precios", ProductPriceHistory.objects.count()),
             ("Presupuestos", Quote.objects.count()),
+            ("  · abiertos (en gestión)", Quote.objects.filter(status__in=open_statuses).count()),
+            ("  · convertidos", Quote.objects.filter(status=Quote.StatusChoices.CONVERTED).count()),
         ]
         for label, n in lines:
             self.stdout.write(f"  {label:.<32} {n:>8,}")
+        self.stdout.write(f"  {'Descuento total otorgado (USD)':.<32} {float(discount):>10,.2f}")
         last = ExchangeRate.objects.order_by("-date").first()
         if last:
             self.stdout.write(

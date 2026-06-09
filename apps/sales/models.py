@@ -31,6 +31,10 @@ class Sale(models.Model):
     total_sale_usd = models.DecimalField(max_digits=12, decimal_places=2, default=0, help_text=_("Total de venta en USD"))
     total_cost_usd = models.DecimalField(max_digits=12, decimal_places=2, default=0, help_text=_("Total de costo en USD"))
     total_profit_usd = models.DecimalField(max_digits=12, decimal_places=2, default=0, help_text=_("Utilidad total en USD"))
+    total_discount_usd = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        help_text=_("Descuento total otorgado en USD (precio de lista − precio de venta)"),
+    )
 
     # Totales en Bs
     total_sale_ves = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True, help_text=_("Total de venta en Bolívares"))
@@ -81,7 +85,15 @@ class SaleItem(models.Model):
         help_text=_("Producto vendido"),
     )
     quantity = models.PositiveIntegerField(default=1)
-    unit_sale_price_usd = models.DecimalField(max_digits=10, decimal_places=2, help_text=_("Precio unitario de venta en USD"))
+    unit_list_price_usd = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0,
+        help_text=_("Precio de lista unitario en USD (antes de descuento)"),
+    )
+    discount_pct = models.DecimalField(
+        max_digits=5, decimal_places=2, default=0,
+        help_text=_("Descuento aplicado a la línea (%)"),
+    )
+    unit_sale_price_usd = models.DecimalField(max_digits=10, decimal_places=2, help_text=_("Precio unitario de venta en USD (neto, con descuento)"))
     unit_cost_price_usd = models.DecimalField(max_digits=10, decimal_places=2, help_text=_("Precio unitario de costo/compra en USD"))
     subtotal_sale_usd = models.DecimalField(max_digits=12, decimal_places=2, help_text=_("Subtotal de venta en USD (cantidad × precio venta)"))
     subtotal_cost_usd = models.DecimalField(max_digits=12, decimal_places=2, help_text=_("Subtotal de costo en USD (cantidad × precio compra)"))

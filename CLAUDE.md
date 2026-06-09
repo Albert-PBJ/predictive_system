@@ -27,20 +27,29 @@ python manage.py makemigrations
 # WAREHOUSE / inventory-manager user (inventario1).
 python manage.py seed_demo_data
 
-# Load the FULL historical company database (real + synthetic), 2022 → March 2026.
-# Reads the company's real files from ../resources/ (products from the 2018/2025 price
-# lists, 3.3k customers/prospects, real Jan–Feb 2022 sales, a real May-2026 quote) and
-# generates a coherent operating history on top: monthly BCV+parallel exchange rates
-# following the real bolívar trajectory, price history, ~1k sales with line items,
-# append-only inventory movements (stock = Σ movements, never negative), and quotes.
-# The synthetic data has REAL economic relationships baked in so the ML models have
-# something to learn (not just trend+seasonality): per-product popularity, price→quantity
-# elasticity, an exchange-rate-shock dip in demand (shock = devaluation ABOVE the recent
-# inflation norm, so it's not collinear with the growth trend), and feature-driven quote
-# conversion (installation/deal-size/customer-type/rate-shock decide if a quote closes;
-# converted quotes spawn their sale). Idempotent & deterministic (--fresh wipes the
-# transactional/time-series tables and regenerates; products/customers upserted by
-# SKU/RIF). See command docstring for detail.
+# Load the FULL historical company database (real + synthetic), 2022 → April 2026.
+# Reads the company's real files from ../resources/ (catalog + current sell prices from
+# "Lista de Precios Maescar.xlsx" — material/colors per row, cost derived from a ~33%
+# target margin so prices sit ABOVE the market; 3.3k customers/prospects, real Jan–Feb
+# 2022 sales, a real May-2026 quote) and generates a coherent operating history on top:
+# monthly BCV+parallel exchange rates following the real bolívar trajectory, price history,
+# ~2k sales with line items (each carrying its DISCOUNT: list price, %, total), append-only
+# inventory movements (stock = Σ movements, never negative), and quotes.
+#
+# The synthetic data tells a deliberate BUSINESS STORY so the system has a problem to solve,
+# while staying LEARNABLE (good R²): RETAIL stagnates/declines (small customers leave for
+# cheaper rivals — share ~19%→9%) while INSTITUTIONAL/projects grow at a CONSTANT rate and
+# carry the company (afloat, modest growth). A Jan-2026 POLITICAL SHOCK (arrest → parallel
+# dollar spikes) dents demand for a while; because it's tied to the rate, the models learn it
+# via `shock_cambiario`. Revenue is REVENUE-TARGETED per segment (smooth series, not lumpy),
+# best-sellers are concentrated (steady per-product demand), discounts are segment-based
+# (retail ~5%, projects ~11%), and quote conversion is feature-driven (installation/deal-size/
+# customer-type/rate-shock) with a sharpened, separable label. Resulting holdout metrics:
+# ventas ≈0.59, utilidad ≈0.59, demanda ≈0.57, tasa ≈0.75, precio ≈0.77; conversión acc ≈0.74.
+#
+# Idempotent & deterministic. --fresh (default) WIPES sales + the whole product catalog and
+# regenerates (customers preserved; competitor product-matches go NULL — re-run rematch_products).
+# See command docstring for detail.
 python manage.py seed_company_data                 # carga completa (recomendado)
 python manage.py seed_company_data --scale 1.5     # más volumen de ventas
 python manage.py seed_company_data --purge-demo    # elimina además los datos de seed_demo_data
@@ -195,7 +204,12 @@ and both run inside a single `transaction.atomic` so a sale/movement never lands
   `ExchangeRate`, computes subtotals/profit/`commission` (seller's `commission_rate` × profit) and
   `total_sale_ves` (parallel rate preferred), then decrements stock by writing one `InventoryMovement`
   (type `SAL`, negative qty) per line. The seller is resolved from the authenticated user's `Seller`
-  profile (a Manager+ may register on behalf of another seller by passing `seller`).
+  profile (a Manager+ may register on behalf of another seller by passing `seller`). **Discounts:**
+  each item may carry a `discount_pct`; the service snapshots the product's list price into
+  `SaleItem.unit_list_price_usd`, derives the net `unit_sale_price_usd = list × (1 − pct/100)` (or,
+  if a net price is sent instead, back-computes the %), and totals the saving into
+  `Sale.total_discount_usd`. The serializer exposes the list price + % on read and accepts
+  `discount_pct` on write.
 - **`apps/sales/services.void_sale`** — reverses a sale: writes a `DEV` movement per line (returns the
   qty to stock) and sets status `ANU`. Gated to Manager+ via `@action(permission_classes=[IsManager])`.
 - **`apps/inventory/services.apply_movement`** — the single chokepoint for stock mutation (append-only):
