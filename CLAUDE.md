@@ -185,6 +185,7 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 /api/inventory/movements/     → InventoryMovementViewSet: history (ver = operativo) + register ENT/AJU/DEV (Inventario+)
 /api/exchange-rate/latest     → latest BCV/parallel rate, read-only (Seller+)
 /api/analytics/               → predictive module (Manager+): overview, forecast/{demand,sales,profit,exchange-rate,product-price,inventory,quote-conversion}, benchmark/competitors, forecastable-products
+/api/analytics/stats/         → descriptive statistics: dashboard (IsViewer — home panel, non-sensitive aggregates), {customers,products,sales,quotes} (Manager+). Live ORM aggregations in apps/analytics/stats.py
 /scrapers/                    → <source>/start, <source>/status, <source>/finalize (ADMIN only)
 ```
 

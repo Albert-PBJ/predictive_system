@@ -2,6 +2,13 @@
 
 from django.urls import path
 
+from .stats_views import (
+    CustomerStatsView,
+    DashboardStatsView,
+    ProductStatsView,
+    QuoteStatsView,
+    SalesStatsView,
+)
 from .views import (
     CompetitorAnalysisView,
     DemandForecastView,
@@ -26,4 +33,10 @@ urlpatterns = [
     path("forecast/inventory", InventoryForecastView.as_view(), name="analytics-inventory"),
     path("forecast/quote-conversion", QuoteConversionForecastView.as_view(), name="analytics-quote"),
     path("benchmark/competitors", CompetitorAnalysisView.as_view(), name="analytics-competitors"),
+    # Estadísticas descriptivas (paneles de situación).
+    path("stats/dashboard", DashboardStatsView.as_view(), name="analytics-stats-dashboard"),
+    path("stats/customers", CustomerStatsView.as_view(), name="analytics-stats-customers"),
+    path("stats/products", ProductStatsView.as_view(), name="analytics-stats-products"),
+    path("stats/sales", SalesStatsView.as_view(), name="analytics-stats-sales"),
+    path("stats/quotes", QuoteStatsView.as_view(), name="analytics-stats-quotes"),
 ]
