@@ -34,6 +34,12 @@ from .features import add_period, calendar_features, period_label
 
 Z90 = 1.645  # cuantil normal para una banda de ~90%
 
+# Fracción de la serie reservada como conjunto de prueba (holdout temporal 80/20).
+# El split es siempre *out-of-time*: el 20% más reciente se evalúa, el 80% anterior
+# entrena. Solo afecta a las métricas reportadas; el modelo final se reajusta sobre el
+# 100% de los datos antes de pronosticar.
+TEST_FRACTION = 0.20
+
 # Modelo asignado a cada objetivo (la UI lo fija; se puede sobreescribir por ?model=).
 # Cada técnica exigida se usa donde MEJOR rinde (ver comparación en train_models):
 #   - XGBoost      -> demanda por producto (mejor R²; panel global no lineal).
@@ -147,11 +153,12 @@ def forecast_series(
     names = list(X.columns)
     y_arr = np.asarray(targets, dtype=float)
 
-    # --- holdout temporal (backtest a un paso) para métricas honestas ---
+    # --- holdout temporal 80/20 (backtest a un paso) para métricas honestas ---
+    # El 20% más reciente se reserva como prueba; el 80% anterior entrena el backtest.
     n_rows = len(y_arr)
-    n_holdout = min(12, max(0, n_rows - 5)) if n_rows >= 8 else 0
+    n_holdout = int(round(n_rows * TEST_FRACTION))
     metrics, sigma = None, None
-    if n_holdout >= 3:
+    if n_holdout >= 3 and (n_rows - n_holdout) >= 5:
         Xtr, Xte = X.iloc[:-n_holdout], X.iloc[-n_holdout:]
         ytr, yte = y_arr[:-n_holdout], y_arr[-n_holdout:]
         bt = make_regressor(model_key)
@@ -162,6 +169,8 @@ def forecast_series(
         pred_o = np.expm1(pred) if log_target else pred
         metrics = _metrics(yte_o, pred_o)
         sigma = float(np.std(yte - pred)) or None  # sigma en escala del modelo
+    else:
+        n_holdout = 0  # serie demasiado corta: no se evalúa, modelo se reporta sin prueba
 
     # --- ajuste final sobre toda la serie ---
     estimator = make_regressor(model_key)
@@ -449,9 +458,20 @@ def _train_demand_panel(model_key: str):
     y = np.asarray(targets, dtype=float)
     meta_periods = np.asarray(meta_rows)
 
-    # Holdout = filas de los últimos 6 meses globales (across products).
-    holdout_periods = set(all_periods[-6:])
-    test_mask = np.array([p in holdout_periods for p in meta_periods])
+    # Holdout temporal 80/20: los meses globales más recientes cuyas filas suman ~20%
+    # del panel (se corta en frontera de mes para no filtrar dentro de un mismo periodo).
+    target_test = int(round(len(y) * TEST_FRACTION))
+    test_mask = np.zeros(len(y), dtype=bool)
+    accumulated = 0
+    for period in reversed(all_periods):
+        sel = meta_periods == period
+        count = int(sel.sum())
+        if count == 0:
+            continue
+        test_mask |= sel
+        accumulated += count
+        if accumulated >= target_test:
+            break
     metrics, n_holdout = None, 0
     if test_mask.sum() >= 10 and (~test_mask).sum() >= 20:
         bt = make_regressor(model_key)
@@ -649,7 +669,7 @@ def forecast_quote_conversion(model: str | None = None) -> dict:
     Xc, yc = X_all[closed], y_all[closed]
     metrics, n_holdout = None, 0
     if len(yc) >= 16 and pd.Series(yc).nunique() == 2:
-        cut = int(len(yc) * 0.75)
+        cut = int(len(yc) * (1 - TEST_FRACTION))  # 80% entrena / 20% prueba (temporal)
         clf_bt = make_classifier(model_key)
         clf_bt.fit(Xc.iloc[:cut], yc[:cut])
         if pd.Series(yc[cut:]).nunique() >= 1:

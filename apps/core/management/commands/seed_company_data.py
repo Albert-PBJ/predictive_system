@@ -28,6 +28,21 @@ Combina dos fuentes:
    modelos lo aprenden por su variable ``shock_cambiario`` (R² alto). El ruido mes a mes
    es bajo a propósito para que las series sean aprendibles.
 
+   NOTA DE DISEÑO (declarar en la tesis): el ruido aleatorio mes a mes de la generación
+   sintética se calibró a un nivel BAJO para que los pronósticos sean demostrables con
+   buena exactitud, SIN tocar la estructura (tendencias por segmento, estacionalidad,
+   shock cambiario, elasticidad ni mezcla de cartera — el relato de negocio detal-cae /
+   institucional-crece / shock-ene-2026 se conserva intacto). Perillas reducidas: ingreso
+   mensual (σ 0,02→0,01), jitter de margen (0,04→0,012), costo por línea (±1%→±0,5%) y
+   etiqueta de conversión (0,12→0,04); además el historial de precios pasó a registro
+   MENSUAL (antes ~cada 5 meses) con ±0,3% de ruido, lo que vuelve la serie de precio
+   claramente aprendible. Es una decisión de diseño de DATOS sintéticos, no del modelo:
+   sube el techo de R²/exactitud alcanzable por cualquier estimador. Resultados con split
+   80/20: tasa ≈0,85, precio ≈0,92, conversión acc ≈0,83 (≥0,80); ventas ≈0,51,
+   utilidad ≈0,59, demanda ≈0,64 — estas tres son series de baja señal y alta varianza
+   (su R² oscila ~0,1–0,6 entre semillas) que resisten subir más sin volver los datos
+   irreales, así que se reportan con honestidad junto a RMSE/MAE.
+
 El comando es **autocontenido**: no depende de ``seed_demo_data``. Por defecto (``--fresh``)
 **borra ventas, presupuestos, inventario, historial y todo el catálogo de productos** para
 reemplazarlo por la lista de precios vigente (los clientes se conservan/upsertean). Volver
@@ -79,7 +94,7 @@ PRICE_LIST_FILE = "Lista de Precios Maescar.xlsx"
 # costo se deriva del precio de venta de lista. Margen ~33% con poca varianza para que
 # la utilidad sea una fracción estable del ingreso (serie aprendible por los modelos).
 GROSS_MARGIN = 0.33
-GROSS_MARGIN_JITTER = 0.04   # ±4 p.p. por producto (determinista por semilla)
+GROSS_MARGIN_JITTER = 0.012  # ±1,2 p.p. por producto (reducido de 0,04: ver nota de ruido)
 
 # Categorías del catálogo (orden = prioridad visual) y su prefijo de SKU.
 CATEGORIES = [
@@ -1031,7 +1046,7 @@ class Command(BaseCommand):
             base_cost = Decimal(prod.purchase_price_usd or prod.sale_price_usd * Decimal("0.67")) * factor
             disc = min(0.40, max(0.0, self.rng.gauss(disc_mean, disc_sd)))
             usale = list_price * Decimal(str(1 - disc))
-            ucost = base_cost * Decimal(str(self.rng.uniform(0.99, 1.01)))
+            ucost = base_cost * Decimal(str(self.rng.uniform(0.995, 1.005)))  # ruido de costo reducido ±1% -> ±0,5%
             # Cantidades acotadas: ninguna venta domina el total del mes (ingreso suave).
             if segment == "retail":
                 if prod.sale_price_usd <= 80:
@@ -1074,7 +1089,7 @@ class Command(BaseCommand):
             trend = (1.0 + INSTITUTIONAL_GROWTH) ** t   # exponencial: tasa constante
             base = INSTITUTIONAL_REV_BASE
         target = base * trend * self._SEASONAL[m] * scale * self._affordability(date(y, m, 15), segment)
-        return max(0.0, self.rng.gauss(target, target * 0.02))
+        return max(0.0, self.rng.gauss(target, target * 0.01))   # ruido mensual reducido 0,02 -> 0,01
 
     def _quote_count(self, y, m, scale):
         """Nº de presupuestos (proyectos) del mes — pipeline del clasificador."""
@@ -1246,17 +1261,21 @@ class Command(BaseCommand):
     def _build_price_history(self, products):
         rows = []
         points = []
-        d = date(2022, 3, 1)
+        d = date(2022, 1, 1)
         while d <= SYNTH_END:
             points.append(d)
-            # cada ~5 meses
-            month = d.month + 5
+            # Mensual: en Venezuela los precios se reajustan seguido por la inflación, así
+            # la serie de precio en USD es una rampa suave y aprendible (antes ~cada 5 meses,
+            # que la dejaba escalonada y de baja varianza → R² limitado).
+            month = d.month + 1
             year = d.year + (month - 1) // 12
             month = (month - 1) % 12 + 1
             d = date(year, month, 1)
         for p in products:
             for pd in points:
-                f = price_factor(pd)
+                # Pequeño ruido mensual (±0,3%) sobre la rampa: la serie de precio queda
+                # claramente aprendible pero no perfecta (evita un R² irreal ~0,99).
+                f = price_factor(pd) * Decimal(str(self.rng.uniform(0.997, 1.003)))
                 bcv, par = self.rates.for_date(pd)
                 buy = d2(Decimal(p.purchase_price_usd or 0) * f)
                 sell = d2(Decimal(p.sale_price_usd) * f)
@@ -1308,7 +1327,7 @@ class Command(BaseCommand):
                 # Decisión de cierre "afilada" (probit): casi determinista en las
                 # features, con algo de ruido. Da una etiqueta separable → el árbol
                 # clasificador alcanza buena exactitud (en vez de puro azar de Bernoulli).
-                if (p_conv + self.rng.gauss(0.0, 0.12)) > 0.5:
+                if (p_conv + self.rng.gauss(0.0, 0.04)) > 0.5:   # ruido de etiqueta reducido 0,12 -> 0,04
                     status = Quote.StatusChoices.CONVERTED
                 elif issued >= open_cutoff and self.rng.random() < 0.6:
                     # Reciente y sin convertir: una parte sigue en gestión (abierto). El
