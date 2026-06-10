@@ -14,6 +14,11 @@ Combina dos fuentes:
    enero 2022 hasta abril 2026: ventas (con su **descuento** por línea y total), líneas de
    venta, movimientos de inventario, historial de precios y presupuestos. Las **tasas de
    cambio** (BCV + paralela) siguen la trayectoria real del bolívar (~4,2 → 563 Bs/USD).
+   Las ventas y presupuestos se reparten entre un **equipo comercial** = los vendedores
+   reales (peso mayor) + varios vendedores adicionales (``EXTRA_SELLERS``) + algunos
+   **ex-vendedores** (``FORMER_SELLERS``, inactivos: por rotación de personal sólo tienen
+   ventas hasta su fecha de salida, así los datos recientes los maneja el equipo actual);
+   el vendedor ligado al **admin** se crea sólo para registro manual y **no recibe ninguna venta**.
 
    El relato de negocio que llevan los datos (para que el sistema ayude a decidir):
    el **detal se estanca y cae** (clientes pequeños se van a la competencia más barata),
@@ -193,6 +198,31 @@ DISCOUNT_BANDS = {"retail": (0.05, 0.02), "institutional": (0.11, 0.025)}
 REAL_SELLERS = [
     ("Mariangel", "Escobar", "mariangel.escobar@maescar.com", Decimal("10.00")),
     ("Renny", "Durán", "renny.duran@maescar.com", Decimal("10.00")),
+]
+
+# Resto del equipo comercial (nombres sintéticos pero verosímiles). Amplían la fuerza de
+# ventas a la que se atribuye la historia: junto con los reales reparten las ventas y
+# presupuestos generados. No afectan la aprendibilidad de los modelos (la mayoría agrega
+# por mes, no por vendedor); sólo distribuyen la autoría de forma más realista para la PYME.
+EXTRA_SELLERS = [
+    ("Gabriela", "Méndez", "gabriela.mendez@maescar.com", Decimal("10.00")),
+    ("Luis", "Hernández", "luis.hernandez@maescar.com", Decimal("8.00")),
+    ("Andreína", "Rojas", "andreina.rojas@maescar.com", Decimal("10.00")),
+    ("José", "Marcano", "jose.marcano@maescar.com", Decimal("8.00")),
+    ("Daniela", "Suárez", "daniela.suarez@maescar.com", Decimal("10.00")),
+]
+
+# Vendedores senior (los de mayor cartera): reciben más peso al repartir las ventas.
+SENIOR_SELLERS = ("Mariangel", "Renny")
+
+# Ex-vendedores: ya no están en la empresa (rotación normal de personal en 3 años). Se
+# crean **inactivos** (``is_active=False``) y sólo se les atribuyen ventas/presupuestos
+# **hasta su fecha de salida**, de modo que los datos recientes (2025-2026) los manejan
+# únicamente los vendedores activos. Formato: (nombre, apellido, email, comisión, salida).
+FORMER_SELLERS = [
+    ("Pedro", "Linares", "pedro.linares@maescar.com", Decimal("8.00"), date(2023, 6, 30)),
+    ("María", "Goitía", "maria.goitia@maescar.com", Decimal("10.00"), date(2024, 3, 31)),
+    ("Oscar", "Bracho", "oscar.bracho@maescar.com", Decimal("8.00"), date(2024, 11, 30)),
 ]
 
 # Compradores reales (del Cuadro de Ventas) — se crean como clientes ACTIVOS.
@@ -905,25 +935,37 @@ class Command(BaseCommand):
     # ---------------------------------------------------------- vendedores -- #
     def _ensure_sellers(self):
         sellers = []
-        for fn, ln, email, comm in REAL_SELLERS:
+        for fn, ln, email, comm in REAL_SELLERS + EXTRA_SELLERS:
             s, _ = Seller.objects.get_or_create(
                 first_name=fn, last_name=ln,
                 defaults=dict(email=email, commission_rate=comm, is_active=True),
             )
             sellers.append(s)
-        # Vendedor ligado al admin (si existe) para que el admin pueda registrar ventas.
+        # Ex-vendedores: se crean INACTIVOS y se guardan con su fecha de salida para que
+        # sólo reciban ventas/presupuestos mientras estuvieron en la empresa.
+        self._former_sellers = []
+        for fn, ln, email, comm, left_on in FORMER_SELLERS:
+            s, _ = Seller.objects.get_or_create(
+                first_name=fn, last_name=ln,
+                defaults=dict(email=email, commission_rate=comm, is_active=False),
+            )
+            self._former_sellers.append((s, left_on))
+        # Vendedor ligado al admin (si existe): se crea SOLO para que el admin pueda
+        # registrar ventas desde la UI, pero se EXCLUYE de la fuerza de ventas seedeada
+        # (no se le atribuye ninguna venta ni presupuesto histórico).
         admin = User.objects.filter(is_superuser=True).order_by("id").first()
         if admin:
-            s, _ = Seller.objects.get_or_create(
+            Seller.objects.get_or_create(
                 user=admin,
                 defaults=dict(first_name=admin.first_name or "Admin",
                               last_name=admin.last_name or "Maescar",
                               email=admin.email or "admin@maescar.com",
                               commission_rate=Decimal("10.00")),
             )
-            sellers.append(s)
         self._sellers_by_name = {s.first_name: s for s in sellers}
-        self.stdout.write(self.style.SUCCESS(f"Vendedores: {len(sellers)}."))
+        self.stdout.write(self.style.SUCCESS(
+            f"Vendedores: {len(sellers)} activos + {len(self._former_sellers)} ex-vendedores "
+            f"(inactivos, con ventas sólo hasta su salida); el admin queda solo para registro manual."))
         return sellers
 
     # ------------------------------------------------------ tasas de cambio -- #
@@ -1049,10 +1091,21 @@ class Command(BaseCommand):
             Customer.TypeChoices.INSTITUTIONAL, Customer.TypeChoices.CORPORATE)]
         return (retail or active), (inst or active)
 
+    def _seller_weights(self, sellers):
+        """Peso al repartir ventas/presupuestos: los vendedores senior llevan más cartera
+        que el resto del equipo (≈50% para los dos senior, el resto entre los demás)."""
+        return [5 if s.first_name in SENIOR_SELLERS else 2 for s in sellers]
+
+    def _sellers_for_month(self, sellers, y, m):
+        """Vendedores que estaban en la empresa en el mes (y, m) con sus pesos: los activos
+        siempre, los ex-vendedores sólo hasta su fecha de salida (rotación de personal)."""
+        first = date(y, m, 1)
+        pool = list(sellers) + [s for (s, left_on) in self._former_sellers if first <= left_on]
+        return pool, self._seller_weights(pool)
+
     def _build_direct_sales(self, active, sellers, *, scale):
         """Ventas directas por segmento (detal flojo, institucional sano): en memoria."""
         self.stdout.write("Generando ventas (detal + institucional) 2022 → abril 2026...")
-        seller_weights = [5 if s.first_name in ("Mariangel", "Renny") else 1 for s in sellers]
         sale_dicts = []
 
         # 1) Ventas reales seedeadas (ene–feb 2022). Sin descuento (precio = lista).
@@ -1077,6 +1130,7 @@ class Command(BaseCommand):
                    ("institutional", inst_pool, Sale.TypeChoices.INSTITUTIONAL))
         for y, m in iter_months(date(2022, 1, 1), SYNTH_END):
             last_day = self._month_last_day(y, m)
+            month_sellers, month_weights = self._sellers_for_month(sellers, y, m)
             for segment, pool, stype in streams:
                 target = self._segment_target_revenue(y, m, segment, scale)
                 acc = 0.0
@@ -1085,7 +1139,7 @@ class Command(BaseCommand):
                     guard += 1
                     d = date(y, m, self.rng.randint(1, last_day))
                     customer = self.rng.choice(pool)
-                    seller = self.rng.choices(sellers, weights=seller_weights)[0]
+                    seller = self.rng.choices(month_sellers, weights=month_weights)[0]
                     sd = self._make_sale_dict(d, customer, seller,
                                               self._basket(d, segment), sale_type=stype)
                     sale_dicts.append(sd)
@@ -1223,7 +1277,6 @@ class Command(BaseCommand):
         y el inventario quedan consistentes. Así el árbol de decisión tiene una etiqueta
         (convertido / no) con señal real (instalación, monto, tipo de cliente, shock cambiario)."""
         self.stdout.write("Generando presupuestos (proyectos) y conversiones…")
-        seller_weights = [5 if s.first_name in ("Mariangel", "Renny") else 1 for s in sellers]
         _retail_pool, inst_pool = self._segment_pools(active)
         specs, converted_sales = [], []
         # El pipeline de presupuestos es la fuente del CLASIFICADOR de conversión; el
@@ -1237,10 +1290,11 @@ class Command(BaseCommand):
             n = self._quote_count(y, m, 1.0)
             last_day = self._month_last_day(y, m)
             shock = self._rate_shock(date(y, m, 15))
+            month_sellers, month_weights = self._sellers_for_month(sellers, y, m)
             for _ in range(n):
                 issued = date(y, m, self.rng.randint(1, last_day))
                 customer = self.rng.choice(inst_pool)
-                seller = self.rng.choices(sellers, weights=seller_weights)[0]
+                seller = self.rng.choices(month_sellers, weights=month_weights)[0]
                 basket = self._basket(issued, "institutional")  # 6-tuplas con descuento
                 # El presupuesto se cotiza a precio de lista.
                 items = [(p, q, d2(list_price)) for (p, q, list_price, _us, _uc, _dp) in basket]
@@ -1250,7 +1304,7 @@ class Command(BaseCommand):
                 delivery = self.rng.random() < 0.55
                 p_conv = conversion_probability(
                     total_usd, units, installation, delivery, customer.customer_type,
-                    shock, seller.first_name in ("Mariangel", "Renny"))
+                    shock, seller.first_name in SENIOR_SELLERS)
                 # Decisión de cierre "afilada" (probit): casi determinista en las
                 # features, con algo de ruido. Da una etiqueta separable → el árbol
                 # clasificador alcanza buena exactitud (en vez de puro azar de Bernoulli).
