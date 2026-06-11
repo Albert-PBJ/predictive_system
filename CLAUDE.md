@@ -56,6 +56,24 @@ python manage.py seed_company_data --purge-demo    # elimina además los datos d
 python manage.py seed_company_data --no-fresh      # añade sin borrar la historia previa
 python manage.py seed_company_data --resources "C:/ruta/resources" --seed 7
 
+# Genera datos de mercado de competidores SIMULADOS para los 10 principales del
+# mercado venezolano de mobiliario de oficina (los mismos que ya aparecen scrapeados:
+# Biloffice, Suhsillas, Maxximuebles, HermanMiller, Mercado Libre, …). A cada uno le
+# rellena los metadatos (ubicación/web/IG) y le genera un catálogo coherente derivado
+# del catálogo propio: precio = precio Maescar × multiplicador de tier (budget/mid/
+# premium) × deriva mensual × ruido, recortado a la banda de su categoría. La mayoría
+# quedan MÁS BARATOS que Maescar (su precio está por encima del mercado → es lo que
+# empuja al detal a la competencia); HermanMiller queda por encima (premium importado).
+# Pobla toda la capa de confianza (price_usd, listing_key, match al Product propio,
+# enriched_by, ScrapeRun) y reparte las observaciones en los últimos 6 meses para que el
+# análisis de competencia tenga posicionamiento, comparación like-with-like y TENDENCIA.
+# Vive en apps/benchmarking. PRESERVA los datos reales scrapeados: solo administra su
+# propia siembra (ScrapeRun con notes="seed_competitor_data"). Determinista e idempotente.
+python manage.py seed_competitor_data                  # carga la simulación (--fresh por defecto)
+python manage.py seed_competitor_data --scale 1.5      # más filas por competidor
+python manage.py seed_competitor_data --no-fresh       # añade sin borrar la siembra previa
+python manage.py seed_competitor_data --seed 7
+
 # Entrena, evalúa y registra los modelos del módulo predictivo (apps/analytics).
 # Para cada objetivo de serie temporal entrena las TRES técnicas (regresión lineal,
 # árbol de decisión, XGBoost), imprime una tabla comparativa de R²/RMSE/MAE y escribe
