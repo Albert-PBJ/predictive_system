@@ -10,6 +10,9 @@ from .stats_views import (
     SalesStatsView,
 )
 from .views import (
+    BenchmarkingComparisonView,
+    BenchmarkingForecastView,
+    BenchmarkingProductForecastView,
     CompetitorAnalysisView,
     DemandForecastView,
     ExchangeRateForecastView,
@@ -33,6 +36,10 @@ urlpatterns = [
     path("forecast/inventory", InventoryForecastView.as_view(), name="analytics-inventory"),
     path("forecast/quote-conversion", QuoteConversionForecastView.as_view(), name="analytics-quote"),
     path("benchmark/competitors", CompetitorAnalysisView.as_view(), name="analytics-competitors"),
+    # Benchmarking Competitivo (módulo dedicado con rango de fechas).
+    path("benchmarking/comparison", BenchmarkingComparisonView.as_view(), name="analytics-benchmarking-comparison"),
+    path("benchmarking/forecast", BenchmarkingForecastView.as_view(), name="analytics-benchmarking-forecast"),
+    path("benchmarking/product-forecast", BenchmarkingProductForecastView.as_view(), name="analytics-benchmarking-product-forecast"),
     # Estadísticas descriptivas (paneles de situación).
     path("stats/dashboard", DashboardStatsView.as_view(), name="analytics-stats-dashboard"),
     path("stats/customers", CustomerStatsView.as_view(), name="analytics-stats-customers"),

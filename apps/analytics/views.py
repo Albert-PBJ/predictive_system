@@ -12,6 +12,7 @@ invalidándolo cuando cambian los datos. Se puede sobreescribir el modelo por
 from __future__ import annotations
 
 import logging
+from datetime import date
 
 from django.db.models import Count, Sum
 from rest_framework import status
@@ -22,6 +23,7 @@ from apps.accounts.permissions import IsManager
 from apps.core.models import SERVICE_SKU_PREFIX, Product
 from apps.sales.models import SaleItem
 
+from . import benchmarking
 from .ml import forecasters as F
 from .ml import registry
 from .models import PredictionLog
@@ -49,6 +51,14 @@ def _int(request, key):
         return int(request.query_params.get(key))
     except (TypeError, ValueError):
         return None
+
+
+def _date(request, key, fallback: date) -> date:
+    value = request.query_params.get(key)
+    try:
+        return date.fromisoformat(value) if value else fallback
+    except (ValueError, TypeError):
+        return fallback
 
 
 class _BaseForecastView(APIView):
@@ -157,6 +167,51 @@ class CompetitorAnalysisView(_BaseForecastView):
         pid = _int(request, "product")
         key = f"competitor:{category}:{pid}"
         return Response(registry.cached(key, lambda: F.competitor_analysis(category, pid)))
+
+
+# --------------------------------------------------------------------------- #
+# Benchmarking Competitivo ("máquina del tiempo": rango sobre scraped_at)
+# --------------------------------------------------------------------------- #
+class BenchmarkingComparisonView(_BaseForecastView):
+    """GET /api/analytics/benchmarking/comparison?from=&to= — radiografía descriptiva
+    de la competencia para el rango (no se cachea: agregación directa y barata)."""
+
+    def get(self, request):
+        default_start, default_end = benchmarking.default_range()
+        start = _date(request, "from", default_start)
+        end = _date(request, "to", default_end)
+        return Response(benchmarking.comparison(start, end))
+
+
+class BenchmarkingForecastView(_BaseForecastView):
+    """GET /api/analytics/benchmarking/forecast?from=&to=&horizon=&category= —
+    pronóstico del precio de mercado vs. nuestros precios (entrena bajo demanda + cachea)."""
+
+    def get(self, request):
+        default_start, default_end = benchmarking.default_range()
+        start = _date(request, "from", default_start)
+        end = _date(request, "to", default_end)
+        h, category = _horizon(request), (request.query_params.get("category") or None)
+        key = f"benchmark_fc:{start.isoformat()}:{end.isoformat()}:{h}:{category}"
+        return Response(registry.cached(key, lambda: F.competitor_forecast(start, end, h, category)))
+
+
+class BenchmarkingProductForecastView(_BaseForecastView):
+    """GET /api/analytics/benchmarking/product-forecast?product=&competitor=&horizon=&from=&to=
+    — precio de un competidor (o promedio de todos) vs. nuestro precio interno, para un
+    producto propio con equivalente en la competencia."""
+
+    def get(self, request):
+        pid = _int(request, "product")
+        if not pid:
+            return Response({"detail": "Falta el parámetro 'product'."}, status=status.HTTP_400_BAD_REQUEST)
+        default_start, default_end = benchmarking.default_range()
+        start = _date(request, "from", default_start)
+        end = _date(request, "to", default_end)
+        h = _horizon(request)
+        competitor = request.query_params.get("competitor") or None
+        key = f"benchmark_pf:{pid}:{competitor}:{start.isoformat()}:{end.isoformat()}:{h}"
+        return Response(registry.cached(key, lambda: F.competitor_product_forecast(pid, competitor, h, start, end)))
 
 
 # --------------------------------------------------------------------------- #

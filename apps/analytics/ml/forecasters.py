@@ -30,7 +30,14 @@ from sklearn.pipeline import Pipeline
 
 from . import datasets
 from .estimators import MODEL_META, feature_importances, make_classifier, make_regressor
-from .features import add_period, calendar_features, period_label
+from .features import (
+    add_period,
+    calendar_features,
+    month_range,
+    period_diff,
+    period_label,
+    period_of,
+)
 
 Z90 = 1.645  # cuantil normal para una banda de ~90%
 
@@ -885,6 +892,380 @@ def competitor_analysis(category: str | None = None, product_id: int | None = No
         "product_comparison": product_comparison, "trend": trend,
         "observations": observations, "model": model_block,
         "meta": {"n_obs": int(len(df)), "n_competitors": int(df["competitor"].nunique())},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 9) Pronóstico de mercado de competencia vs. nuestros precios
+# --------------------------------------------------------------------------- #
+# Los datos scrapeados de competencia abarcan pocos meses (≈6), así que la matriz
+# de rezagos + holdout de `forecast_series` no aplica. Se ajusta una RECTA al índice
+# de mes (misma técnica de regresión lineal que ya usa `competitor_analysis` para la
+# tendencia) y se proyecta `horizon` meses con una banda ~90% basada en los residuos.
+def _linear_trend_forecast(periods: list[str], values: list[float], horizon: int, *, nonneg: bool = True) -> dict:
+    """Recta sobre el índice de mes + proyección con banda ~90% (series cortas)."""
+    from sklearn.linear_model import LinearRegression
+
+    n = len(values)
+    x = np.arange(n, dtype=float).reshape(-1, 1)
+    y = np.asarray(values, dtype=float)
+    lr = LinearRegression().fit(x, y)
+    fitted = lr.predict(x)
+    resid = y - fitted
+    sigma = float(np.std(resid)) if n > 2 else 0.0
+    ss_res = float(np.sum(resid ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = round(1.0 - ss_res / ss_tot, 4) if ss_tot > 0 else None
+
+    history = [
+        {"period": p, "label": period_label(p), "value": round(float(v), 2)}
+        for p, v in zip(periods, values)
+    ]
+    last = periods[-1]
+    forecast = []
+    for step in range(1, horizon + 1):
+        p = add_period(last, step)
+        pred = float(lr.predict(np.array([[n - 1 + step]], dtype=float))[0])
+        band = Z90 * sigma * math.sqrt(step)
+        lo, hi = pred - band, pred + band
+        if nonneg:
+            pred, lo, hi = max(pred, 0.0), max(lo, 0.0), max(hi, 0.0)
+        forecast.append({
+            "period": p, "label": period_label(p),
+            "value": round(pred, 2), "lower": round(lo, 2), "upper": round(hi, 2),
+        })
+
+    model = {
+        "key": "linear", "label": MODEL_META["linear"]["label"], "library": "scikit-learn",
+        "r2": r2,
+        "rmse": round(float(np.sqrt(np.mean(resid ** 2))), 4) if n else None,
+        "mae": round(float(np.mean(np.abs(resid))), 4) if n else None,
+        "slope_usd_per_month": round(float(lr.coef_[0]), 4),
+        "n_train": int(n), "n_holdout": 0, "trained_at": timezone.now().isoformat(),
+    }
+    return {"history": history, "forecast": forecast, "model": model, "sigma": sigma}
+
+
+def _project_to_axis(periods: list[str], values: list[float], axis: list[str]) -> list[float]:
+    """Proyecta una serie ``(periodos, valores)`` sobre un eje de periodos arbitrario.
+
+    Devuelve el valor real donde existe y una extrapolación lineal donde no (para
+    poder dibujar la línea de "nuestro precio" alineada al eje del mercado, incluido
+    el tramo pronosticado)."""
+    from sklearn.linear_model import LinearRegression
+
+    if not periods:
+        return [0.0 for _ in axis]
+    actual = dict(zip(periods, values))
+    base = periods[0]
+    lr = None
+    if len(periods) >= 2:
+        x = np.array([[period_diff(p, base)] for p in periods], dtype=float)
+        lr = LinearRegression().fit(x, np.asarray(values, dtype=float))
+    out = []
+    for p in axis:
+        if p in actual:
+            out.append(round(float(actual[p]), 2))
+        elif lr is not None:
+            pred = float(lr.predict(np.array([[period_diff(p, base)]], dtype=float))[0])
+            out.append(round(max(pred, 0.0), 2))
+        else:
+            out.append(round(float(values[0]), 2))
+    return out
+
+
+def _gap_verdict(cur_gap: float | None, proj_gap: float | None) -> dict:
+    """Veredicto de competitividad a partir de la brecha de precio (nuestro − mercado).
+
+    Brecha positiva = somos más caros. Si la brecha proyectada crece, perdemos
+    competitividad; si decrece, la ganamos."""
+    if cur_gap is None or proj_gap is None:
+        return {"key": "unknown", "label": "Sin referencia propia"}
+    if proj_gap > cur_gap + 1.5:
+        return {"key": "widening", "label": "Brecha creciente (menos competitivos)"}
+    if proj_gap < cur_gap - 1.5:
+        return {"key": "narrowing", "label": "Brecha decreciente (más competitivos)"}
+    return {"key": "stable", "label": "Brecha estable"}
+
+
+def _own_price_panel() -> dict[str, dict[str, float]]:
+    """Precio de venta de CATÁLOGO (lista), promedio mensual, de nuestros productos.
+    Devuelve ``{categoria_scraper | "__ALL__": {periodo: precio_usd}}``.
+
+    Se usa el precio de **lista** (``ProductPriceHistory.sale_price_usd``), no el
+    realizado, para que la comparación sea coherente con el bloque de posicionamiento
+    de la página "Comparaciones" (que también usa el precio de catálogo) y con la
+    narrativa del negocio (nuestros precios están por encima del mercado). Cada
+    producto se arrastra (ffill) sobre el eje mensual desde su primer precio conocido,
+    y se promedia por categoría. Las categorías propias se mapean al vocabulario del
+    scraper (``classify_category``) para casar con la ``category`` de competencia."""
+    from collections import defaultdict
+
+    from apps.core.models import Product, ProductPriceHistory
+
+    try:
+        from apps.competitor_market_data.scrapers import classify_category
+    except Exception:  # pragma: no cover - import defensivo
+        classify_category = lambda _t: None  # noqa: E731
+
+    cat_of: dict[int, str | None] = {}
+    for p in Product.objects.filter(is_active=True).select_related("category"):
+        text = f"{p.name} {p.full_name or ''}".strip()
+        cat_of[p.id] = classify_category(text) or (p.category.name if p.category else None)
+
+    # Último precio de lista por (producto, mes).
+    hist: dict[int, dict[str, float]] = defaultdict(dict)
+    for r in (
+        ProductPriceHistory.objects.values("product_id", "changed_at", "sale_price_usd")
+        .order_by("changed_at")
+    ):
+        if r["sale_price_usd"] is None:
+            continue
+        hist[r["product_id"]][period_of(r["changed_at"])] = float(r["sale_price_usd"])
+    if not hist:
+        return {}
+
+    all_periods = sorted({p for per in hist.values() for p in per})
+    axis = month_range(all_periods[0], all_periods[-1])
+    acc: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    for pid, per in hist.items():
+        cat = cat_of.get(pid)
+        last = None
+        for p in axis:
+            if p in per:
+                last = per[p]
+            if last is None:
+                continue
+            for key in (["__ALL__"] + ([cat] if cat else [])):
+                acc[key][p].append(last)
+    return {
+        key: {p: (sum(v) / len(v) if v else 0.0) for p, v in per.items()}
+        for key, per in acc.items()
+    }
+
+
+def _benchmark_range_block(start, end) -> dict:
+    """Bloque ``range`` (mismas claves que el panel de Inicio) para el módulo de
+    benchmarking, con los límites de datos tomados de ``CompetitorMarketData``."""
+    from django.db.models import Max, Min
+
+    from apps.benchmarking.models import CompetitorMarketData
+
+    from .datasets import EXCLUDED_COMPETITOR_SOURCES
+
+    bounds = (
+        CompetitorMarketData.objects.filter(price_usd__isnull=False)
+        .exclude(source__in=EXCLUDED_COMPETITOR_SOURCES)
+        .aggregate(lo=Min("scraped_at"), hi=Max("scraped_at"))
+    )
+    data_from = bounds["lo"].date().isoformat() if bounds["lo"] else (start.isoformat() if start else None)
+    data_to = bounds["hi"].date().isoformat() if bounds["hi"] else (end.isoformat() if end else None)
+    return {
+        "from": start.isoformat() if start else data_from,
+        "to": end.isoformat() if end else data_to,
+        "from_label": period_label(period_of(start)) if start else None,
+        "to_label": period_label(period_of(end)) if end else None,
+        "data_from": data_from,
+        "data_to": data_to,
+    }
+
+
+def competitor_forecast(start=None, end=None, horizon: int = 6, category: str | None = None) -> dict:
+    """Proyecta el precio promedio de mercado (competencia) y lo compara con el precio
+    promedio realizado de NUESTRO catálogo, global y por categoría.
+
+    El rango ``[start, end]`` define la ventana histórica de observaciones de
+    competencia usada para ajustar la tendencia; el pronóstico la extiende ``horizon``
+    meses. Devuelve, por gráfico, ``history``/``forecast`` (forma estándar de
+    pronóstico) y ``own_series`` ya alineada al eje ``history+forecast`` para pintarla
+    como una serie extra."""
+    title = "Pronóstico de mercado vs. nuestros precios"
+    obs = datasets.competitor_observations(start=start, end=end)
+    all_obs = datasets.competitor_observations()
+    categories = sorted(all_obs["category"].dropna().unique().tolist()) if not all_obs.empty else []
+    range_block = _benchmark_range_block(start, end)
+
+    # Productos propios con equivalente en la competencia (para el selector de la UI).
+    matched_products = []
+    if not obs.empty:
+        matched = obs[obs["matched_product_id"].notna()]
+        for pid_, g in matched.groupby("matched_product_id"):
+            matched_products.append({
+                "product_id": int(pid_),
+                "name": g["matched_product"].iloc[0],
+                "n_competitors": int(g["competitor"].nunique()),
+                "n_obs": int(len(g)),
+            })
+        matched_products.sort(key=lambda d: d["n_obs"], reverse=True)
+
+    base = {
+        "target": "competitor_forecast", "title": title, "range": range_block,
+        "horizon": horizon, "categories": categories, "matched_products": matched_products,
+        "narrative": [],
+    }
+    if obs.empty:
+        return {**base, "market_overall": None, "by_category": [], "model": None,
+                "meta": {"insufficient_data": True, "n_obs": 0}}
+
+    own_panel = _own_price_panel()
+
+    def market_series(df):
+        if df.empty:
+            return None
+        s = df.groupby("period")["price_usd"].mean()
+        if s.index.nunique() < 3:
+            return None
+        periods = month_range(s.index.min(), s.index.max())
+        s = s.reindex(periods).interpolate().ffill().bfill()
+        return periods, [float(v) for v in s.tolist()]
+
+    def build_chart(df, cat_key):
+        ms = market_series(df)
+        if ms is None:
+            return None
+        periods, values = ms
+        fc = _linear_trend_forecast(periods, values, horizon)
+        axis = [h["period"] for h in fc["history"]] + [f["period"] for f in fc["forecast"]]
+        own_d = own_panel.get(cat_key) or {}
+        own_series = None
+        if own_d:
+            ops = sorted(own_d)
+            own_series = _project_to_axis(ops, [own_d[p] for p in ops], axis)
+        return {
+            "history": fc["history"], "forecast": fc["forecast"],
+            "model": fc["model"], "own_series": own_series,
+        }
+
+    market_overall = build_chart(obs, "__ALL__")
+    if market_overall is None:
+        return {**base, "market_overall": None, "by_category": [], "model": None,
+                "meta": {"insufficient_data": True, "n_obs": int(len(obs)),
+                         "n_competitors": int(obs["competitor"].nunique())}}
+
+    def gap_pct(o, m):
+        return round((o - m) / m * 100.0, 1) if (o and m) else None
+
+    by_category = []
+    counts = obs.groupby("category").size().sort_values(ascending=False)
+    target_cats = [category] if category else list(counts.index[:8])
+    for cat in target_cats:
+        sub = obs[obs["category"] == cat]
+        chart = build_chart(sub, cat)
+        if chart is None:
+            continue
+        n_hist = len(chart["history"])
+        cur_market = chart["history"][-1]["value"]
+        proj_market = chart["forecast"][-1]["value"] if chart["forecast"] else cur_market
+        own = chart["own_series"] or []
+        cur_own = own[n_hist - 1] if len(own) >= n_hist else None
+        proj_own = own[-1] if own else None
+        cur_gap = gap_pct(cur_own, cur_market)
+        proj_gap = gap_pct(proj_own, proj_market)
+        by_category.append({
+            "category": cat, **chart,
+            "current_market": cur_market, "projected_market": proj_market,
+            "current_own": cur_own, "projected_own": proj_own,
+            "current_gap_pct": cur_gap, "projected_gap_pct": proj_gap,
+            "verdict": _gap_verdict(cur_gap, proj_gap),
+        })
+
+    # Resumen automatizado (data storytelling), 3-5 frases — igual que el panel de Inicio.
+    narrative = []
+    slope = (market_overall.get("model") or {}).get("slope_usd_per_month")
+    if slope is not None:
+        if slope > 0.5:
+            narrative.append(f"El precio promedio de mercado sube ~${abs(slope):.1f}/mes según la tendencia.")
+        elif slope < -0.5:
+            narrative.append(f"El precio promedio de mercado baja ~${abs(slope):.1f}/mes según la tendencia.")
+        else:
+            narrative.append("El precio promedio de mercado se mantiene estable según la tendencia.")
+    scored = [b for b in by_category if b["current_gap_pct"] is not None]
+    if scored:
+        n_above = sum(1 for b in scored if b["current_gap_pct"] > 0)
+        narrative.append(f"Estamos por encima del mercado en {n_above} de {len(scored)} categoría(s) comparables.")
+    n_narrow = sum(1 for b in by_category if b["verdict"]["key"] == "narrowing")
+    n_widen = sum(1 for b in by_category if b["verdict"]["key"] == "widening")
+    if n_narrow or n_widen:
+        narrative.append(f"La brecha con el mercado se reduce en {n_narrow} categoría(s) y crece en {n_widen}.")
+    if matched_products:
+        narrative.append(f"{len(matched_products)} producto(s) tienen equivalente en la competencia para comparar precio.")
+
+    return {
+        **base,
+        "narrative": narrative[:5],
+        "market_overall": market_overall,
+        "by_category": by_category,
+        "model": market_overall["model"],
+        "meta": {"n_obs": int(len(obs)), "n_competitors": int(obs["competitor"].nunique())},
+    }
+
+
+def competitor_product_forecast(
+    product_id: int,
+    competitor: str | None = None,
+    horizon: int = 6,
+    start=None,
+    end=None,
+) -> dict:
+    """Compara, para UN producto propio con equivalente en la competencia, el precio
+    del competidor (histórico + pronóstico) contra nuestro precio interno (histórico +
+    pronóstico).
+
+    ``competitor`` puede ser el nombre de un competidor concreto o ``None``/``"__all__"``
+    para usar el **promedio de todos los competidores** de ese producto como objetivo.
+    El precio interno reutiliza ``forecast_product_price`` (Ridge log-lineal). El
+    histórico interno se recorta a la ventana de la competencia para que ambas líneas
+    sean comparables."""
+    from apps.core.models import Product
+
+    product = Product.objects.filter(id=product_id).first()
+    if not product:
+        return {"product": None, "selected_competitor": competitor or "__all__",
+                "competitors": [], "competitor_series": None, "own_series": None,
+                "meta": {"insufficient_data": True, "n_obs": 0}}
+    subject = {"id": product.id, "name": product.name, "sku": product.sku}
+
+    df = datasets.competitor_observations(product_id=product_id, start=start, end=end)
+    competitors = sorted(df["competitor"].dropna().unique().tolist()) if not df.empty else []
+    sel = competitor if (competitor and competitor != "__all__") else None
+    cdf = df[df["competitor"] == sel] if sel else df
+
+    competitor_series, comp_periods = None, None
+    if not cdf.empty:
+        s = cdf.groupby("period")["price_usd"].mean()
+        comp_periods = month_range(s.index.min(), s.index.max())
+        s = s.reindex(comp_periods).interpolate().ffill().bfill()
+        fc = _linear_trend_forecast(comp_periods, [float(v) for v in s.tolist()], horizon)
+        competitor_series = {
+            "label": sel or "Todos los competidores",
+            "history": fc["history"], "forecast": fc["forecast"], "model": fc["model"],
+        }
+
+    # Precio interno alineado EXACTAMENTE a la ventana de la competencia (mismos meses
+    # de histórico y de pronóstico), para que ambas líneas sean comparables. Se toma el
+    # precio de lista mensual (ffill desde el último conocido) y se proyecta con la misma
+    # técnica (recta sobre el índice de mes) que la serie del competidor.
+    own_series = None
+    if comp_periods:
+        pser = datasets.product_price_series(product_id)
+        if not pser.empty:
+            full_idx = sorted(set(pser.index) | set(comp_periods))
+            aligned = pser["sale_price_usd"].reindex(full_idx).ffill().bfill()
+            own_vals = [float(aligned.loc[p]) for p in comp_periods]
+            ofc = _linear_trend_forecast(comp_periods, own_vals, horizon)
+            own_series = {
+                "label": "Maescar (interno)",
+                "history": ofc["history"], "forecast": ofc["forecast"], "model": ofc["model"],
+            }
+
+    return {
+        "product": subject,
+        "selected_competitor": competitor or "__all__",
+        "competitors": competitors,
+        "competitor_series": competitor_series,
+        "own_series": own_series,
+        "meta": {"n_obs": int(len(cdf)), "n_competitors": len(competitors),
+                 "insufficient_data": competitor_series is None},
     }
 
 

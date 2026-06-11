@@ -207,6 +207,7 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 /api/inventory/movements/     → InventoryMovementViewSet: history (ver = operativo) + register ENT/AJU/DEV (Inventario+)
 /api/exchange-rate/latest     → latest BCV/parallel rate, read-only (Seller+)
 /api/analytics/               → predictive module (Manager+): overview, forecast/{demand,sales,profit,exchange-rate,product-price,inventory,quote-conversion}, benchmark/competitors, forecastable-products
+/api/analytics/benchmarking/  → módulo "Benchmarking Competitivo" (Manager+): comparison (descriptivo, ?from=&to=), forecast (gap por categoría + matched_products, ?from=&to=&horizon=), product-forecast (competidor vs. interno por producto, ?product=&competitor=&horizon=&from=&to=). Excluye source="FB" en todas las lecturas.
 /api/analytics/stats/         → descriptive statistics: dashboard (IsViewer — home panel, non-sensitive aggregates), {customers,products,sales,quotes} (Manager+). Live ORM aggregations in apps/analytics/stats.py
 /scrapers/                    → <source>/start, <source>/status, <source>/finalize (ADMIN only)
 ```
@@ -280,8 +281,16 @@ The ML layer turns the seeded history into decision-support forecasts. Code live
   price + shock) sliced per product at serve time. Exchange rate & price model **log(value)**
   (the bolívar devalues exponentially → linear-on-log beats trees, which can't extrapolate).
   `competitor_analysis` is **separate** (cross-sectional positioning + like-with-like via the
-  existing product match + a linear price trend); `forecast_quote_conversion` is a **classifier**
-  (probability + expected pipeline).
+  existing product match + a linear price trend); `competitor_forecast(start, end, horizon,
+  category)` powers the **Benchmarking module** — it projects the competitor market-average price
+  (per category) with a plain `LinearRegression` on the month index (the series are too short for
+  the lag-matrix `forecast_series`), overlays our catalog price (`_own_price_panel`, from
+  `ProductPriceHistory`), and returns `matched_products`; `competitor_product_forecast(product_id,
+  competitor, …)` compares one product's competitor price (a specific one, or the mean of all) vs.
+  our internal price, aligning both to the same months. `forecast_quote_conversion` is a
+  **classifier** (probability + expected pipeline). The descriptive side of benchmarking lives in
+  `apps/analytics/benchmarking.py` (`comparison(start, end)`, deduped by `listing_key`, not cached).
+  **All benchmarking reads exclude `source="FB"`** (`EXCLUDED_COMPETITOR_SOURCES` in `ml/datasets.py`).
 - **`ml/registry.py`** — in-process cache keyed by a cheap **data fingerprint** (counts + last
   mod), so endpoints **lazy-train on demand and cache** (training is sub-second) and invalidate
   when data changes; plus joblib helpers and `upsert_prediction_log`.

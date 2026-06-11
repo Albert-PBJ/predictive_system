@@ -21,6 +21,11 @@ from .features import month_range, period_of
 
 COMPLETED = Sale.StatusChoices.COMPLETED
 
+# Fuentes de competencia EXCLUIDAS de todo el análisis/entrenamiento. Facebook
+# Marketplace se descarta por decisión del proyecto (recomendación del tutor): el
+# scraper se conserva, pero sus datos no se usan en ninguna analítica ni en la UI.
+EXCLUDED_COMPETITOR_SOURCES = ("FB",)
+
 
 def _reindex_monthly(df: pd.DataFrame, value_cols: dict[str, str]) -> pd.DataFrame:
     """Reindexa un DataFrame con columna ``period`` a un rango mensual completo.
@@ -259,19 +264,34 @@ def quotes_dataframe() -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Datos de competidores (análisis separado)
 # --------------------------------------------------------------------------- #
-def competitor_observations(category: str | None = None, product_id: int | None = None) -> pd.DataFrame:
+def competitor_observations(
+    category: str | None = None,
+    product_id: int | None = None,
+    start=None,
+    end=None,
+) -> pd.DataFrame:
     """Observaciones de mercado de competidores con precio en USD, deduplicadas.
 
     Cada fila es una observación; nos quedamos con la última por ``listing_key``
     (semántica de observación del benchmarking) para no contar dos veces un re-scrape.
+
+    ``start``/``end`` (``datetime.date``) acotan la ventana por ``scraped_at`` ANTES de
+    deduplicar, de modo que cada anuncio queda con su última observación *dentro* del
+    rango elegido (la "máquina del tiempo" del módulo de benchmarking).
     """
-    qs = CompetitorMarketData.objects.filter(price_usd__isnull=False).select_related(
-        "competitor", "product"
+    qs = (
+        CompetitorMarketData.objects.filter(price_usd__isnull=False)
+        .exclude(source__in=EXCLUDED_COMPETITOR_SOURCES)
+        .select_related("competitor", "product")
     )
     if category:
         qs = qs.filter(category__iexact=category)
     if product_id:
         qs = qs.filter(product_id=product_id)
+    if start is not None:
+        qs = qs.filter(scraped_at__date__gte=start)
+    if end is not None:
+        qs = qs.filter(scraped_at__date__lte=end)
     rows = []
     for r in qs.order_by("-scraped_at"):
         rows.append(
