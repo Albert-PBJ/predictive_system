@@ -80,7 +80,9 @@ def create_sale(
     }
 
     # Valida existencia/estado y acumula la cantidad pedida por producto (para
-    # detectar líneas repetidas que en conjunto excedan el stock disponible).
+    # detectar líneas repetidas que en conjunto excedan el stock disponible). Los
+    # **servicios** (p. ej. Mantenimiento) no llevan inventario: no se acumulan aquí,
+    # así no se validan contra stock ni lo descuentan más abajo.
     requested = {}
     for it in items:
         pid = it["product"]
@@ -92,7 +94,8 @@ def create_sale(
         qty = it["quantity"]
         if qty < 1:
             raise SaleValidationError(f"La cantidad de '{product.name}' debe ser al menos 1.")
-        requested[pid] = requested.get(pid, 0) + qty
+        if not product.is_service:
+            requested[pid] = requested.get(pid, 0) + qty
 
     discounts_stock = status != Sale.StatusChoices.CANCELLED
     if discounts_stock:
@@ -164,8 +167,9 @@ def create_sale(
         total_cost += subtotal_cost
         total_discount += line_discount
 
-        if discounts_stock:
-            # Salida de inventario (append-only) ligada a esta venta.
+        if discounts_stock and not product.is_service:
+            # Salida de inventario (append-only) ligada a esta venta. Los servicios no
+            # tienen inventario, así que no generan movimiento.
             apply_movement(
                 product=product,
                 movement_type=InventoryMovement.MovementTypeChoices.EXIT,
@@ -211,6 +215,9 @@ def void_sale(*, sale, user):
         raise SaleValidationError("La venta ya está anulada.")
 
     for item in sale.items.select_related("product"):
+        # Los servicios no llevan inventario: no hay nada que reingresar.
+        if item.product.is_service:
+            continue
         apply_movement(
             product=item.product,
             movement_type=InventoryMovement.MovementTypeChoices.RETURN,

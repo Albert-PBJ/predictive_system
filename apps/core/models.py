@@ -1,6 +1,15 @@
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
+# Prefijo de SKU que marca un **servicio** (p. ej. "Mantenimiento"): un producto sin
+# inventario y de precio flexible (se fija al registrar la venta). Se usa de forma
+# transversal para tratar a los servicios como "sin stock": no validan/descuentan
+# inventario y se excluyen de las pantallas y métricas de existencias. NO se excluyen
+# de los modelos de ML (demanda/ventas/utilidad): su historia sintética se genera suave
+# para no afectar la exactitud. Para identificar un servicio usa `Product.is_service`
+# (instancia) o el filtro `sku__startswith=SERVICE_SKU_PREFIX` (queryset).
+SERVICE_SKU_PREFIX = "MSC-SERV-"
+
 
 class Category(models.Model):
     name = models.CharField(
@@ -115,6 +124,16 @@ class Product(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.sku})" if self.sku else self.name
+
+    @property
+    def is_service(self) -> bool:
+        """True si el producto es un **servicio** (sin inventario, precio flexible).
+
+        Se reconoce por el prefijo de SKU `SERVICE_SKU_PREFIX` (p. ej. "Mantenimiento").
+        Los servicios se venden a un precio que se fija en la venta, no descuentan
+        stock y se excluyen de las métricas de inventario.
+        """
+        return bool(self.sku and self.sku.startswith(SERVICE_SKU_PREFIX))
 
 
 class ProductPriceHistory(models.Model):

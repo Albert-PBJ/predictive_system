@@ -361,6 +361,8 @@ Jan-2026 shock, seasonality, price elasticity, and the retail-vs-institutional s
 
 **Inventory is append-only:** Never mutate stock directly — always create an `InventoryMovement` with type `ENT/SAL/AJU/DEV`. `Product.stock` is the current value; movements are the audit trail.
 
+**Service products (stockless, flexible price):** A product whose SKU starts with `SERVICE_SKU_PREFIX` (`"MSC-SERV-"`, in `apps/core/models.py`) is a **service** — no inventory, price set at sale time. Check it with `Product.is_service` (instance) or `sku__startswith=SERVICE_SKU_PREFIX` (queryset). Services: skip stock validation + write no `InventoryMovement` in `sales.services.create_sale`/`void_sale`; are excluded from the stock-control view (`inventory.StockListView`), the inventory-health/stock-status/no-demand aggregates (`analytics.stats`), and the inventory/restock forecasts (`analytics.ml.forecasters.forecast_inventory`, `OverviewView` restock). They are **kept in** the demand/sales/profit/price ML datasets and the catalog/sales stats. The seeded **"Mantenimiento"** product (`MSC-SERV-001`, category "Servicios") is the first one; its synthetic history is generated *smooth* (same trend/seasonality/Jan-2026 shock, low noise) so it doesn't degrade the ML metrics — verified by re-running `train_models` after `seed_company_data`. Frontend mirrors this via `isService()` in `services/productsService.ts`. (`seed_company_data` also sets realistic customer `created_at` so the dashboard's new-vs-old customer metrics work; this feeds no model.)
+
 **`apps/products` vs `apps/core`:** `apps/core` owns the `Product` model. `apps/products` is a thin REST API layer — serializer and viewset only. New model fields go in `apps/core/models.py`.
 
 ## Authentication & Roles

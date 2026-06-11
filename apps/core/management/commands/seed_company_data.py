@@ -14,6 +14,11 @@ Combina dos fuentes:
    enero 2022 hasta abril 2026: ventas (con su **descuento** por línea y total), líneas de
    venta, movimientos de inventario, historial de precios y presupuestos. Las **tasas de
    cambio** (BCV + paralela) siguen la trayectoria real del bolívar (~4,2 → 563 Bs/USD).
+   Se añade además el **servicio de "Mantenimiento"** (precio FLEXIBLE, sin inventario):
+   un producto-servicio en la categoría "Servicios" con ventas históricas suaves que
+   entran en los modelos de ML sin degradar la exactitud (ver bloque del servicio abajo),
+   y se fijan **fechas de alta** (``created_at``) verosímiles a los clientes para que los
+   paneles distingan altas nuevas de antiguas (esto último no alimenta ningún modelo).
    Las ventas y presupuestos se reparten entre un **equipo comercial** = los vendedores
    reales (peso mayor) + varios vendedores adicionales (``EXTRA_SELLERS``) + algunos
    **ex-vendedores** (``FORMER_SELLERS``, inactivos: por rotación de personal sólo tienen
@@ -62,7 +67,7 @@ import json
 import random
 import re
 import unicodedata
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
@@ -70,10 +75,12 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
+from django.utils import timezone
 from django.utils.text import slugify
 
 from apps.core.models import (
-    Category, Customer, ExchangeRate, Product, ProductPriceHistory, Seller,
+    SERVICE_SKU_PREFIX, Category, Customer, ExchangeRate, Product,
+    ProductPriceHistory, Seller,
 )
 from apps.inventory.models import InventoryMovement
 from apps.sales.models import Quote, QuoteItem, Sale, SaleItem
@@ -208,6 +215,28 @@ SHOCK_SENSITIVITY = {"retail": 0.45, "institutional": 0.18}
 # Descuentos típicos por segmento (media, dispersión). Lo institucional negocia
 # más por volumen; el detal, menos. Poca dispersión → utilidad predecible.
 DISCOUNT_BANDS = {"retail": (0.05, 0.02), "institutional": (0.11, 0.025)}
+
+# --------------------------------------------------------------------------- #
+#  Servicio de Mantenimiento (precio FLEXIBLE, sin inventario).               #
+# --------------------------------------------------------------------------- #
+# "Mantenimiento" es un SERVICIO, no un producto de stock: su precio se negocia y se
+# fija al registrar la venta (no es un precio de catálogo fijo). Se le genera una
+# historia sintética SUAVE — misma estructura que el resto (tendencia + estacionalidad +
+# shock cambiario) y ruido bajo — para que ENTRE en los modelos de ML (demanda, ventas,
+# utilidad) SIN degradar la exactitud (R²/RMSE/MAE). Vive en su categoría "Servicios" y
+# se trata como "sin stock" en todo el sistema (ver `Product.is_service`). El nº de
+# trabajos/mes (= unidades de demanda) y el precio medio son series suaves, de modo que
+# tanto la demanda como el ingreso/utilidad del servicio son aprendibles.
+MAINTENANCE_SKU = SERVICE_SKU_PREFIX + "001"   # "MSC-SERV-001"
+MAINTENANCE_NAME = "Mantenimiento"
+MAINTENANCE_CATEGORY = "Servicios"
+MAINTENANCE_REF_PRICE = 90.0          # tarifa de referencia en USD (el precio real se fija en la venta)
+MAINTENANCE_MARGIN = 0.55             # margen del servicio (mano de obra) ~55%, estable
+MAINTENANCE_MARGIN_JITTER = 0.02      # ±2 p.p. por trabajo → utilidad estable (serie aprendible)
+MAINTENANCE_BASE_JOBS = 12.0          # nº de trabajos/mes base (2022-01), antes de tendencia
+MAINTENANCE_GROWTH = 0.015            # crecimiento mensual constante (crece con la base instalada)
+MAINTENANCE_PRICE_SD = 0.12           # dispersión del precio por trabajo (negociación)
+MAINTENANCE_START = date(2022, 1, 1)  # el servicio existe desde el inicio de la historia
 
 # Vendedores reales de Maescar (comisión 10% de la utilidad, como en el Cuadro de Ventas).
 REAL_SELLERS = [
@@ -658,6 +687,10 @@ class Command(BaseCommand):
 
         random.seed(opt["seed"])
         self.rng = random.Random(opt["seed"])
+        # RNG aislado para el servicio de Mantenimiento y las fechas de alta de clientes:
+        # estos se generan al FINAL, así que `self.rng` (la data principal) queda idéntica
+        # bit a bit y el servicio solo añade una capa suave que no afecta la exactitud.
+        self._svc_rng = random.Random(opt["seed"] + 7)
         self.rates = RateModel()
         openpyxl = _load_openpyxl()
 
@@ -689,6 +722,15 @@ class Command(BaseCommand):
             self._persist_quotes(quote_specs)
             self._build_inventory(products, all_sales, admin)
             self._build_price_history(products)
+
+            # Servicio de Mantenimiento (precio flexible) + sus ventas históricas. Se
+            # genera al final, con un RNG propio y sin tocar inventario, de modo que la
+            # data principal queda intacta y solo se suma una capa suave a las series.
+            self._build_maintenance(active, sellers)
+
+            # Fechas de alta (created_at) verosímiles para distinguir clientes nuevos de
+            # antiguos en los paneles (no alimenta ningún modelo de ML).
+            self._set_customer_registration_dates()
 
         self._summary()
 
@@ -1258,7 +1300,8 @@ class Command(BaseCommand):
             f"Movimientos de inventario: {len(movements)}. Productos en stock bajo: {low}."))
 
     # --------------------------------------------------- historial precios -- #
-    def _build_price_history(self, products):
+    def _build_price_history(self, products, rng=None):
+        rng = rng or self.rng
         rows = []
         points = []
         d = date(2022, 1, 1)
@@ -1275,7 +1318,7 @@ class Command(BaseCommand):
             for pd in points:
                 # Pequeño ruido mensual (±0,3%) sobre la rampa: la serie de precio queda
                 # claramente aprendible pero no perfecta (evita un R² irreal ~0,99).
-                f = price_factor(pd) * Decimal(str(self.rng.uniform(0.997, 1.003)))
+                f = price_factor(pd) * Decimal(str(rng.uniform(0.997, 1.003)))
                 bcv, par = self.rates.for_date(pd)
                 buy = d2(Decimal(p.purchase_price_usd or 0) * f)
                 sell = d2(Decimal(p.sale_price_usd) * f)
@@ -1283,9 +1326,110 @@ class Command(BaseCommand):
                     product=p, purchase_price_usd=buy, sale_price_usd=sell,
                     purchase_price_ves=d2(buy * bcv), sale_price_ves=d2(sell * bcv),
                     bcv_rate=bcv, parallel_rate=par, changed_at=pd,
-                    reason=self.rng.choice(PRICE_HISTORY_REASONS)))
+                    reason=rng.choice(PRICE_HISTORY_REASONS)))
         ProductPriceHistory.objects.bulk_create(rows, batch_size=1000)
         self.stdout.write(self.style.SUCCESS(f"Historial de precios: {len(rows)} registros."))
+
+    # ----------------------------------------------------- mantenimiento --- #
+    def _build_maintenance(self, active, sellers):
+        """Crea el producto-servicio "Mantenimiento" y su historia de ventas (precio flexible).
+
+        El precio NO es de catálogo: se negocia y se fija en cada venta. El producto solo
+        lleva una tarifa de referencia. Las ventas se generan mes a mes con un objetivo
+        SUAVE de nº de trabajos (misma tendencia/estacionalidad/shock que el resto, ruido
+        bajo) y un precio por trabajo alrededor de una media que sigue la rampa de precios.
+        Así la DEMANDA (nº de trabajos = unidades) y el INGRESO/UTILIDAD del servicio son
+        series suaves que entran en los modelos sin bajar el R². No mueve inventario.
+        """
+        rng = self._svc_rng
+        cat, _ = Category.objects.get_or_create(
+            name=MAINTENANCE_CATEGORY, defaults={"slug": slugify(MAINTENANCE_CATEGORY)})
+        ref_cost = MAINTENANCE_REF_PRICE * (1.0 - MAINTENANCE_MARGIN)
+        product, _ = Product.objects.update_or_create(
+            sku=MAINTENANCE_SKU,
+            defaults=dict(
+                name=MAINTENANCE_NAME, full_name="Servicio de mantenimiento de mobiliario",
+                category=cat, material=Product.MaterialChoices.OTHER, colors=[],
+                purchase_price_usd=d2(ref_cost), sale_price_usd=d2(MAINTENANCE_REF_PRICE),
+                min_stock=0, stock=0, is_manufactured=False, is_active=True,
+            ),
+        )
+
+        retail_pool, inst_pool = self._segment_pools(active)
+        sale_dicts = []
+        for y, m in iter_months(MAINTENANCE_START, SYNTH_END):
+            t = self._month_index(y, m)
+            last_day = self._month_last_day(y, m)
+            trend = (1.0 + MAINTENANCE_GROWTH) ** t                 # crecimiento constante (exponencial)
+            afford = self._affordability(date(y, m, 15), "institutional")
+            target = MAINTENANCE_BASE_JOBS * trend * self._SEASONAL[m] * afford
+            n_jobs = max(0, int(round(rng.gauss(target, target * 0.06))))   # ruido bajo → serie suave
+            month_sellers, month_weights = self._sellers_for_month(sellers, y, m)
+            mean_price = MAINTENANCE_REF_PRICE * float(price_factor(date(y, m, 15)))
+            for _ in range(n_jobs):
+                d = date(y, m, rng.randint(1, last_day))
+                # El mantenimiento es sobre todo institucional/empresarial (base instalada),
+                # con algún particular. El tipo de venta sigue al tipo de cliente.
+                if rng.random() < 0.8 and inst_pool:
+                    customer = rng.choice(inst_pool)
+                else:
+                    customer = rng.choice(retail_pool or active)
+                seller = rng.choices(month_sellers, weights=month_weights)[0]
+                price = max(15.0, rng.gauss(mean_price, mean_price * MAINTENANCE_PRICE_SD))
+                margin = MAINTENANCE_MARGIN + rng.uniform(-MAINTENANCE_MARGIN_JITTER, MAINTENANCE_MARGIN_JITTER)
+                cost = price * (1.0 - margin)
+                stype = (Sale.TypeChoices.INSTITUTIONAL
+                         if customer.customer_type != Customer.TypeChoices.INDIVIDUAL
+                         else Sale.TypeChoices.RETAIL)
+                # spec de 6-tuplas (producto, cant, precio_lista, precio_neto, costo, disc_pct):
+                # precio flexible → lista = neto (sin descuento).
+                spec = [(product, 1, d2(price), d2(price), d2(cost), Decimal("0.00"))]
+                sale_dicts.append(self._make_sale_dict(
+                    d, customer, seller, spec, sale_type=stype,
+                    status=Sale.StatusChoices.COMPLETED))
+
+        self._persist_sales(sale_dicts)
+        # Historial de precios de la tarifa de referencia (rampa suave) con el RNG aislado,
+        # para que el modelo de precio también pueda pronosticar el servicio de forma aprendible.
+        self._build_price_history([product], rng=self._svc_rng)
+        self.stdout.write(self.style.SUCCESS(
+            f"Mantenimiento (servicio): {len(sale_dicts)} ventas históricas (precio flexible)."))
+
+    # ----------------------------------------------- fechas de alta clientes -- #
+    def _set_customer_registration_dates(self):
+        """Fija `created_at` de los clientes para distinguir ALTAS nuevas de antiguas.
+
+        `created_at` es auto_now_add (de fábrica, todos = hoy), así que el panel no podía
+        contar "clientes nuevos" por mes. Aquí se reconstruye una fecha de alta verosímil:
+        los compradores se dieron de alta poco antes de su PRIMERA compra; los prospectos
+        (sin compras) se reparten en el tiempo con sesgo a fechas recientes (la empresa
+        capta más leads con los años). No alimenta ningún modelo de ML; es solo para los
+        paneles. Determinista (RNG aislado) e idempotente.
+        """
+        from django.db.models import Min
+
+        rng = self._svc_rng
+        first_purchase = {
+            r["customer_id"]: r["first"]
+            for r in Sale.objects.values("customer_id").annotate(first=Min("sale_date"))
+        }
+        start = date(2022, 1, 1)
+        span_days = max(1, (SYNTH_END - start).days)
+        tz = timezone.get_current_timezone()
+        updates = []
+        for c in Customer.objects.all().only("id"):
+            fp = first_purchase.get(c.id)
+            if fp:
+                reg = max(start, fp - timedelta(days=rng.randint(3, 45)))
+            else:
+                # Prospecto sin compras: sesgo a fechas recientes (triangular, moda al final).
+                reg = start + timedelta(days=int(rng.triangular(0.0, 1.0, 1.0) * span_days))
+            dt = datetime.combine(reg, time(9, 0))
+            c.created_at = timezone.make_aware(dt, tz) if settings.USE_TZ else dt
+            updates.append(c)
+        Customer.objects.bulk_update(updates, ["created_at"], batch_size=500)
+        self.stdout.write(self.style.SUCCESS(
+            f"Fechas de alta de clientes fijadas: {len(updates)}."))
 
     # ------------------------------------------------------- presupuestos -- #
     def _build_quote_opportunities(self, active, sellers):

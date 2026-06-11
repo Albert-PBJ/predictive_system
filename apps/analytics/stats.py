@@ -18,7 +18,7 @@ from datetime import date, timedelta
 from django.db.models import Avg, Count, F, Max, Min, Q, Sum
 from django.db.models.functions import TruncMonth
 
-from apps.core.models import Customer, ExchangeRate, Product
+from apps.core.models import SERVICE_SKU_PREFIX, Customer, ExchangeRate, Product
 from apps.sales.models import Quote, Sale, SaleItem
 
 from .ml.features import add_period, month_range, period_label, period_of
@@ -343,9 +343,14 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool) -> dict:
     top_customers = [_crow(a) for a in sorted(cust_agg, key=lambda x: _f(x["revenue"]), reverse=True)[:8]]
 
     # Productos sin demanda en el rango (activos sin ninguna venta) — "¿qué no rota?".
+    # Se excluyen los servicios: no llevan stock, no representan capital inmovilizado.
     sold_ids = {a["product_id"] for a in item_agg}
     no_demand_qs = (
-        Product.objects.filter(is_active=True).exclude(id__in=sold_ids).select_related("category").order_by("-stock")
+        Product.objects.filter(is_active=True)
+        .exclude(id__in=sold_ids)
+        .exclude(sku__startswith=SERVICE_SKU_PREFIX)
+        .select_related("category")
+        .order_by("-stock")
     )
     no_demand = []
     for p in no_demand_qs[:10]:
@@ -390,15 +395,17 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool) -> dict:
         )[:8]
     ]
 
-    # Salud del inventario (instantánea "actual", no depende del rango).
-    inv = Product.objects.filter(is_active=True).aggregate(
+    # Salud del inventario (instantánea "actual", no depende del rango). Los servicios
+    # (sin stock) se excluyen: no son existencias físicas.
+    phys = Product.objects.filter(is_active=True).exclude(sku__startswith=SERVICE_SKU_PREFIX)
+    inv = phys.aggregate(
         cost=Sum(F("stock") * F("purchase_price_usd")),
         retail=Sum(F("stock") * F("sale_price_usd")),
         units=Sum("stock"),
     )
-    active_products = Product.objects.filter(is_active=True).count()
-    out_of_stock = Product.objects.filter(is_active=True, stock__lte=0).count()
-    low_stock = Product.objects.filter(is_active=True, stock__gt=0, stock__lte=F("min_stock")).count()
+    active_products = phys.count()
+    out_of_stock = phys.filter(stock__lte=0).count()
+    low_stock = phys.filter(stock__gt=0, stock__lte=F("min_stock")).count()
     ok_stock = max(active_products - out_of_stock - low_stock, 0)
     inventory_health = {
         "active_products": active_products,
@@ -713,14 +720,16 @@ def products() -> dict:
     active = Product.objects.filter(is_active=True).count()
     inactive = Product.objects.filter(is_active=False).count()
 
-    out_of_stock = Product.objects.filter(is_active=True, stock__lte=0).count()
-    low_stock = Product.objects.filter(
-        is_active=True, stock__gt=0, stock__lte=F("min_stock")
-    ).count()
-    ok_stock = active - out_of_stock - low_stock
+    # Estado de existencias y valor de inventario: solo productos FÍSICOS (los servicios
+    # no llevan stock). El conteo de catálogo (`active`) sí incluye los servicios.
+    phys = Product.objects.filter(is_active=True).exclude(sku__startswith=SERVICE_SKU_PREFIX)
+    phys_active = phys.count()
+    out_of_stock = phys.filter(stock__lte=0).count()
+    low_stock = phys.filter(stock__gt=0, stock__lte=F("min_stock")).count()
+    ok_stock = phys_active - out_of_stock - low_stock
 
     # Valor del inventario (a costo y a precio de venta).
-    val = Product.objects.filter(is_active=True).aggregate(
+    val = phys.aggregate(
         cost=Sum(F("stock") * F("purchase_price_usd")),
         retail=Sum(F("stock") * F("sale_price_usd")),
         units=Sum("stock"),
@@ -751,9 +760,15 @@ def products() -> dict:
     top_by_units = [prow(a) for a in sorted(item_agg, key=lambda x: x["units"] or 0, reverse=True)[:10]]
     top_by_revenue = [prow(a) for a in sorted(item_agg, key=lambda x: _f(x["revenue"]), reverse=True)[:10]]
 
-    # Productos activos sin ventas registradas (baja rotación).
+    # Productos activos sin ventas registradas (baja rotación). Los servicios no son
+    # "lentos" por rotación de stock, así que se excluyen de este conteo.
     sold_ids = {a["product_id"] for a in item_agg}
-    no_sales_qs = Product.objects.filter(is_active=True).exclude(id__in=sold_ids).select_related("category")
+    no_sales_qs = (
+        Product.objects.filter(is_active=True)
+        .exclude(id__in=sold_ids)
+        .exclude(sku__startswith=SERVICE_SKU_PREFIX)
+        .select_related("category")
+    )
     slow_movers = [
         {
             "product_id": p.id,

@@ -579,6 +579,9 @@ def forecast_inventory(product_id: int, horizon: int = 6) -> dict:
     if not product:
         return _empty("inventory", "Proyección de inventario")
     subject = {"product_id": product_id, "product_name": product.name, "sku": product.sku}
+    # Los servicios (p. ej. Mantenimiento) no llevan inventario: no se proyecta stock.
+    if product.is_service:
+        return _empty("inventory", "Proyección de inventario", subject=subject)
     demand = forecast_demand(product_id, horizon=horizon)
     if not demand.get("forecast"):
         return _empty("inventory", "Proyección de inventario", subject=subject)

@@ -19,7 +19,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.permissions import IsManager
-from apps.core.models import Product
+from apps.core.models import SERVICE_SKU_PREFIX, Product
 from apps.sales.models import SaleItem
 
 from .ml import forecasters as F
@@ -180,8 +180,10 @@ class OverviewView(_BaseForecastView):
             return f[0] if f else None
 
         # Reabastecimiento: top productos por unidades vendidas que necesitan reorden.
+        # Se excluyen los servicios (sin inventario, no se reabastecen).
         top = (
             SaleItem.objects.filter(sale__status="COMP")
+            .exclude(product__sku__startswith=SERVICE_SKU_PREFIX)
             .values("product_id")
             .annotate(units=Sum("quantity"))
             .order_by("-units")[:8]

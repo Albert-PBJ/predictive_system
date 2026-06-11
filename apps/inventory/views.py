@@ -3,7 +3,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.permissions import IsOperational, IsWarehouse
-from apps.core.models import Product
+from apps.core.models import SERVICE_SKU_PREFIX, Product
 
 from .models import InventoryMovement
 from .serializers import (
@@ -116,7 +116,13 @@ class StockListView(APIView):
         return str(value).lower() in ("1", "true", "yes", "si", "sí")
 
     def get(self, request):
-        qs = Product.objects.select_related("category").order_by("category__name", "name")
+        # Los servicios (p. ej. Mantenimiento) no llevan inventario: se excluyen del
+        # control de stock.
+        qs = (
+            Product.objects.select_related("category")
+            .exclude(sku__startswith=SERVICE_SKU_PREFIX)
+            .order_by("category__name", "name")
+        )
 
         params = request.query_params
         search = (params.get("search") or "").strip()
