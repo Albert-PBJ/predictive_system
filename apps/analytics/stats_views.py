@@ -16,6 +16,8 @@ no se cachean: el panel refleja siempre el dato más reciente.
 
 from __future__ import annotations
 
+from datetime import date
+
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -25,12 +27,29 @@ from . import stats
 
 
 class DashboardStatsView(APIView):
-    """GET /api/analytics/stats/dashboard — resumen para el panel de Inicio."""
+    """GET /api/analytics/stats/dashboard — panel de Inicio ejecutivo.
+
+    Acepta ``?from=YYYY-MM-DD&to=YYYY-MM-DD`` (la "máquina del tiempo": todo el
+    panel se recalcula para ese rango). Por defecto, los últimos 12 meses. Es
+    ``IsViewer`` (lo carga cualquier usuario), pero la utilidad/margen/índice/
+    competencia/modelos solo se incluyen para Gerente/Admin (``sensitive``).
+    """
 
     permission_classes = [IsViewer]
 
     def get(self, request):
-        return Response(stats.dashboard())
+        default_start, default_end = stats.default_range()
+        start = self._parse_date(request.query_params.get("from"), default_start)
+        end = self._parse_date(request.query_params.get("to"), default_end)
+        sensitive = IsManager().has_permission(request, self)
+        return Response(stats.executive_dashboard(start, end, sensitive=sensitive))
+
+    @staticmethod
+    def _parse_date(value: str | None, fallback: date) -> date:
+        try:
+            return date.fromisoformat(value) if value else fallback
+        except (ValueError, TypeError):
+            return fallback
 
 
 class _ManagerStatsView(APIView):
