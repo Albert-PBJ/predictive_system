@@ -67,39 +67,6 @@ def _customer_names(ids) -> dict[int, dict]:
     return out
 
 
-def _monthly_sales(months: int = 12) -> list[dict]:
-    """Serie mensual (últimos ``months`` meses) de ingresos, utilidad y nº de ventas.
-
-    Rellena con ceros los meses sin ventas para que el eje sea continuo.
-    """
-    end = reference_month()
-    start = add_period(end, -(months - 1))
-    rows = (
-        Sale.objects.filter(status=COMP, sale_date__gte=_first_of(start))
-        .annotate(m=TruncMonth("sale_date"))
-        .values("m")
-        .annotate(
-            revenue=Sum("total_sale_usd"),
-            profit=Sum("total_profit_usd"),
-            count=Count("id"),
-        )
-    )
-    by_period = {period_of(r["m"]): r for r in rows}
-    out = []
-    for p in month_range(start, end):
-        r = by_period.get(p)
-        out.append(
-            {
-                "period": p,
-                "label": period_label(p),
-                "revenue": _f(r["revenue"]) if r else 0.0,
-                "profit": _f(r["profit"]) if r else 0.0,
-                "count": int(r["count"]) if r else 0,
-            }
-        )
-    return out
-
-
 # --------------------------------------------------------------------------- #
 # Panel de inicio EJECUTIVO (resumen estratégico con "máquina del tiempo")
 # --------------------------------------------------------------------------- #
@@ -116,20 +83,39 @@ def _monthly_sales(months: int = 12) -> list[dict]:
 # rentabilidad — coherente con cómo se gestiona la utilidad en el resto de la app.
 
 
-def default_range() -> tuple[date, date]:
-    """Rango por defecto: los últimos 2 meses con datos.
+def default_range(months: int = 2) -> tuple[date, date]:
+    """Rango por defecto: los últimos ``months`` meses con datos.
 
-    Carga el panel mostrando los dos meses más recientes para que las variaciones de
-    los KPIs comparen contra los 2 meses anteriores (la ventana previa de igual
-    duración) y la tendencia tenga ya un par de puntos. El usuario amplía con los
-    presets (1/2/3/6/12 meses, año, todo).
+    El panel de Inicio carga 2 meses para que las variaciones de los KPIs comparen
+    contra la ventana previa de igual duración y la tendencia tenga ya un par de
+    puntos; los paneles de estadísticas usan 1 mes. El usuario amplía con los presets
+    (1/2/3/6/12 meses, año, todo).
     """
     last = Sale.objects.filter(status=COMP).aggregate(m=Max("sale_date"))["m"] or date.today()
-    return _first_of(add_period(period_of(last), -1)), last
+    return _first_of(add_period(period_of(last), -(months - 1))), last
 
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
     return max(lo, min(hi, x))
+
+
+def _range_block(start: date, end: date) -> dict:
+    """Bloque ``range`` común a los paneles con "máquina del tiempo".
+
+    Devuelve el rango elegido (con etiquetas en español) y los límites de datos
+    disponibles (primera/última venta completada) para que el selector de fechas
+    del frontend conozca su mínimo/máximo. Idéntico al que expone el panel de Inicio.
+    """
+    bounds = Sale.objects.filter(status=COMP).aggregate(lo=Min("sale_date"), hi=Max("sale_date"))
+    return {
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "from_label": period_label(period_of(start)),
+        "to_label": period_label(period_of(end)),
+        "months": len(month_range(period_of(start), period_of(end))),
+        "data_from": bounds["lo"].isoformat() if bounds["lo"] else start.isoformat(),
+        "data_to": bounds["hi"].isoformat() if bounds["hi"] else end.isoformat(),
+    }
 
 
 def _sale_metrics(qs) -> dict:
@@ -603,8 +589,17 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool) -> dict:
 # --------------------------------------------------------------------------- #
 # Clientes
 # --------------------------------------------------------------------------- #
-def customers() -> dict:
-    ref = reference_month()
+def customers(start: date, end: date) -> dict:
+    """Estadísticas de clientes para el rango [start, end].
+
+    La **composición** de la cartera (tipo, ubicación, activos vs. prospectos, totales)
+    es una instantánea del estado actual (no depende del rango). Lo que sí se recalcula
+    para el rango son los agregados de **compra**: rankings por ingresos/actividad y los
+    clientes con compras. El corte de "en riesgo" (6 meses sin comprar) es relativo a la
+    fecha final del rango.
+    """
+    if start > end:
+        start, end = end, start
     type_labels = dict(Customer.TypeChoices.choices)
 
     by_type = [
@@ -632,13 +627,20 @@ def customers() -> dict:
     total = Customer.objects.count()
     prospects = total - active
 
-    # Agregados de compra por cliente (solo ventas completadas).
-    agg = list(
+    # Agregados de compra por cliente DENTRO del rango (solo ventas completadas).
+    range_agg = list(
+        Sale.objects.filter(status=COMP, sale_date__gte=start, sale_date__lte=end)
+        .values("customer_id")
+        .annotate(revenue=Sum("total_sale_usd"), orders=Count("id"), last=Max("sale_date"))
+    )
+    # Para "en riesgo" se necesita la última compra REAL (no la del rango), así que se
+    # consulta el histórico completo aparte.
+    full_agg = list(
         Sale.objects.filter(status=COMP)
         .values("customer_id")
         .annotate(revenue=Sum("total_sale_usd"), orders=Count("id"), last=Max("sale_date"))
     )
-    names = _customer_names({a["customer_id"] for a in agg})
+    names = _customer_names({a["customer_id"] for a in range_agg} | {a["customer_id"] for a in full_agg})
 
     def row(a):
         info = names.get(a["customer_id"], {})
@@ -652,23 +654,24 @@ def customers() -> dict:
             "last_purchase": a["last"].isoformat() if a["last"] else None,
         }
 
-    top_by_revenue = [row(a) for a in sorted(agg, key=lambda x: _f(x["revenue"]), reverse=True)[:10]]
-    top_by_orders = [row(a) for a in sorted(agg, key=lambda x: x["orders"], reverse=True)[:10]]
+    top_by_revenue = [row(a) for a in sorted(range_agg, key=lambda x: _f(x["revenue"]), reverse=True)[:10]]
+    top_by_orders = [row(a) for a in sorted(range_agg, key=lambda x: x["orders"], reverse=True)[:10]]
 
-    # Clientes en riesgo: activos cuya última compra es anterior al corte (6 meses).
-    cutoff = _first_of(add_period(ref, -6))
+    # Clientes en riesgo: activos cuya última compra es anterior al corte (end - 6 meses).
+    cutoff = _first_of(add_period(period_of(end), -6))
     active_ids = set(
         Customer.objects.filter(is_active_customer=True).values_list("id", flat=True)
     )
     at_risk = [
         row(a)
         for a in sorted(
-            (a for a in agg if a["customer_id"] in active_ids and a["last"] and a["last"] < cutoff),
+            (a for a in full_agg if a["customer_id"] in active_ids and a["last"] and a["last"] < cutoff),
             key=lambda x: x["last"],
         )[:10]
     ]
 
     return {
+        "range": _range_block(start, end),
         "by_type": by_type,
         "by_state": by_state,
         "active_split": [
@@ -679,7 +682,7 @@ def customers() -> dict:
             "total": total,
             "active": active,
             "prospects": prospects,
-            "with_purchases": len(agg),
+            "with_purchases": len(range_agg),
         },
         "top_by_revenue": top_by_revenue,
         "top_by_orders": top_by_orders,
@@ -690,7 +693,16 @@ def customers() -> dict:
 # --------------------------------------------------------------------------- #
 # Productos
 # --------------------------------------------------------------------------- #
-def products() -> dict:
+def products(start: date, end: date) -> dict:
+    """Estadísticas de productos para el rango [start, end].
+
+    La **composición** del catálogo y el **inventario** (categorías, materiales,
+    activos/inactivos, estado y valor de stock) son una instantánea actual. Lo que se
+    recalcula para el rango son las **ventas por producto**: más vendidos por unidades/
+    ingresos y los que no rotaron (sin ventas en el rango).
+    """
+    if start > end:
+        start, end = end, start
     material_labels = dict(Product.MaterialChoices.choices)
 
     by_category = [
@@ -735,9 +747,11 @@ def products() -> dict:
         units=Sum("stock"),
     )
 
-    # Ventas por producto (unidades e ingreso) — solo ventas completadas.
+    # Ventas por producto (unidades e ingreso) — ventas completadas DENTRO del rango.
     item_agg = list(
-        SaleItem.objects.filter(sale__status=COMP)
+        SaleItem.objects.filter(
+            sale__status=COMP, sale__sale_date__gte=start, sale__sale_date__lte=end
+        )
         .values("product_id")
         .annotate(units=Sum("quantity"), revenue=Sum("subtotal_sale_usd"))
     )
@@ -760,7 +774,7 @@ def products() -> dict:
     top_by_units = [prow(a) for a in sorted(item_agg, key=lambda x: x["units"] or 0, reverse=True)[:10]]
     top_by_revenue = [prow(a) for a in sorted(item_agg, key=lambda x: _f(x["revenue"]), reverse=True)[:10]]
 
-    # Productos activos sin ventas registradas (baja rotación). Los servicios no son
+    # Productos activos sin ventas en el rango (baja rotación). Los servicios no son
     # "lentos" por rotación de stock, así que se excluyen de este conteo.
     sold_ids = {a["product_id"] for a in item_agg}
     no_sales_qs = (
@@ -781,6 +795,7 @@ def products() -> dict:
     ]
 
     return {
+        "range": _range_block(start, end),
         "by_category": by_category,
         "by_material": by_material,
         "active_split": [
@@ -809,8 +824,17 @@ def products() -> dict:
 # --------------------------------------------------------------------------- #
 # Ventas
 # --------------------------------------------------------------------------- #
-def sales() -> dict:
+def sales(start: date, end: date) -> dict:
+    """Estadísticas de ventas para el rango [start, end] (todo se recalcula).
+
+    Composición detal/institucional, tendencia mensual (dentro del rango), ingresos por
+    categoría, mejores vendedores y totales, todo medido sobre ventas completadas en el
+    intervalo elegido.
+    """
+    if start > end:
+        start, end = end, start
     type_labels = dict(Sale.TypeChoices.choices)
+    in_range = Sale.objects.filter(status=COMP, sale_date__gte=start, sale_date__lte=end)
 
     by_type = [
         {
@@ -821,42 +845,56 @@ def sales() -> dict:
             "profit": _f(r["profit"]),
         }
         for r in (
-            Sale.objects.filter(status=COMP)
+            in_range
             .values("sale_type")
             .annotate(count=Count("id"), revenue=Sum("total_sale_usd"), profit=Sum("total_profit_usd"))
             .order_by("-revenue")
         )
     ]
 
-    monthly = _monthly_sales(18)
-
-    # Ingresos mensuales por tipo (detal vs. institucional) — últimos 12 meses.
-    end = reference_month()
-    start = add_period(end, -11)
-    rows = (
-        Sale.objects.filter(status=COMP, sale_date__gte=_first_of(start))
-        .annotate(m=TruncMonth("sale_date"))
+    # Serie mensual (ingresos/utilidad/nº de ventas) dentro del rango, ejes continuos.
+    p_start, p_end = period_of(start), period_of(end)
+    periods = month_range(p_start, p_end)
+    month_rows = (
+        in_range.annotate(m=TruncMonth("sale_date"))
         .values("m", "sale_type")
-        .annotate(revenue=Sum("total_sale_usd"))
+        .annotate(revenue=Sum("total_sale_usd"), profit=Sum("total_profit_usd"), count=Count("id"))
     )
-    monthly_map: dict[str, dict] = {}
-    for r in rows:
+    agg_month: dict[str, dict] = {}
+    for r in month_rows:
         p = period_of(r["m"])
-        monthly_map.setdefault(p, {})[r["sale_type"]] = _f(r["revenue"])
+        slot = agg_month.setdefault(p, {"revenue": 0.0, "profit": 0.0, "count": 0, "RET": 0.0, "INS": 0.0})
+        slot["revenue"] += _f(r["revenue"])
+        slot["profit"] += _f(r["profit"])
+        slot["count"] += int(r["count"])
+        if r["sale_type"] == Sale.TypeChoices.RETAIL:
+            slot["RET"] += _f(r["revenue"])
+        elif r["sale_type"] == Sale.TypeChoices.INSTITUTIONAL:
+            slot["INS"] += _f(r["revenue"])
+    monthly = [
+        {
+            "period": p,
+            "label": period_label(p),
+            "revenue": agg_month.get(p, {}).get("revenue", 0.0),
+            "profit": agg_month.get(p, {}).get("profit", 0.0),
+            "count": agg_month.get(p, {}).get("count", 0),
+        }
+        for p in periods
+    ]
     monthly_by_type = [
         {
             "period": p,
             "label": period_label(p),
-            "retail": monthly_map.get(p, {}).get(Sale.TypeChoices.RETAIL, 0.0),
-            "institutional": monthly_map.get(p, {}).get(Sale.TypeChoices.INSTITUTIONAL, 0.0),
+            "retail": agg_month.get(p, {}).get("RET", 0.0),
+            "institutional": agg_month.get(p, {}).get("INS", 0.0),
         }
-        for p in month_range(start, end)
+        for p in periods
     ]
 
     revenue_by_category = [
         {"category": r["product__category__name"] or "Sin categoría", "revenue": _f(r["revenue"])}
         for r in (
-            SaleItem.objects.filter(sale__status=COMP)
+            SaleItem.objects.filter(sale__in=in_range)
             .values("product__category__name")
             .annotate(revenue=Sum("subtotal_sale_usd"))
             .order_by("-revenue")[:10]
@@ -864,7 +902,7 @@ def sales() -> dict:
     ]
 
     seller_rows = (
-        Sale.objects.filter(status=COMP)
+        in_range
         .values("seller_id", "seller__first_name", "seller__last_name")
         .annotate(revenue=Sum("total_sale_usd"), profit=Sum("total_profit_usd"), count=Count("id"))
         .order_by("-revenue")[:10]
@@ -880,7 +918,7 @@ def sales() -> dict:
         for r in seller_rows
     ]
 
-    totals = Sale.objects.filter(status=COMP).aggregate(
+    totals = in_range.aggregate(
         revenue=Sum("total_sale_usd"),
         profit=Sum("total_profit_usd"),
         discount=Sum("total_discount_usd"),
@@ -891,6 +929,7 @@ def sales() -> dict:
     profit = _f(totals["profit"])
 
     return {
+        "range": _range_block(start, end),
         "by_type": by_type,
         "monthly": monthly,
         "monthly_by_type": monthly_by_type,
@@ -910,11 +949,22 @@ def sales() -> dict:
 # --------------------------------------------------------------------------- #
 # Presupuestos
 # --------------------------------------------------------------------------- #
-def quotes() -> dict:
+def quotes(start: date, end: date) -> dict:
+    """Estadísticas de presupuestos para el rango [start, end].
+
+    Todo se mide sobre los presupuestos **emitidos** dentro del intervalo (``issued_date``
+    en el rango): mezcla por estado, conversión/cierre, tendencia emitidos vs. convertidos,
+    pipeline abierto y los de mayor valor. Los presupuestos sin fecha de emisión (borradores)
+    quedan fuera, como en el panel de Inicio.
+    """
+    if start > end:
+        start, end = end, start
     status_labels = dict(Quote.StatusChoices.choices)
     CON = Quote.StatusChoices.CONVERTED
     REJ = Quote.StatusChoices.REJECTED
     OPEN = [Quote.StatusChoices.DRAFT, Quote.StatusChoices.SENT, Quote.StatusChoices.APPROVED]
+
+    in_range = Quote.objects.filter(issued_date__gte=start, issued_date__lte=end)
 
     by_status = [
         {
@@ -924,26 +974,22 @@ def quotes() -> dict:
             "value": _f(r["value"]),
         }
         for r in (
-            Quote.objects.values("status")
+            in_range.values("status")
             .annotate(count=Count("id"), value=Sum("total_usd"))
             .order_by("-count")
         )
     ]
 
-    total = Quote.objects.count()
-    converted = Quote.objects.filter(status=CON).count()
-    rejected = Quote.objects.filter(status=REJ).count()
+    total = in_range.count()
+    converted = in_range.filter(status=CON).count()
+    rejected = in_range.filter(status=REJ).count()
     conversion_rate = round(converted / total * 100, 1) if total else None
     win_rate = round(converted / (converted + rejected) * 100, 1) if (converted + rejected) else None
 
-    # Emitidos vs. convertidos por mes (últimos 12, por fecha de emisión).
-    qs = Quote.objects.all()
-    last = qs.aggregate(m=Max("issued_date"))["m"]
-    end = period_of(last) if last else reference_month()
-    start = add_period(end, -11)
+    # Emitidos vs. convertidos por mes dentro del rango (por fecha de emisión).
+    periods = month_range(period_of(start), period_of(end))
     rows = (
-        qs.filter(issued_date__gte=_first_of(start))
-        .annotate(m=TruncMonth("issued_date"))
+        in_range.annotate(m=TruncMonth("issued_date"))
         .values("m")
         .annotate(issued=Count("id"), converted=Count("id", filter=Q(status=CON)))
     )
@@ -955,15 +1001,15 @@ def quotes() -> dict:
             "issued": int(by_period[p]["issued"]) if p in by_period else 0,
             "converted": int(by_period[p]["converted"]) if p in by_period else 0,
         }
-        for p in month_range(start, end)
+        for p in periods
     ]
 
-    pipeline = Quote.objects.filter(status__in=OPEN).aggregate(
+    pipeline = in_range.filter(status__in=OPEN).aggregate(
         count=Count("id"), value=Sum("total_usd")
     )
 
     top = (
-        Quote.objects.select_related("customer")
+        in_range.select_related("customer")
         .order_by("-total_usd")[:10]
     )
     top_quotes = [
@@ -980,11 +1026,12 @@ def quotes() -> dict:
     ]
 
     return {
+        "range": _range_block(start, end),
         "by_status": by_status,
         "monthly": monthly,
         "extras": [
-            {"key": "installation", "label": "Con instalación", "count": Quote.objects.filter(includes_installation=True).count()},
-            {"key": "delivery", "label": "Con despacho", "count": Quote.objects.filter(includes_delivery=True).count()},
+            {"key": "installation", "label": "Con instalación", "count": in_range.filter(includes_installation=True).count()},
+            {"key": "delivery", "label": "Con despacho", "count": in_range.filter(includes_delivery=True).count()},
         ],
         "totals": {
             "total": total,

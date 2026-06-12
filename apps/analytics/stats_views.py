@@ -26,11 +26,31 @@ from apps.accounts.permissions import IsManager, IsViewer
 from . import stats
 
 
+def _parse_date(value: str | None, fallback: date) -> date:
+    """Parsea ``YYYY-MM-DD`` del query string; usa ``fallback`` si falta o es inválido."""
+    try:
+        return date.fromisoformat(value) if value else fallback
+    except (ValueError, TypeError):
+        return fallback
+
+
+def _range_params(request, *, default_months: int = 2) -> tuple[date, date]:
+    """Rango [from, to] del query string ("máquina del tiempo").
+
+    Sin ``?from=&to=`` cae al rango por defecto de ``default_months`` meses: el panel de
+    Inicio usa 2 (para comparar contra la ventana previa); los paneles de estadísticas, 1.
+    """
+    default_start, default_end = stats.default_range(default_months)
+    start = _parse_date(request.query_params.get("from"), default_start)
+    end = _parse_date(request.query_params.get("to"), default_end)
+    return start, end
+
+
 class DashboardStatsView(APIView):
     """GET /api/analytics/stats/dashboard — panel de Inicio ejecutivo.
 
     Acepta ``?from=YYYY-MM-DD&to=YYYY-MM-DD`` (la "máquina del tiempo": todo el
-    panel se recalcula para ese rango). Por defecto, los últimos 12 meses. Es
+    panel se recalcula para ese rango). Por defecto, los últimos 2 meses. Es
     ``IsViewer`` (lo carga cualquier usuario), pero la utilidad/margen/índice/
     competencia/modelos solo se incluyen para Gerente/Admin (``sensitive``).
     """
@@ -38,39 +58,41 @@ class DashboardStatsView(APIView):
     permission_classes = [IsViewer]
 
     def get(self, request):
-        default_start, default_end = stats.default_range()
-        start = self._parse_date(request.query_params.get("from"), default_start)
-        end = self._parse_date(request.query_params.get("to"), default_end)
+        start, end = _range_params(request)
         sensitive = IsManager().has_permission(request, self)
         return Response(stats.executive_dashboard(start, end, sensitive=sensitive))
 
-    @staticmethod
-    def _parse_date(value: str | None, fallback: date) -> date:
-        try:
-            return date.fromisoformat(value) if value else fallback
-        except (ValueError, TypeError):
-            return fallback
-
 
 class _ManagerStatsView(APIView):
+    """Vistas de detalle (Gerente/Admin). Todas aceptan la misma ``?from=&to=``.
+
+    Las funciones de ``stats`` deciden qué se recalcula por rango (agregados de
+    venta/presupuesto) y qué es instantánea actual (composición de cartera/catálogo,
+    inventario) — ver sus docstrings.
+    """
+
     permission_classes = [IsManager]
 
 
 class CustomerStatsView(_ManagerStatsView):
     def get(self, request):
-        return Response(stats.customers())
+        start, end = _range_params(request, default_months=1)
+        return Response(stats.customers(start, end))
 
 
 class ProductStatsView(_ManagerStatsView):
     def get(self, request):
-        return Response(stats.products())
+        start, end = _range_params(request, default_months=1)
+        return Response(stats.products(start, end))
 
 
 class SalesStatsView(_ManagerStatsView):
     def get(self, request):
-        return Response(stats.sales())
+        start, end = _range_params(request, default_months=1)
+        return Response(stats.sales(start, end))
 
 
 class QuoteStatsView(_ManagerStatsView):
     def get(self, request):
-        return Response(stats.quotes())
+        start, end = _range_params(request, default_months=1)
+        return Response(stats.quotes(start, end))
