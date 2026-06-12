@@ -62,7 +62,7 @@ class CompetitorAdmin(admin.ModelAdmin):
 class CompetitorMarketDataAdmin(admin.ModelAdmin):
     list_display = (
         "competitor_name", "source", "product_name", "price", "currency",
-        "price_usd", "matched_product", "enriched_by", "is_in_stock", "scraped_at",
+        "price_usd", "matched_product", "enriched_by", "is_in_stock", "posted_at", "scraped_at",
     )
     list_filter = ("source", "enriched_by", "is_in_stock", "scraped_at")
     search_fields = ("competitor_name", "product_name", "category")

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pandas as pd
 from django.db.models import Count, Sum
-from django.db.models.functions import TruncMonth
+from django.db.models.functions import Coalesce, TruncMonth
 
 from apps.benchmarking.models import CompetitorMarketData
 from apps.core.models import ExchangeRate, Product, ProductPriceHistory
@@ -25,6 +25,21 @@ COMPLETED = Sale.StatusChoices.COMPLETED
 # Marketplace se descarta por decisión del proyecto (recomendación del tutor): el
 # scraper se conserva, pero sus datos no se usan en ninguna analítica ni en la UI.
 EXCLUDED_COMPETITOR_SOURCES = ("FB",)
+
+
+def effective_obs_date():
+    """Expresión ORM de la fecha EFECTIVA de una observación de competencia.
+
+    Usa ``posted_at`` (la fecha real de publicación, que sólo trae el scraper de
+    Instagram) cuando existe, y si no ``scraped_at`` (la fecha del scraping). Así un
+    post viejo scrapeado hoy se ubica en su mes real: sus precios/promociones son de
+    aquella fecha, no de la del scraping. Para las demás fuentes ``posted_at`` es NULL
+    y la expresión cae naturalmente en ``scraped_at``.
+
+    Pensada para anotar el queryset y luego filtrar/ordenar por la fecha efectiva
+    (``effective_at``), en lugar de por ``scraped_at`` directamente.
+    """
+    return Coalesce("posted_at", "scraped_at")
 
 
 def _reindex_monthly(df: pd.DataFrame, value_cols: dict[str, str]) -> pd.DataFrame:
@@ -275,25 +290,29 @@ def competitor_observations(
     Cada fila es una observación; nos quedamos con la última por ``listing_key``
     (semántica de observación del benchmarking) para no contar dos veces un re-scrape.
 
-    ``start``/``end`` (``datetime.date``) acotan la ventana por ``scraped_at`` ANTES de
-    deduplicar, de modo que cada anuncio queda con su última observación *dentro* del
-    rango elegido (la "máquina del tiempo" del módulo de benchmarking).
+    ``start``/``end`` (``datetime.date``) acotan la ventana por la fecha EFECTIVA de la
+    observación (``effective_obs_date``: la fecha de publicación del post en Instagram,
+    o ``scraped_at`` en el resto) ANTES de deduplicar, de modo que cada anuncio queda
+    con su última observación *dentro* del rango elegido (la "máquina del tiempo" del
+    módulo de benchmarking). Los modelos se entrenan sobre esta fecha efectiva, no
+    sobre ``scraped_at``, para no fechar en el mes del scraping un post antiguo.
     """
     qs = (
         CompetitorMarketData.objects.filter(price_usd__isnull=False)
         .exclude(source__in=EXCLUDED_COMPETITOR_SOURCES)
         .select_related("competitor", "product")
+        .annotate(effective_at=effective_obs_date())
     )
     if category:
         qs = qs.filter(category__iexact=category)
     if product_id:
         qs = qs.filter(product_id=product_id)
     if start is not None:
-        qs = qs.filter(scraped_at__date__gte=start)
+        qs = qs.filter(effective_at__date__gte=start)
     if end is not None:
-        qs = qs.filter(scraped_at__date__lte=end)
+        qs = qs.filter(effective_at__date__lte=end)
     rows = []
-    for r in qs.order_by("-scraped_at"):
+    for r in qs.order_by("-effective_at"):
         rows.append(
             {
                 "id": r.id,
@@ -307,12 +326,13 @@ def competitor_observations(
                 "source": r.source,
                 "listing_key": r.listing_key or f"_row{r.id}",
                 "scraped_at": r.scraped_at,
-                "period": period_of(r.scraped_at.date()),
+                "effective_at": r.effective_at,
+                "period": period_of(r.effective_at.date()),
             }
         )
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    # Última observación por anuncio (ya viene ordenado desc por scraped_at).
+    # Última observación por anuncio (ya viene ordenado desc por la fecha efectiva).
     df = df.drop_duplicates(subset="listing_key", keep="first")
     return df

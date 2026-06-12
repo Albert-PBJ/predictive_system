@@ -22,7 +22,7 @@ from django.db.models import Max, Min
 from apps.benchmarking.models import CompetitorMarketData
 from apps.core.models import Product
 
-from .ml.datasets import EXCLUDED_COMPETITOR_SOURCES
+from .ml.datasets import EXCLUDED_COMPETITOR_SOURCES, effective_obs_date
 from .ml.features import period_label, period_of
 
 try:
@@ -41,7 +41,8 @@ def data_bounds() -> tuple[date | None, date | None]:
     agg = (
         CompetitorMarketData.objects.filter(price_usd__isnull=False)
         .exclude(source__in=EXCLUDED_COMPETITOR_SOURCES)
-        .aggregate(lo=Min("scraped_at"), hi=Max("scraped_at"))
+        .annotate(effective_at=effective_obs_date())
+        .aggregate(lo=Min("effective_at"), hi=Max("effective_at"))
     )
     lo = agg["lo"].date() if agg["lo"] else None
     hi = agg["hi"].date() if agg["hi"] else None
@@ -61,19 +62,25 @@ def default_range() -> tuple[date, date]:
 
 def _window_rows(start: date | None, end: date | None) -> list[CompetitorMarketData]:
     """Filas de competencia con precio en USD dentro de ``[start, end]``, deduplicadas
-    a la última observación por ``listing_key``."""
+    a la última observación por ``listing_key``.
+
+    La ventana y el orden usan la fecha EFECTIVA de la observación
+    (``effective_obs_date``: la fecha de publicación del post en Instagram, o
+    ``scraped_at`` en el resto), para que un post antiguo scrapeado hoy cuente en su
+    mes real y no en el del scraping."""
     qs = (
         CompetitorMarketData.objects.filter(price_usd__isnull=False)
         .exclude(source__in=EXCLUDED_COMPETITOR_SOURCES)
         .select_related("competitor", "product")
+        .annotate(effective_at=effective_obs_date())
     )
     if start is not None:
-        qs = qs.filter(scraped_at__date__gte=start)
+        qs = qs.filter(effective_at__date__gte=start)
     if end is not None:
-        qs = qs.filter(scraped_at__date__lte=end)
+        qs = qs.filter(effective_at__date__lte=end)
     seen: set[str] = set()
     rows: list[CompetitorMarketData] = []
-    for r in qs.order_by("-scraped_at"):  # más reciente primero
+    for r in qs.order_by("-effective_at"):  # más reciente primero (por fecha efectiva)
         key = r.listing_key or f"_row{r.id}"
         if key in seen:
             continue

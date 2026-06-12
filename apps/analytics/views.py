@@ -170,7 +170,8 @@ class CompetitorAnalysisView(_BaseForecastView):
 
 
 # --------------------------------------------------------------------------- #
-# Benchmarking Competitivo ("máquina del tiempo": rango sobre scraped_at)
+# Benchmarking Competitivo ("máquina del tiempo": rango sobre la fecha efectiva de
+# la observación — posted_at en Instagram, scraped_at en el resto)
 # --------------------------------------------------------------------------- #
 class BenchmarkingComparisonView(_BaseForecastView):
     """GET /api/analytics/benchmarking/comparison?from=&to= — radiografía descriptiva

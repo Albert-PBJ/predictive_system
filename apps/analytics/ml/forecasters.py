@@ -1051,12 +1051,13 @@ def _benchmark_range_block(start, end) -> dict:
 
     from apps.benchmarking.models import CompetitorMarketData
 
-    from .datasets import EXCLUDED_COMPETITOR_SOURCES
+    from .datasets import EXCLUDED_COMPETITOR_SOURCES, effective_obs_date
 
     bounds = (
         CompetitorMarketData.objects.filter(price_usd__isnull=False)
         .exclude(source__in=EXCLUDED_COMPETITOR_SOURCES)
-        .aggregate(lo=Min("scraped_at"), hi=Max("scraped_at"))
+        .annotate(effective_at=effective_obs_date())
+        .aggregate(lo=Min("effective_at"), hi=Max("effective_at"))
     )
     data_from = bounds["lo"].date().isoformat() if bounds["lo"] else (start.isoformat() if start else None)
     data_to = bounds["hi"].date().isoformat() if bounds["hi"] else (end.isoformat() if end else None)

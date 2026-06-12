@@ -116,6 +116,15 @@ class CompetitorMarketData(models.Model):
     raw_metadata = models.JSONField(null=True, blank=True, help_text=_("Respuesta completa del scraper (Apify)"))
     scraped_at = models.DateTimeField(auto_now_add=True)
 
+    # Fecha real de la publicación (solo Instagram: la trae el post). Permite ubicar
+    # la observación en su mes REAL y no en el del scraping: un flyer publicado hace
+    # meses pero scrapeado hoy refleja precios/promociones de aquella fecha. Para el
+    # resto de fuentes queda en NULL y se usa `scraped_at` (ver `effective_date_expr`).
+    posted_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text=_("Fecha de publicación original del anuncio (solo Instagram); si está vacía se usa scraped_at"),
+    )
+
     class Meta:
         db_table = "benchmarking_competitor_market_data"
         verbose_name = "Dato de Mercado Competidor"

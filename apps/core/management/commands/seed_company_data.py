@@ -775,8 +775,12 @@ class Command(BaseCommand):
             raise CommandError(f"No se encontró la lista de precios vigente: {price_path}")
         for name, sell, colors, material in read_new_price_list(openpyxl, price_path):
             merged[norm_name(name)] = (name, sell, colors, material)
+        # Sólo los productos de la lista de precios vigente quedan ACTIVOS (es el
+        # catálogo actual de la empresa).
+        catalog_keys = set(merged)
         # Productos que sólo aparecen en las ventas reales (no en la lista vigente):
-        # se conservan para que esas ventas resuelvan a un producto real.
+        # se conservan para que esas ventas resuelvan a un producto real, pero quedan
+        # INACTIVOS (están descontinuados: ya no figuran en el catálogo vigente).
         for name, _buy, sell in CURATED_EXTRA_PRODUCTS:
             if norm_name(name) not in merged:
                 merged[norm_name(name)] = (name, float(sell), [], None)
@@ -803,7 +807,7 @@ class Command(BaseCommand):
                     colors=colors or CAT_COLORS.get(cat_name, []),
                     purchase_price_usd=d2(buy), sale_price_usd=d2(sell),
                     min_stock=min_stock, is_manufactured=manufactured,
-                    is_active=True,
+                    is_active=_key in catalog_keys,
                 ),
             )
             created += int(was_created)

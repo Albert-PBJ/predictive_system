@@ -1,8 +1,11 @@
 import logging
 import re
 import unicodedata
+from datetime import datetime, timezone as dt_timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
+
+from django.utils.dateparse import parse_datetime
 
 from apps.benchmarking.models import Competitor, CompetitorMarketData
 from apps.competitor_market_data.enrichment import deepseek, image_ocr
@@ -154,6 +157,28 @@ def _extract_promotions(caption: str, hashtags: list) -> Optional[str]:
     return None
 
 
+def _parse_post_timestamp(post: dict) -> Optional[datetime]:
+    """Fecha de publicación del post de Instagram (campo ``timestamp`` de Apify).
+
+    El actor devuelve un ISO 8601 (p. ej. ``"2025-03-12T14:23:11.000Z"``). La
+    guardamos para ubicar la observación en su mes REAL: un post viejo scrapeado hoy
+    trae precios/promociones de su fecha de publicación, no de la del scraping. Se
+    normaliza a un datetime *aware* (UTC) y devuelve None si falta o no es parseable.
+    """
+    raw = post.get("timestamp")
+    if not raw:
+        return None
+    try:
+        dt = parse_datetime(raw) if isinstance(raw, str) else None
+    except (ValueError, TypeError):
+        dt = None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:  # naive → asumir UTC (Apify entrega UTC)
+        dt = dt.replace(tzinfo=dt_timezone.utc)
+    return dt
+
+
 def _is_in_stock(caption: str) -> bool:
     """Retorna False si el caption contiene palabras de producto agotado."""
     if not caption:
@@ -225,6 +250,7 @@ def _map_post_to_instance(post: dict) -> CompetitorMarketData:
         lead_time_days=_extract_lead_time(caption),
         is_in_stock=_is_in_stock(caption),
         promotions=_extract_promotions(caption, hashtags),
+        posted_at=_parse_post_timestamp(post),  # fecha real de publicación (Instagram)
         raw_metadata=post,  # JSON completo retornado por Apify
     )
 
