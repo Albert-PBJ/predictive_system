@@ -19,11 +19,11 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.permissions import IsManager
+from apps.accounts.permissions import IsManager, IsViewer
 from apps.core.models import SERVICE_SKU_PREFIX, Product
 from apps.sales.models import SaleItem
 
-from . import benchmarking
+from . import benchmarking, report_narrative, stats
 from .ml import forecasters as F
 from .ml import registry
 from .models import PredictionLog
@@ -283,3 +283,30 @@ class OverviewView(_BaseForecastView):
             "restock_alerts": restock,
             "registry": registry_rows,
         }
+
+
+class ReportNarrativeView(APIView):
+    """GET /api/analytics/report-narrative — narrativa del reporte ejecutivo redactada por LLM.
+
+    Acepta la misma "máquina del tiempo" ``?from=&to=`` que el panel de Inicio. Recalcula
+    el panel ejecutivo para ese rango (con el mismo gating de sensibilidad: ``IsViewer``
+    para cargarlo, pero utilidad/margen/IVC/competencia solo si el solicitante pasa
+    ``IsManager``) y, para gerencia, adjunta los titulares predictivos. Le pasa esos
+    HECHOS al modelo, que redacta situación/puntos clave/riesgos/acciones/cierre.
+
+    Degrada de forma segura: si el LLM no está configurado o falla, retorna
+    ``{"available": False, ...}`` y el frontend cae a la síntesis determinista existente,
+    de modo que el botón "Generar reporte" funciona igual sin clave de LLM.
+    """
+
+    permission_classes = [IsViewer]
+
+    def get(self, request):
+        default_start, default_end = stats.default_range(2)
+        start = _date(request, "from", default_start)
+        end = _date(request, "to", default_end)
+        sensitive = IsManager().has_permission(request, self)
+        dashboard = stats.executive_dashboard(start, end, sensitive=sensitive)
+        # Las estimaciones (overview) son de gerencia; se cachean igual que en OverviewView.
+        overview = registry.cached("overview", OverviewView._build) if sensitive else None
+        return Response(report_narrative.generate(dashboard, overview, sensitive=sensitive))

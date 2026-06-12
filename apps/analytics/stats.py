@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from django.db.models import Avg, Count, F, Max, Min, Q, Sum
-from django.db.models.functions import TruncMonth
+from django.db.models.functions import TruncDay, TruncMonth
 
 from apps.core.models import SERVICE_SKU_PREFIX, Customer, ExchangeRate, Product
 from apps.sales.models import Quote, Sale, SaleItem
@@ -45,6 +45,25 @@ def _pct(curr: float, prev: float) -> float | None:
 def _first_of(period: str) -> date:
     """Primer día del mes de un periodo ``"YYYY-MM"``."""
     return date(int(period[:4]), int(period[5:]), 1)
+
+
+# Abreviaturas de mes en español para etiquetar series DIARIAS (p. ej. "05 may").
+_MONTH_ABBR_ES = ("ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic")
+
+
+def _day_range(start: date, end: date) -> list[date]:
+    """Lista de días [start, end] inclusive (eje continuo para series diarias)."""
+    out: list[date] = []
+    d = start
+    while d <= end:
+        out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def _day_label(d: date) -> str:
+    """Etiqueta corta de un día en español: ``"05 may"``."""
+    return f"{d.day:02d} {_MONTH_ABBR_ES[d.month - 1]}"
 
 
 def reference_month() -> str:
@@ -852,18 +871,24 @@ def sales(start: date, end: date) -> dict:
         )
     ]
 
-    # Serie mensual (ingresos/utilidad/nº de ventas) dentro del rango, ejes continuos.
+    # Serie de tendencia (ingresos/utilidad/nº de ventas) dentro del rango, eje continuo.
+    # Si el rango cae en UN SOLO mes calendario (p. ej. el preset "1 mes"), se desglosa
+    # por DÍA en lugar de por mes: con un único punto mensual las líneas/barras quedan
+    # vacías, así que la granularidad diaria mantiene los gráficos legibles.
     p_start, p_end = period_of(start), period_of(end)
     periods = month_range(p_start, p_end)
-    month_rows = (
-        in_range.annotate(m=TruncMonth("sale_date"))
-        .values("m", "sale_type")
+    daily = len(periods) <= 1
+    trunc = TruncDay if daily else TruncMonth
+    rows = (
+        in_range.annotate(b=trunc("sale_date"))
+        .values("b", "sale_type")
         .annotate(revenue=Sum("total_sale_usd"), profit=Sum("total_profit_usd"), count=Count("id"))
     )
-    agg_month: dict[str, dict] = {}
-    for r in month_rows:
-        p = period_of(r["m"])
-        slot = agg_month.setdefault(p, {"revenue": 0.0, "profit": 0.0, "count": 0, "RET": 0.0, "INS": 0.0})
+    agg: dict = {}
+    for r in rows:
+        # TruncDay → date; TruncMonth → date que normalizamos a periodo "YYYY-MM".
+        key = r["b"] if daily else period_of(r["b"])
+        slot = agg.setdefault(key, {"revenue": 0.0, "profit": 0.0, "count": 0, "RET": 0.0, "INS": 0.0})
         slot["revenue"] += _f(r["revenue"])
         slot["profit"] += _f(r["profit"])
         slot["count"] += int(r["count"])
@@ -871,24 +896,29 @@ def sales(start: date, end: date) -> dict:
             slot["RET"] += _f(r["revenue"])
         elif r["sale_type"] == Sale.TypeChoices.INSTITUTIONAL:
             slot["INS"] += _f(r["revenue"])
+
+    if daily:
+        buckets = [(d, d.isoformat(), _day_label(d)) for d in _day_range(start, end)]
+    else:
+        buckets = [(p, p, period_label(p)) for p in periods]
     monthly = [
         {
-            "period": p,
-            "label": period_label(p),
-            "revenue": agg_month.get(p, {}).get("revenue", 0.0),
-            "profit": agg_month.get(p, {}).get("profit", 0.0),
-            "count": agg_month.get(p, {}).get("count", 0),
+            "period": pid,
+            "label": label,
+            "revenue": agg.get(key, {}).get("revenue", 0.0),
+            "profit": agg.get(key, {}).get("profit", 0.0),
+            "count": agg.get(key, {}).get("count", 0),
         }
-        for p in periods
+        for key, pid, label in buckets
     ]
     monthly_by_type = [
         {
-            "period": p,
-            "label": period_label(p),
-            "retail": agg_month.get(p, {}).get("RET", 0.0),
-            "institutional": agg_month.get(p, {}).get("INS", 0.0),
+            "period": pid,
+            "label": label,
+            "retail": agg.get(key, {}).get("RET", 0.0),
+            "institutional": agg.get(key, {}).get("INS", 0.0),
         }
-        for p in periods
+        for key, pid, label in buckets
     ]
 
     revenue_by_category = [
@@ -928,13 +958,31 @@ def sales(start: date, end: date) -> dict:
     revenue = _f(totals["revenue"])
     profit = _f(totals["profit"])
 
+    # Ventas del periodo, de la más reciente a la más antigua (tabla de detalle).
+    # Se acota a 50 filas para no inflar el payload; "Ver todas" lleva al historial.
+    recent = [
+        {
+            "id": s.id,
+            "date": s.sale_date.isoformat(),
+            "customer": s.customer.company_name,
+            "type": s.sale_type,
+            "type_label": s.get_sale_type_display(),
+            "total_usd": _f(s.total_sale_usd),
+            "status": s.status,
+            "status_label": s.get_status_display(),
+        }
+        for s in in_range.select_related("customer").order_by("-sale_date", "-id")[:50]
+    ]
+
     return {
         "range": _range_block(start, end),
+        "granularity": "daily" if daily else "monthly",
         "by_type": by_type,
         "monthly": monthly,
         "monthly_by_type": monthly_by_type,
         "revenue_by_category": revenue_by_category,
         "top_sellers": top_sellers,
+        "recent": recent,
         "totals": {
             "revenue": revenue,
             "profit": profit,
