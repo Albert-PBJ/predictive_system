@@ -19,16 +19,32 @@ Variables de entorno (en el `.env` del backend):
 
 import json
 import logging
-import os
 import re
+
+from apps.core import system_settings
 
 logger = logging.getLogger(__name__)
 
 
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-USE_LLM_ENRICHMENT = os.environ.get("USE_LLM_ENRICHMENT", "False").lower() in ("1", "true", "yes")
+# La clave es un SECRETO: se lee SIEMPRE del entorno, nunca de la BD/UI. El resto de
+# la configuración (interruptor, modelo, base_url) la resuelve `system_settings`
+# (la BD manda, sembrada del .env), de modo que se puede cambiar en caliente.
+DEEPSEEK_API_KEY = system_settings.deepseek_api_key()
+
+
+def use_llm_enrichment() -> bool:
+    """Estado EFECTIVO del interruptor de enriquecimiento (BD-manda)."""
+    return system_settings.llm_enrichment_enabled()
+
+
+def current_model() -> str:
+    """Modelo de DeepSeek configurado (BD-manda, fallback al entorno)."""
+    return system_settings.deepseek_model()
+
+
+def current_base_url() -> str:
+    return system_settings.deepseek_base_url()
+
 
 _REQUEST_TIMEOUT = 20  # segundos por llamada
 _MAX_KNOWN_COMPETITORS = 100  # tope de competidores enviados en el prompt
@@ -59,7 +75,7 @@ _SYSTEM_PROMPT = (
 
 def is_enabled() -> bool:
     """True solo si el enriquecimiento está activado y hay API key configurada."""
-    return USE_LLM_ENRICHMENT and bool(DEEPSEEK_API_KEY)
+    return use_llm_enrichment() and bool(DEEPSEEK_API_KEY)
 
 
 def _get_client():
@@ -69,7 +85,7 @@ def _get_client():
 
     return OpenAI(
         api_key=DEEPSEEK_API_KEY,
-        base_url=DEEPSEEK_BASE_URL,
+        base_url=current_base_url(),
         timeout=_REQUEST_TIMEOUT,
     )
 
@@ -191,7 +207,7 @@ def enrich_listing(
 
     try:
         response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
+            model=current_model(),
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": _build_user_prompt(title, description, location, known)},
@@ -380,7 +396,7 @@ def enrich_instagram_post(
 
     try:
         response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
+            model=current_model(),
             messages=[
                 {"role": "system", "content": _IG_SYSTEM_PROMPT},
                 {
@@ -505,7 +521,7 @@ def match_products(scraped: list[dict], catalog: list[dict]) -> dict:
 
     try:
         response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
+            model=current_model(),
             messages=[
                 {"role": "system", "content": _PRODUCT_MATCH_SYSTEM_PROMPT},
                 {"role": "user", "content": _build_product_match_prompt(scraped, catalog)},
@@ -558,11 +574,11 @@ def get_config_status() -> dict:
         openai_version = None
 
     return {
-        "use_llm_enrichment": USE_LLM_ENRICHMENT,
+        "use_llm_enrichment": use_llm_enrichment(),
         "has_api_key": bool(key),
         "api_key_preview": key_preview,
-        "model": DEEPSEEK_MODEL,
-        "base_url": DEEPSEEK_BASE_URL,
+        "model": current_model(),
+        "base_url": current_base_url(),
         "request_timeout_seconds": _REQUEST_TIMEOUT,
         "openai_installed": openai_installed,
         "openai_version": openai_version,
@@ -599,7 +615,7 @@ def check_connection(
     }
 
     # Validaciones de configuración (no consumen tokens ni hacen red).
-    if not USE_LLM_ENRICHMENT:
+    if not use_llm_enrichment():
         diagnostic["error"] = {
             "stage": "config",
             "type": "EnriquecimientoDeshabilitado",
@@ -642,7 +658,7 @@ def check_connection(
 
     try:
         response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
+            model=current_model(),
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": _build_user_prompt(title, description, location, known)},
@@ -663,7 +679,7 @@ def check_connection(
                 "total_tokens": getattr(usage, "total_tokens", None),
             }
         diagnostic["ok"] = True
-        logger.info("Prueba de conexión a DeepSeek EXITOSA (modelo=%s).", DEEPSEEK_MODEL)
+        logger.info("Prueba de conexión a DeepSeek EXITOSA (modelo=%s).", current_model())
     except Exception as exc:
         error = {"stage": "api_call", "type": type(exc).__name__, "message": str(exc)}
         # Los errores del SDK de OpenAI suelen traer el código HTTP y el cuerpo.

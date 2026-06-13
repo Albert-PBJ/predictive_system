@@ -10,13 +10,13 @@ stock descontado pero sin línea registrada, o viceversa).
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 
 from apps.core.models import ExchangeRate, Product
 from apps.inventory.models import InventoryMovement
 from apps.inventory.services import InsufficientStockError, apply_movement
 
-from .models import Sale, SaleItem
+from .models import Quote, QuoteItem, Sale, SaleItem
 
 CENTS = Decimal("0.01")
 
@@ -25,16 +25,21 @@ class SaleValidationError(Exception):
     """Error de negocio al registrar o anular una venta (se traduce a HTTP 400)."""
 
 
+class QuoteValidationError(Exception):
+    """Error de negocio al crear un presupuesto (se traduce a HTTP 400)."""
+
+
 def _latest_rate():
     """Última tasa de cambio cargada (la más reciente por fecha)."""
     return ExchangeRate.objects.order_by("-date").first()
 
 
 def _effective_rate(rate):
-    """Tasa preferida para convertir USD→VES: la paralela; si no, la BCV."""
-    if not rate:
-        return None
-    return rate.parallel_rate or rate.bcv_rate
+    """Tasa para convertir USD→VES según la base elegida en la configuración
+    (paralela por defecto; también BCV o promedio). Si no hay tasa, None."""
+    from apps.core import system_settings
+
+    return system_settings.effective_rate(rate)
 
 
 def _money(value):
@@ -232,3 +237,149 @@ def void_sale(*, sale, user):
     sale.notes = f"{sale.notes}\n{stamp}".strip() if sale.notes else stamp
     sale.save(update_fields=["status", "notes", "updated_at"])
     return sale
+
+
+# --------------------------------------------------------------------------- #
+# Presupuestos (cotizaciones)
+# --------------------------------------------------------------------------- #
+# A diferencia de una venta, un presupuesto NO toca el inventario (no descuenta
+# stock) ni calcula utilidad/comisión: es una oferta de precios. Lleva IVA (16% por
+# defecto) y un número correlativo legible por día (DDMMYYYY-N).
+
+
+def _next_quote_number(issued_date, offset: int = 0) -> str:
+    """Número de presupuesto correlativo del día: ``DDMMYYYY-N``.
+
+    Calcula el siguiente N a partir de los ya emitidos ese día. ``offset`` permite
+    saltar al siguiente ante una colisión de unicidad (reintento concurrente).
+    """
+    prefix = issued_date.strftime("%d%m%Y")
+    existing = Quote.objects.filter(quote_number__startswith=f"{prefix}-").values_list(
+        "quote_number", flat=True
+    )
+    max_n = 0
+    for qn in existing:
+        try:
+            max_n = max(max_n, int(qn.rsplit("-", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return f"{prefix}-{max_n + 1 + offset}"
+
+
+def create_quote(
+    *,
+    seller,
+    customer,
+    items,
+    issued_date=None,
+    expiry_date=None,
+    iva_rate=None,
+    includes_installation=False,
+    includes_delivery=False,
+    status=Quote.StatusChoices.DRAFT,
+):
+    """Crea un presupuesto con sus líneas (sin tocar inventario).
+
+    ``items`` es una lista de dicts ``{"product": <id>, "quantity": <int>,
+    "unit_price_usd": <Decimal|None>}``; si no se indica el precio unitario, se toma
+    el precio de venta actual del producto. El IVA y la vigencia, si no se pasan, se
+    toman de la Configuración del Sistema (``default_iva_pct`` /
+    ``default_quote_expiry_days``). Calcula subtotal, IVA y total (USD + VES según la
+    última tasa), asigna un número correlativo único y persiste todo de forma
+    atómica. Lanza ``QuoteValidationError`` ante datos inválidos.
+    """
+    from datetime import timedelta
+
+    from apps.core import system_settings
+
+    if not items:
+        raise QuoteValidationError("El presupuesto debe tener al menos una línea de producto.")
+
+    issued_date = issued_date or date.today()
+    if iva_rate is None:
+        iva_rate = system_settings.default_iva_pct()
+    # Vigencia por defecto: si no se indica vencimiento, se calcula a partir de la
+    # configuración (issued + N días). N=0 deja el presupuesto sin vencimiento.
+    if expiry_date is None:
+        days = system_settings.default_quote_expiry_days()
+        if days and days > 0:
+            expiry_date = issued_date + timedelta(days=days)
+
+    product_ids = [it["product"] for it in items]
+    products = {p.id: p for p in Product.objects.filter(id__in=product_ids)}
+    for it in items:
+        product = products.get(it["product"])
+        if product is None:
+            raise QuoteValidationError(f"El producto con id {it['product']} no existe.")
+        if not product.is_active:
+            raise QuoteValidationError(f"El producto '{product.name}' está inactivo y no puede cotizarse.")
+        if it["quantity"] < 1:
+            raise QuoteValidationError(f"La cantidad de '{product.name}' debe ser al menos 1.")
+
+    rate = _latest_rate()
+    eff_rate = _effective_rate(rate)
+
+    # Datos de cada línea (precio unitario flexible: el del producto o el enviado).
+    lines = []
+    subtotal = Decimal("0")
+    for it in items:
+        product = products[it["product"]]
+        qty = it["quantity"]
+        unit_in = it.get("unit_price_usd")
+        unit = _money(unit_in if unit_in is not None else (product.sale_price_usd or 0))
+        line_total = _money(unit * qty)
+        lines.append({
+            "product": product,
+            "quantity": qty,
+            "unit_price_usd": unit,
+            "unit_price_ves": _money(unit * eff_rate) if eff_rate else None,
+            "line_total_usd": line_total,
+            "line_total_ves": _money(line_total * eff_rate) if eff_rate else None,
+        })
+        subtotal += line_total
+
+    iva_rate = Decimal(str(iva_rate))
+    iva_amount = _money(subtotal * iva_rate / Decimal("100"))
+    total = subtotal + iva_amount
+
+    quote_fields = dict(
+        customer=customer,
+        seller=seller,
+        issued_date=issued_date,
+        expiry_date=expiry_date,
+        bcv_rate=rate.bcv_rate if rate else None,
+        parallel_rate=rate.parallel_rate if rate else None,
+        includes_installation=includes_installation,
+        includes_delivery=includes_delivery,
+        subtotal_usd=subtotal,
+        subtotal_ves=_money(subtotal * eff_rate) if eff_rate else None,
+        iva_rate=iva_rate,
+        iva_amount_usd=iva_amount,
+        total_usd=total,
+        total_ves=_money(total * eff_rate) if eff_rate else None,
+        status=status,
+    )
+
+    # El número correlativo es único; ante una colisión por concurrencia se reintenta
+    # con el siguiente N (cada intento en su propia transacción).
+    for attempt in range(6):
+        number = _next_quote_number(issued_date, attempt)
+        try:
+            with transaction.atomic():
+                quote = Quote.objects.create(quote_number=number, **quote_fields)
+                QuoteItem.objects.bulk_create([
+                    QuoteItem(
+                        quote=quote,
+                        product=l["product"],
+                        quantity=l["quantity"],
+                        unit_price_usd=l["unit_price_usd"],
+                        unit_price_ves=l["unit_price_ves"],
+                        line_total_usd=l["line_total_usd"],
+                        line_total_ves=l["line_total_ves"],
+                    )
+                    for l in lines
+                ])
+            return quote
+        except IntegrityError:
+            continue
+    raise QuoteValidationError("No se pudo generar un número de presupuesto único. Intenta de nuevo.")

@@ -286,3 +286,155 @@ class ExchangeRate(models.Model):
 
     def __str__(self):
         return f"{self.date}: BCV={self.bcv_rate} | Paralela={self.parallel_rate}"
+
+
+# Clave de caché del singleton de configuración. Se busca/borra desde
+# `apps.core.system_settings` y desde `SystemSettings.save()`.
+SYSTEM_SETTINGS_CACHE_KEY = "system_settings_singleton"
+
+
+class SystemSettings(models.Model):
+    """Configuración global del sistema (fila única, ``pk=1``).
+
+    Centraliza los parámetros que antes vivían dispersos como **variables de
+    entorno** (interruptores de enriquecimiento/OCR, tasa de cambio) o como
+    **constantes de negocio** sueltas (IVA, vencimiento de presupuestos), para que
+    un administrador pueda ajustarlos en caliente desde la UI, sin reiniciar el
+    servidor ni redeplegar.
+
+    Semántica **DB-manda, sembrada del entorno**: la primera vez que se necesita,
+    la fila se crea tomando como valores iniciales los del ``.env`` (ver
+    ``system_settings._env_defaults``); a partir de ahí la fila es la fuente de
+    verdad. Los **secretos** (``DEEPSEEK_API_KEY``, ``APIFY_API_KEY``, credenciales
+    de BD, ``SECRET_KEY``) **no** se guardan aquí: se siguen leyendo del entorno.
+
+    Es un singleton: ``save()`` fuerza ``pk=1`` e invalida la caché; usa
+    ``SystemSettings.load()`` o ``system_settings.get_settings()`` para leerla.
+    """
+
+    class RateBasisChoices(models.TextChoices):
+        PARALLEL = "PAR", _("Paralela")
+        BCV = "BCV", _("BCV (oficial)")
+        AVERAGE = "AVG", _("Promedio BCV/Paralela")
+
+    # ── Tasa de cambio ────────────────────────────────────────────────────────
+    rate_basis = models.CharField(
+        max_length=3, choices=RateBasisChoices.choices, default=RateBasisChoices.PARALLEL,
+        help_text=_("Qué tasa usar para convertir USD→VES en ventas, presupuestos y reportes."),
+    )
+    rate_max_age_days = models.PositiveSmallIntegerField(
+        default=2,
+        help_text=_("Días de antigüedad a partir de los cuales la tasa se considera vencida (dispara alerta)."),
+    )
+    exchange_rate_api_url = models.CharField(
+        max_length=300, blank=True, default="https://pydolarve.org/api/v1/dollar",
+        help_text=_("URL de la API pública para bajar la tasa (BCV + paralela)."),
+    )
+
+    # ── Enriquecimiento por LLM (scrapers + reporte) ──────────────────────────
+    use_llm_enrichment = models.BooleanField(
+        default=False,
+        help_text=_("Activa el enriquecimiento de scrapers vía DeepSeek (requiere DEEPSEEK_API_KEY en el entorno)."),
+    )
+    deepseek_model = models.CharField(
+        max_length=100, blank=True, default="deepseek-chat",
+        help_text=_("Modelo de DeepSeek a usar (p. ej. deepseek-chat)."),
+    )
+    deepseek_base_url = models.CharField(
+        max_length=300, blank=True, default="https://api.deepseek.com",
+        help_text=_("Endpoint compatible con OpenAI para DeepSeek."),
+    )
+    enable_llm_report_narrative = models.BooleanField(
+        default=True,
+        help_text=_("Permite que el reporte ejecutivo PDF use prosa redactada por el LLM (si hay clave)."),
+    )
+
+    # ── OCR de imágenes (Instagram) ───────────────────────────────────────────
+    use_vision_price_ocr = models.BooleanField(
+        default=False,
+        help_text=_("Activa el OCR de precios en imágenes de Instagram (EasyOCR; requiere el paquete instalado)."),
+    )
+    ocr_languages = models.CharField(
+        max_length=50, blank=True, default="es,en",
+        help_text=_("Idiomas de EasyOCR, separados por comas (p. ej. es,en)."),
+    )
+    ocr_use_gpu = models.BooleanField(
+        default=False, help_text=_("Usar GPU para el OCR si hay CUDA disponible."),
+    )
+    ocr_max_images_per_post = models.PositiveSmallIntegerField(
+        default=2, help_text=_("Cuántas imágenes leer por publicación."),
+    )
+    ocr_mag_ratio = models.DecimalField(
+        max_digits=4, decimal_places=2, default=2.00,
+        help_text=_("Factor de ampliación de la imagen antes del OCR (ayuda a captar un '$' pequeño)."),
+    )
+    ocr_assume_usd_for_bare_number = models.BooleanField(
+        default=False,
+        help_text=_("Tratar un número sin símbolo de moneda como precio en USD (arriesgado; off por defecto)."),
+    )
+    ocr_bare_number_max_usd = models.DecimalField(
+        max_digits=8, decimal_places=2, default=500.00,
+        help_text=_("Tope de seguridad (USD) para un número 'desnudo' sin indicador de precio."),
+    )
+
+    # ── Scrapers (generales) ──────────────────────────────────────────────────
+    discard_instagram_without_price = models.BooleanField(
+        default=False,
+        help_text=_("Descartar posts de Instagram sin precio (por defecto se conservan: el precio rara vez está en el caption)."),
+    )
+    scraper_default_limit = models.PositiveSmallIntegerField(
+        default=50, help_text=_("Límite de resultados por defecto al lanzar un scraper."),
+    )
+
+    # ── Valores por defecto de negocio ────────────────────────────────────────
+    default_iva_pct = models.DecimalField(
+        max_digits=5, decimal_places=2, default=16.00,
+        help_text=_("IVA por defecto (%) al crear un presupuesto."),
+    )
+    default_quote_expiry_days = models.PositiveSmallIntegerField(
+        default=15,
+        help_text=_("Vigencia por defecto (días) de un presupuesto cuando no se indica fecha de vencimiento."),
+    )
+
+    # ── Datos de la empresa (encabezado de presupuestos y reportes PDF) ────────
+    company_name = models.CharField(
+        max_length=200, blank=True, default="Inversiones Maescar, C.A.",
+        help_text=_("Razón social, usada en el encabezado de presupuestos y reportes."),
+    )
+    company_rif = models.CharField(max_length=30, blank=True, help_text=_("RIF de la empresa."))
+    company_address = models.TextField(blank=True, help_text=_("Dirección fiscal."))
+    company_phone = models.CharField(max_length=50, blank=True, help_text=_("Teléfono de contacto."))
+    company_email = models.EmailField(blank=True, help_text=_("Correo de contacto."))
+    company_website = models.CharField(max_length=150, blank=True, help_text=_("Sitio web."))
+    company_logo_url = models.URLField(max_length=500, blank=True, help_text=_("URL del logo (PNG/JPG) para los documentos."))
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "system_settings"
+        verbose_name = "Configuración del Sistema"
+        verbose_name_plural = "Configuración del Sistema"
+
+    def __str__(self):
+        return "Configuración del Sistema"
+
+    def save(self, *args, **kwargs):
+        # Singleton: una sola fila, siempre pk=1. Invalida la caché tras guardar.
+        from django.core.cache import cache
+
+        self.pk = 1
+        super().save(*args, **kwargs)
+        cache.delete(SYSTEM_SETTINGS_CACHE_KEY)
+
+    def delete(self, *args, **kwargs):
+        # No se permite borrar el singleton (solo se edita).
+        from django.core.cache import cache
+
+        cache.delete(SYSTEM_SETTINGS_CACHE_KEY)
+
+    @classmethod
+    def load(cls):
+        """Atajo de modelo: la fila singleton (delega en el accesor con caché)."""
+        from .system_settings import get_settings
+
+        return get_settings()

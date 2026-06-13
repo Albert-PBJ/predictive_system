@@ -243,7 +243,7 @@ def _enrich_listings(pairs: list[tuple[CompetitorMarketData, dict]]) -> None:
             "Enriquecimiento LLM DESACTIVADO (USE_LLM_ENRICHMENT=%s, DEEPSEEK_API_KEY %s); "
             "se omite la identificación de competidores por IA. Si esperabas que corriera, "
             "revisa el .env y REINICIA el servidor.",
-            deepseek.USE_LLM_ENRICHMENT,
+            deepseek.use_llm_enrichment(),
             "presente" if deepseek.DEEPSEEK_API_KEY else "ausente",
         )
         return
@@ -251,7 +251,7 @@ def _enrich_listings(pairs: list[tuple[CompetitorMarketData, dict]]) -> None:
     logger.info(
         "Enriquecimiento LLM ACTIVO: analizando %d anuncio(s) con DeepSeek (modelo=%s)…",
         len(pairs),
-        deepseek.DEEPSEEK_MODEL,
+        deepseek.current_model(),
     )
     known = list(Competitor.objects.filter(is_active=True).values("id", "name"))
     created_cache: dict[str, Competitor] = {}

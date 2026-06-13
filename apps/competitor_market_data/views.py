@@ -142,7 +142,10 @@ class ScraperStartView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        limit = request.data.get("limit", 50)
+        # Límite por defecto desde la Configuración del Sistema (editable en UI).
+        from apps.core import system_settings
+
+        limit = request.data.get("limit", system_settings.scraper_default_limit())
         if not isinstance(limit, int) or limit < 1:
             return Response(
                 {"error": "El campo 'limit' debe ser un entero positivo."},

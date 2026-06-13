@@ -1,8 +1,23 @@
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from apps.core.models import Customer, Seller
 
-from .models import Sale, SaleItem
+from .models import Quote, QuoteItem, Sale, SaleItem
+
+
+def _seller_display_name(seller) -> str:
+    """Nombre del vendedor: prefiere el del UserProfile (fuente de verdad)."""
+    if not seller:
+        return ""
+    profile = getattr(seller.user, "profile", None) if seller.user else None
+    if profile:
+        name = f"{profile.first_name} {profile.last_name}".strip()
+        if name:
+            return name
+    fallback = f"{seller.first_name} {seller.last_name}".strip()
+    return fallback or (seller.user.username if seller.user else "")
 
 
 # ─────────────────────────── Lectura ───────────────────────────
@@ -69,14 +84,7 @@ class SaleSerializer(serializers.ModelSerializer):
     def get_seller_name(self, obj):
         # El nombre real de la persona vive en el UserProfile (fuente de verdad);
         # se prefiere sobre el nombre guardado en el registro de Vendedor.
-        seller = obj.seller
-        profile = getattr(seller.user, "profile", None) if seller.user else None
-        if profile:
-            name = f"{profile.first_name} {profile.last_name}".strip()
-            if name:
-                return name
-        fallback = f"{seller.first_name} {seller.last_name}".strip()
-        return fallback or (seller.user.username if seller.user else "")
+        return _seller_display_name(obj.seller)
 
 
 # ─────────────────────────── Escritura ───────────────────────────
@@ -126,4 +134,114 @@ class SaleCreateSerializer(serializers.Serializer):
     def validate_items(self, value):
         if not value:
             raise serializers.ValidationError("La venta debe tener al menos una línea de producto.")
+        return value
+
+
+# ─────────────────────────── Presupuestos ───────────────────────────
+
+class QuoteItemSerializer(serializers.ModelSerializer):
+    """Línea de un presupuesto (lectura)."""
+
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    product_sku = serializers.CharField(source="product.sku", read_only=True, default=None)
+
+    class Meta:
+        model = QuoteItem
+        fields = (
+            "id",
+            "product",
+            "product_name",
+            "product_sku",
+            "quantity",
+            "unit_price_usd",
+            "unit_price_ves",
+            "line_total_usd",
+            "line_total_ves",
+        )
+
+
+class QuoteSerializer(serializers.ModelSerializer):
+    """Presupuesto completo (lectura) con sus líneas y etiquetas legibles."""
+
+    items = QuoteItemSerializer(many=True, read_only=True)
+    customer_name = serializers.CharField(source="customer.company_name", read_only=True)
+    customer_rif = serializers.CharField(source="customer.rif", read_only=True)
+    seller_name = serializers.SerializerMethodField()
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+
+    class Meta:
+        model = Quote
+        fields = (
+            "id",
+            "quote_number",
+            "customer",
+            "customer_name",
+            "customer_rif",
+            "seller",
+            "seller_name",
+            "issued_date",
+            "expiry_date",
+            "bcv_rate",
+            "parallel_rate",
+            "includes_installation",
+            "includes_delivery",
+            "subtotal_usd",
+            "subtotal_ves",
+            "iva_rate",
+            "iva_amount_usd",
+            "total_usd",
+            "total_ves",
+            "status",
+            "status_display",
+            "converted_to_sale",
+            "items",
+            "created_at",
+        )
+
+    def get_seller_name(self, obj):
+        return _seller_display_name(obj.seller)
+
+
+class QuoteItemInputSerializer(serializers.Serializer):
+    """Una línea del presupuesto entrante."""
+
+    product = serializers.IntegerField(min_value=1)
+    quantity = serializers.IntegerField(min_value=1)
+    # Precio unitario opcional: si se omite, el servicio usa el precio de venta del
+    # producto. Permite cotizar a un precio negociado distinto del de lista.
+    unit_price_usd = serializers.DecimalField(
+        max_digits=10, decimal_places=2, required=False, allow_null=True, min_value=0
+    )
+
+
+class QuoteCreateSerializer(serializers.Serializer):
+    """Carga útil para crear un presupuesto. El vendedor se resuelve en la vista."""
+
+    customer = serializers.PrimaryKeyRelatedField(queryset=Customer.objects.all())
+    seller = serializers.PrimaryKeyRelatedField(
+        queryset=Seller.objects.filter(is_active=True), required=False, allow_null=True
+    )
+    issued_date = serializers.DateField(required=False, allow_null=True)
+    expiry_date = serializers.DateField(required=False, allow_null=True)
+    iva_rate = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=False, default=Decimal("16.00"),
+        min_value=0, max_value=100,
+    )
+    includes_installation = serializers.BooleanField(required=False, default=False)
+    includes_delivery = serializers.BooleanField(required=False, default=False)
+    status = serializers.ChoiceField(
+        choices=[
+            Quote.StatusChoices.DRAFT,
+            Quote.StatusChoices.SENT,
+            Quote.StatusChoices.APPROVED,
+            Quote.StatusChoices.REJECTED,
+        ],
+        required=False,
+        default=Quote.StatusChoices.DRAFT,
+    )
+    items = QuoteItemInputSerializer(many=True)
+
+    def validate_items(self, value):
+        if not value:
+            raise serializers.ValidationError("El presupuesto debe tener al menos una línea de producto.")
         return value

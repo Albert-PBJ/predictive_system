@@ -1,6 +1,14 @@
 from django.contrib import admin
 
-from .models import Category, Customer, ExchangeRate, Product, ProductPriceHistory, Seller
+from .models import (
+    Category,
+    Customer,
+    ExchangeRate,
+    Product,
+    ProductPriceHistory,
+    Seller,
+    SystemSettings,
+)
 
 
 @admin.register(Category)
@@ -41,3 +49,16 @@ class SellerAdmin(admin.ModelAdmin):
 class ExchangeRateAdmin(admin.ModelAdmin):
     list_display = ("date", "bcv_rate", "parallel_rate", "source")
     date_hierarchy = "date"
+
+
+@admin.register(SystemSettings)
+class SystemSettingsAdmin(admin.ModelAdmin):
+    """Singleton: una sola fila. Se impide crear más de una o borrarla."""
+
+    def has_add_permission(self, request):
+        from .models import SystemSettings as _S
+
+        return not _S.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False

@@ -201,7 +201,7 @@ def _resolve_competitors(pairs: list[tuple[CompetitorMarketData, dict]]) -> None
         logger.info(
             "Enriquecimiento LLM ACTIVO para Mercado Libre (modelo=%s): dedupe de "
             "vendedores y afinado de promociones.",
-            deepseek.DEEPSEEK_MODEL,
+            deepseek.current_model(),
         )
         known = list(Competitor.objects.filter(is_active=True).values("id", "name"))
     else:

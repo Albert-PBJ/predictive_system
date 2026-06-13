@@ -50,13 +50,18 @@ class LatestExchangeRateView(APIView):
                 {"detail": "No hay tasas de cambio cargadas."},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        from apps.core import system_settings
+
+        eff = system_settings.effective_rate(rate)
         return Response(
             {
                 "date": rate.date.isoformat(),
                 "bcv_rate": str(rate.bcv_rate),
                 "parallel_rate": str(rate.parallel_rate) if rate.parallel_rate is not None else None,
-                # Tasa efectiva usada para convertir USD→VES (paralela si existe).
-                "effective_rate": str(rate.parallel_rate or rate.bcv_rate),
+                # Tasa efectiva usada para convertir USD→VES, según la base configurada
+                # (paralela por defecto; también BCV o promedio — ver SystemSettings).
+                "effective_rate": str(eff) if eff is not None else None,
+                "rate_basis": system_settings.rate_basis(),
                 "source": rate.source,
             },
             status=status.HTTP_200_OK,

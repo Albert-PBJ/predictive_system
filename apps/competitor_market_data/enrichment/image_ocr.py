@@ -28,42 +28,52 @@ Variables de entorno (en el `.env` del backend):
 """
 
 import logging
-import os
 import urllib.request
 
-
-def _env_flag(name: str, default: str = "False") -> bool:
-    return os.environ.get(name, default).lower() in ("1", "true", "yes")
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-
+from apps.core import system_settings
 
 logger = logging.getLogger(__name__)
 
 
-USE_VISION_PRICE_OCR = _env_flag("USE_VISION_PRICE_OCR")
-OCR_LANGUAGES = os.environ.get("OCR_LANGUAGES", "es,en")
-OCR_USE_GPU = _env_flag("OCR_USE_GPU")
-OCR_MAX_IMAGES_PER_POST = int(os.environ.get("OCR_MAX_IMAGES_PER_POST", "2"))
-# Amplía la imagen antes del OCR. Sube la detección de texto pequeño/estilizado
-# (p. ej. un símbolo "$" más chico junto a un número grande). A mayor valor, más
-# lento. 1.0 = sin ampliar.
-OCR_MAG_RATIO = _env_float("OCR_MAG_RATIO", 2.0)
-# Respaldo agresivo (OFF por defecto para no contaminar el dataset): cuando el OCR
-# NO transcribe el símbolo de moneda y solo queda un número "desnudo", asumir que
-# es un precio en USD. Actívalo solo si en los logs ves que la red lee el número
-# pero no el "$". El gate de validación por categoría sigue filtrando lo absurdo.
-OCR_ASSUME_USD_FOR_BARE_NUMBER = _env_flag("OCR_ASSUME_USD_FOR_BARE_NUMBER")
-# Tope de seguridad para el número desnudo SIN texto indicativo de precio: si un número
-# así supera este valor (USD), NO se toma (demasiado arriesgado sin símbolo de moneda ni
-# contexto). Un número CON indicador ("AHORA 750", "PRECIO …") NO usa este tope: se
-# confía y lo filtra el gate por categoría. Solo aplica a `_guess_bare_price_usd`.
-OCR_BARE_NUMBER_MAX_USD = _env_float("OCR_BARE_NUMBER_MAX_USD", 500.0)
+# La configuración del OCR (interruptor + parámetros) la resuelve `system_settings`
+# (la BD manda, sembrada del .env), así que se puede cambiar en caliente desde la UI.
+# Se exponen como funciones (no constantes) para que el cambio surta efecto sin
+# reiniciar. El singleton perezoso `_reader` se construye una vez con los idiomas/GPU
+# vigentes en ese momento; cambiarlos aplica en el siguiente arranque del lector.
+
+def use_vision_price_ocr() -> bool:
+    return system_settings.vision_ocr_enabled()
+
+
+def ocr_languages() -> str:
+    return system_settings.ocr_languages()
+
+
+def ocr_use_gpu() -> bool:
+    return system_settings.ocr_use_gpu()
+
+
+def ocr_max_images_per_post() -> int:
+    return system_settings.ocr_max_images_per_post()
+
+
+def ocr_mag_ratio() -> float:
+    """Factor de ampliación de la imagen antes del OCR. Sube la detección de texto
+    pequeño/estilizado (p. ej. un '$' chico junto a un número grande). 1.0 = sin ampliar."""
+    return system_settings.ocr_mag_ratio()
+
+
+def ocr_assume_usd_for_bare_number() -> bool:
+    """Respaldo agresivo (OFF por defecto): si el OCR no transcribe el símbolo de
+    moneda y solo queda un número "desnudo", asumir que es un precio en USD."""
+    return system_settings.ocr_assume_usd_for_bare_number()
+
+
+def ocr_bare_number_max_usd() -> float:
+    """Tope de seguridad para un número desnudo SIN texto indicativo de precio. Un
+    número CON indicador ("AHORA 750") no usa este tope: lo filtra el gate por categoría."""
+    return system_settings.ocr_bare_number_max_usd()
+
 
 _DOWNLOAD_TIMEOUT = 15  # segundos por descarga de imagen
 _MAX_IMAGE_BYTES = 12 * 1024 * 1024  # ignora imágenes anómalas (> 12 MB)
@@ -82,7 +92,7 @@ _reader_failed = False
 
 def is_enabled() -> bool:
     """True solo si el OCR de imágenes está activado por configuración."""
-    return USE_VISION_PRICE_OCR
+    return use_vision_price_ocr()
 
 
 def _get_reader():
@@ -110,18 +120,19 @@ def _get_reader():
         return None
 
     try:
-        languages = [lang.strip() for lang in OCR_LANGUAGES.split(",") if lang.strip()] or [
+        languages = [lang.strip() for lang in ocr_languages().split(",") if lang.strip()] or [
             "es",
             "en",
         ]
+        use_gpu = ocr_use_gpu()
         # La primera construcción descarga los modelos (~64 MB) y puede tardar.
         logger.info(
             "Inicializando EasyOCR (red neuronal) — idiomas=%s, gpu=%s. "
             "La primera vez descarga los modelos y puede tardar…",
             languages,
-            OCR_USE_GPU,
+            use_gpu,
         )
-        _reader = easyocr.Reader(languages, gpu=OCR_USE_GPU)
+        _reader = easyocr.Reader(languages, gpu=use_gpu)
         logger.info("EasyOCR listo.")
     except Exception as exc:  # descarga de modelos fallida, idiomas incompatibles, etc.
         logger.warning("No se pudo inicializar EasyOCR: %s. Se omite el OCR de imágenes.", exc)
@@ -161,7 +172,7 @@ def _ocr_one(reader, url: str) -> str:
     try:
         # detail=0 → solo las cadenas de texto reconocidas (sin bounding boxes).
         # mag_ratio amplía la imagen para captar texto pequeño (p. ej. el "$").
-        fragments = reader.readtext(data, detail=0, mag_ratio=OCR_MAG_RATIO)
+        fragments = reader.readtext(data, detail=0, mag_ratio=ocr_mag_ratio())
     except Exception as exc:
         logger.warning("Falló el OCR de la imagen %s: %s", url, exc)
         return ""
@@ -199,7 +210,7 @@ def read_image(image_ref: str, *, detail: int = 1) -> list:
             return []
 
     try:
-        return reader.readtext(source, detail=detail, mag_ratio=OCR_MAG_RATIO)
+        return reader.readtext(source, detail=detail, mag_ratio=ocr_mag_ratio())
     except Exception as exc:
         logger.warning("Falló el OCR de %s: %s", image_ref, exc)
         return []
@@ -220,7 +231,7 @@ def extract_text_from_images(image_urls: list[str], max_images: int | None = Non
     if reader is None:
         return ""
 
-    limit = max_images if max_images is not None else OCR_MAX_IMAGES_PER_POST
+    limit = max_images if max_images is not None else ocr_max_images_per_post()
     texts: list[str] = []
     for url in image_urls[: max(limit, 0)]:
         text = _ocr_one(reader, url)

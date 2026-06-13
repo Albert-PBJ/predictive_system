@@ -359,7 +359,7 @@ def _enrich_posts(pairs: list[tuple[CompetitorMarketData, dict]]) -> None:
             "Enriquecimiento LLM DESACTIVADO (USE_LLM_ENRICHMENT=%s, DEEPSEEK_API_KEY %s); "
             "se omite el enriquecimiento de posts de Instagram. Si esperabas que corriera, "
             "revisa el .env y REINICIA el servidor.",
-            deepseek.USE_LLM_ENRICHMENT,
+            deepseek.use_llm_enrichment(),
             "presente" if deepseek.DEEPSEEK_API_KEY else "ausente",
         )
         return
@@ -367,7 +367,7 @@ def _enrich_posts(pairs: list[tuple[CompetitorMarketData, dict]]) -> None:
     logger.info(
         "Enriquecimiento LLM ACTIVO: analizando %d post(s) de Instagram con DeepSeek (modelo=%s)…",
         len(pairs),
-        deepseek.DEEPSEEK_MODEL,
+        deepseek.current_model(),
     )
     known = list(Competitor.objects.filter(is_active=True).values("id", "name"))
     # Índice handle → Competitor para deduplicar perfiles ya registrados.
@@ -563,7 +563,7 @@ def _guess_bare_price_usd(text: str) -> Optional[Decimal]:
     """
     if not text:
         return None
-    bare_cap = Decimal(str(image_ocr.OCR_BARE_NUMBER_MAX_USD))
+    bare_cap = Decimal(str(image_ocr.ocr_bare_number_max_usd()))
     cleaned = _PHONE_LIKE_RE.sub(" ", text)
     current: list[Decimal] = []   # números precedidos por indicador de precio ACTUAL
     neutral: list[Decimal] = []   # números sin indicador claro
@@ -612,7 +612,7 @@ def _extract_price_from_ocr(text: str) -> tuple[Optional[Decimal], Optional[str]
     price, currency = _extract_price(text)
     if price is not None:
         return price, currency
-    if image_ocr.OCR_ASSUME_USD_FOR_BARE_NUMBER:
+    if image_ocr.ocr_assume_usd_for_bare_number():
         guess = _guess_bare_price_usd(text)
         if guess is not None:
             return guess, "USD"
@@ -631,8 +631,8 @@ def _ocr_fallback_prices(pairs: list[tuple[CompetitorMarketData, dict]]) -> None
         logger.info(
             "OCR de imágenes DESACTIVADO (USE_VISION_PRICE_OCR=%s); no se intenta leer "
             "precios desde las imágenes de Instagram. Si esperabas que corriera, revisa "
-            "el .env y REINICIA el servidor.",
-            image_ocr.USE_VISION_PRICE_OCR,
+            "Actívalo en Configuración del Sistema.",
+            image_ocr.use_vision_price_ocr(),
         )
         return
 

@@ -1,3 +1,4 @@
+from django.db.models import Q
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -7,9 +8,20 @@ from apps.accounts.permissions import IsManager, IsOperational, IsSeller
 from apps.core.models import Seller
 from apps.inventory.services import InsufficientStockError
 
-from .models import Sale
-from .serializers import SaleCreateSerializer, SaleSerializer
-from .services import SaleValidationError, create_sale, void_sale
+from .models import Quote, Sale
+from .serializers import (
+    QuoteCreateSerializer,
+    QuoteSerializer,
+    SaleCreateSerializer,
+    SaleSerializer,
+)
+from .services import (
+    QuoteValidationError,
+    SaleValidationError,
+    create_quote,
+    create_sale,
+    void_sale,
+)
 
 
 def _is_manager(user):
@@ -132,3 +144,93 @@ class SaleViewSet(viewsets.ModelViewSet):
         except SaleValidationError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(SaleSerializer(sale).data, status=status.HTTP_200_OK)
+
+
+class QuoteViewSet(viewsets.ModelViewSet):
+    """Creación y consulta de presupuestos (cotizaciones).
+
+    - GET  /api/quotes/      → listado de presupuestos (paginado, filtrable).
+    - POST /api/quotes/      → crea un presupuesto (no toca inventario).
+    - GET  /api/quotes/{id}/ → detalle con sus líneas.
+
+    Acceso: **consultar** es para personal operativo; **crear** queda para vendedores
+    o superiores (igual que registrar una venta). El encargado de inventario los ve
+    pero no los crea.
+    """
+
+    permission_classes = [IsOperational]
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_permissions(self):
+        if self.action == "create":
+            return [IsSeller()]
+        return super().get_permissions()
+
+    def get_serializer_class(self):
+        return QuoteCreateSerializer if self.action == "create" else QuoteSerializer
+
+    def get_queryset(self):
+        qs = (
+            Quote.objects.select_related("customer", "seller", "seller__user__profile")
+            .prefetch_related("items__product")
+            .order_by("-issued_date", "-created_at")
+        )
+        params = self.request.query_params
+
+        status_param = params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+
+        customer = params.get("customer")
+        if customer:
+            qs = qs.filter(customer_id=customer)
+
+        date_from = params.get("date_from")
+        if date_from:
+            qs = qs.filter(issued_date__gte=date_from)
+        date_to = params.get("date_to")
+        if date_to:
+            qs = qs.filter(issued_date__lte=date_to)
+
+        search = (params.get("search") or "").strip()
+        if search:
+            qs = qs.filter(
+                Q(customer__company_name__icontains=search) | Q(quote_number__icontains=search)
+            )
+
+        return qs
+
+    def _resolve_seller(self, request, validated):
+        """Vendedor del presupuesto: explícito si es gerente, si no el del usuario.
+
+        A diferencia de una venta, un presupuesto admite no tener vendedor (el modelo
+        lo permite), así que si el usuario no tiene perfil de vendedor se deja en null.
+        """
+        explicit = validated.get("seller")
+        if explicit and _is_manager(request.user):
+            return explicit
+        return Seller.objects.filter(user=request.user, is_active=True).first()
+
+    def create(self, request, *args, **kwargs):
+        serializer = QuoteCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            quote = create_quote(
+                seller=self._resolve_seller(request, data),
+                customer=data["customer"],
+                items=data["items"],
+                issued_date=data.get("issued_date"),
+                expiry_date=data.get("expiry_date"),
+                # Si no se envía IVA, lo resuelve el servicio con el default de la
+                # Configuración del Sistema (default_iva_pct).
+                iva_rate=data.get("iva_rate"),
+                includes_installation=data.get("includes_installation", False),
+                includes_delivery=data.get("includes_delivery", False),
+                status=data.get("status") or Quote.StatusChoices.DRAFT,
+            )
+        except QuoteValidationError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(QuoteSerializer(quote).data, status=status.HTTP_201_CREATED)

@@ -36,9 +36,9 @@ class Command(BaseCommand):
         # El comando es intención explícita, así que corre aunque USE_VISION_PRICE_OCR
         # esté apagado; pero sí necesita el paquete easyocr instalado.
         self.stdout.write(
-            f"Config OCR → mag_ratio={image_ocr.OCR_MAG_RATIO}, idiomas={image_ocr.OCR_LANGUAGES}, "
-            f"gpu={image_ocr.OCR_USE_GPU}, "
-            f"asumir_USD_si_numero_desnudo={image_ocr.OCR_ASSUME_USD_FOR_BARE_NUMBER}"
+            f"Config OCR → mag_ratio={image_ocr.ocr_mag_ratio()}, idiomas={image_ocr.ocr_languages()}, "
+            f"gpu={image_ocr.ocr_use_gpu()}, "
+            f"asumir_USD_si_numero_desnudo={image_ocr.ocr_assume_usd_for_bare_number()}"
         )
 
         if image_ocr._get_reader() is None:
@@ -92,7 +92,7 @@ class Command(BaseCommand):
                     "  Precio (modo OCR): no encontrado"
                     + (
                         ""
-                        if image_ocr.OCR_ASSUME_USD_FOR_BARE_NUMBER
+                        if image_ocr.ocr_assume_usd_for_bare_number()
                         else " (activa OCR_ASSUME_USD_FOR_BARE_NUMBER para adivinar números desnudos)"
                     )
                 )

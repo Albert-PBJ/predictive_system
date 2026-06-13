@@ -12,14 +12,16 @@ Uso:
     python manage.py fetch_exchange_rate --check-only         # solo verifica frescura
     python manage.py fetch_exchange_rate --max-age-days 1     # umbral de "vencida" más estricto
 
-Fuente por defecto: pyDolarVenezuela (https://pydolarve.org). Se puede cambiar con
-la variable de entorno EXCHANGE_RATE_API_URL. Si la API falla, el comando no se
-cae: registra el fallo y corre igualmente la verificación de frescura (que avisará).
+Fuente: la librería **pyDolarVenezuela** (paquete `pyDolarVenezuela`) es la primaria
+—obtiene la BCV oficial de forma estable y, best-effort, la paralela—. Solo si la
+librería no logra ni la BCV (no instalada o sus fuentes caídas) se cae a la **API
+HTTP** configurada en `SystemSettings.exchange_rate_api_url` (pyDolarVe). Si todo
+falla, el comando no se cae: registra el fallo y corre igualmente la verificación de
+frescura (que avisará). Ver `fetch_rates` / `fetch_rates_from_library`.
 """
 
 import json
 import logging
-import os
 import urllib.request
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -31,8 +33,9 @@ from apps.core.models import ExchangeRate
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_API_URL = "https://pydolarve.org/api/v1/dollar"
-# Días de antigüedad a partir de los cuales la tasa se considera vencida.
+# La URL de la API y el umbral de frescura hoy se gestionan desde `SystemSettings`
+# (editables en la UI). Este default queda como respaldo de `check_rate_freshness`
+# cuando se la llama sin argumento.
 DEFAULT_MAX_AGE_DAYS = 2
 HTTP_TIMEOUT = 15
 
@@ -67,6 +70,88 @@ def fetch_rates_from_api(url: str) -> tuple:
             if parallel is not None:
                 break
     return bcv, parallel
+
+
+def _plausible_parallel(parallel, bcv) -> bool:
+    """Filtra valores absurdos de la paralela (algunos scrapers upstream devuelven
+    basura, p. ej. 0,01). Si se conoce la BCV, exige una proporción razonable
+    (la paralela ronda la oficial, nunca una fracción mínima); si no, un piso absoluto."""
+    if parallel is None or parallel <= 0:
+        return False
+    if bcv and bcv > 0:
+        return Decimal("0.5") * bcv <= parallel <= Decimal("5") * bcv
+    return parallel >= Decimal("10")
+
+
+def fetch_rates_from_library() -> tuple:
+    """Obtiene (BCV, paralela) con la librería **pyDolarVenezuela**. Best-effort:
+    nunca lanza; retorna ``(Decimal|None, Decimal|None)``.
+
+    La BCV oficial es estable (página ``BCV``, monitor ``usd``). La paralela es menos
+    fiable —según el momento, algunos scrapers de la librería están caídos o devuelven
+    valores inválidos—, así que se prueban varias fuentes y se valida el resultado;
+    si ninguna sirve, la paralela queda en None (el sistema usa la BCV). Importa la
+    librería de forma diferida (dependencia opcional).
+    """
+    try:
+        from pyDolarVenezuela import Monitor
+        from pyDolarVenezuela.pages import AlCambio, BCV, CriptoDolar, EnParaleloVzla
+    except ImportError as exc:
+        logger.warning(
+            "pyDolarVenezuela no está instalado (%s); se usará la API HTTP de respaldo. "
+            "Instálalo con: pip install pyDolarVenezuela",
+            exc,
+        )
+        return None, None
+
+    bcv = None
+    try:
+        official = Monitor(BCV, "USD").get_value_monitors("usd")
+        bcv = _to_decimal(getattr(official, "price", None))
+    except Exception as exc:  # red, scraping roto, etc.
+        logger.warning("No se pudo obtener la BCV oficial de pyDolarVenezuela: %s", exc)
+
+    parallel = None
+    # Se prueban varias fuentes de paralela y se toma la primera plausible.
+    for page, key in (
+        (EnParaleloVzla, "enparalelovzla"),
+        (CriptoDolar, "enparalelovzla"),
+        (AlCambio, "enparalelovzla"),
+    ):
+        try:
+            node = Monitor(page, "USD").get_value_monitors(key)
+            candidate = _to_decimal(getattr(node, "price", None))
+            if _plausible_parallel(candidate, bcv):
+                parallel = candidate
+                break
+        except Exception as exc:  # fuente caída o sin ese monitor
+            logger.debug("Fuente paralela %s/%s no disponible: %s", getattr(page, "name", page), key, exc)
+
+    if parallel is None:
+        logger.info(
+            "pyDolarVenezuela: no hay una tasa paralela válida disponible ahora; se "
+            "carga solo la BCV (puedes cargar la paralela manualmente)."
+        )
+    return bcv, parallel
+
+
+def fetch_rates(url: str | None = None) -> tuple:
+    """Obtiene (BCV, paralela, fuente) priorizando **pyDolarVenezuela**.
+
+    Si la librería logra la BCV, se usa su resultado (con la paralela que haya podido
+    validar, posiblemente None). Solo si la librería no consigue ni la BCV (no
+    instalada o todas sus fuentes caídas) se cae a la **API HTTP** configurada
+    (``url``, pyDolarVe). Ese respaldo puede lanzar (red/DNS): los llamadores lo
+    manejan. Retorna ``(Decimal|None, Decimal|None, str)`` donde el tercer valor
+    describe la fuente usada.
+    """
+    bcv, parallel = fetch_rates_from_library()
+    if bcv is not None:
+        return bcv, parallel, "pyDolarVenezuela"
+    if url:
+        api_bcv, api_parallel = fetch_rates_from_api(url)
+        return api_bcv, api_parallel, url
+    return None, None, "pyDolarVenezuela"
 
 
 def check_rate_freshness(max_age_days: int = DEFAULT_MAX_AGE_DAYS) -> dict:
@@ -138,8 +223,8 @@ class Command(BaseCommand):
         parser.add_argument("--parallel", type=str, help="Tasa paralela manual (Bs/USD).")
         parser.add_argument("--date", type=str, help="Fecha de la tasa (YYYY-MM-DD); por defecto hoy.")
         parser.add_argument(
-            "--max-age-days", type=int, default=DEFAULT_MAX_AGE_DAYS,
-            help=f"Días desde los que la tasa se considera vencida (default {DEFAULT_MAX_AGE_DAYS}).",
+            "--max-age-days", type=int, default=None,
+            help="Días desde los que la tasa se considera vencida (por defecto, el de la configuración).",
         )
         parser.add_argument(
             "--check-only", action="store_true",
@@ -147,7 +232,13 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        from apps.core import system_settings
+
+        # El umbral por defecto sale de la Configuración del Sistema (editable en UI),
+        # salvo que se pase explícitamente por --max-age-days.
         max_age_days = options["max_age_days"]
+        if max_age_days is None:
+            max_age_days = system_settings.rate_max_age_days()
 
         if not options["check_only"]:
             self._ingest(options)
@@ -177,18 +268,20 @@ class Command(BaseCommand):
         parallel = _to_decimal(options.get("parallel"))
 
         if bcv is None:
-            url = os.environ.get("EXCHANGE_RATE_API_URL", DEFAULT_API_URL)
+            from apps.core import system_settings
+
+            url = system_settings.exchange_rate_api_url()
             try:
-                api_bcv, api_parallel = fetch_rates_from_api(url)
+                api_bcv, api_parallel, provider = fetch_rates(url)
                 bcv = bcv or api_bcv
                 parallel = parallel or api_parallel
                 self.stdout.write(self.style.SUCCESS(
-                    f"API ({url}): BCV={bcv}, Paralela={parallel}"
+                    f"Fuente ({provider}): BCV={bcv}, Paralela={parallel}"
                 ))
             except Exception as exc:  # red, parseo, timeout: no abortamos
-                logger.warning("No se pudo obtener la tasa de la API (%s): %s", url, exc)
+                logger.warning("No se pudo obtener la tasa automáticamente: %s", exc)
                 self.stderr.write(self.style.WARNING(
-                    f"No se pudo obtener la tasa de la API: {exc}. "
+                    f"No se pudo obtener la tasa: {exc}. "
                     "Pasa --bcv/--parallel para cargarla manualmente."
                 ))
 

@@ -58,8 +58,12 @@ DEFAULT_BAND: tuple[Decimal, Decimal] = (Decimal("10"), Decimal("1500"))
 # En Instagram el precio casi nunca está explícito en el caption y extraerlo es
 # poco fiable, así que por defecto NO se descartan los posts que quedan SIN
 # precio (en Facebook/Web el precio es estructurado, ahí un registro sin precio
-# sí se descarta). Poné esto en True para descartarlos también en Instagram.
-DISCARD_INSTAGRAM_WITHOUT_PRICE = False
+# sí se descarta). El interruptor vive en `SystemSettings` (editable desde la UI):
+# ponelo en True para descartarlos también en Instagram.
+def _discard_instagram_without_price() -> bool:
+    from apps.core import system_settings
+
+    return system_settings.discard_instagram_without_price()
 
 # Tag de la fuente Instagram (== CompetitorMarketData.SourceChoices.INSTAGRAM).
 _INSTAGRAM_SOURCE = "IG"
@@ -337,7 +341,7 @@ def validate_record(
     #    por defecto, porque el precio rara vez es explícito en el caption.
     if instance.price is None:
         is_instagram = instance.source == _INSTAGRAM_SOURCE
-        if is_instagram and not DISCARD_INSTAGRAM_WITHOUT_PRICE:
+        if is_instagram and not _discard_instagram_without_price():
             return True, ""
         return False, "sin precio"
 

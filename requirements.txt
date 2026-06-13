@@ -16,6 +16,10 @@ more-itertools==11.0.2
 numpy==2.4.4
 # Lectura de los archivos .xlsx de la empresa (resources/) en el comando seed_company_data.
 openpyxl==3.1.5
+# Tasa de cambio: fuente primaria de fetch_exchange_rate (BCV oficial estable +
+# paralela best-effort). Si no está instalada, el comando cae a la API HTTP pyDolarVe.
+# Arrastra varias dependencias (requests, beautifulsoup4, sqlalchemy, curl-cffi).
+pyDolarVenezuela==2.0.3
 # Opcional: solo se usa si USE_LLM_ENRICHMENT=True (identificación de competidores vía DeepSeek).
 # DeepSeek es compatible con la API de OpenAI, por eso reutilizamos este SDK.
 openai>=1.40,<2

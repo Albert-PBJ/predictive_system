@@ -29,13 +29,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+
+from apps.core import system_settings
 
 logger = logging.getLogger(__name__)
 
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+# La clave es un SECRETO (entorno). El interruptor propio del reporte y el modelo/
+# base_url los resuelve `system_settings` (la BD manda, sembrada del .env).
+DEEPSEEK_API_KEY = system_settings.deepseek_api_key()
 
 _REQUEST_TIMEOUT = 45  # segundos: redactar varios párrafos toma más que enriquecer una fila
 _MAX_TOKENS = 2000
@@ -44,8 +45,12 @@ _VALID_SEVERITIES = {"high", "medium", "low"}
 
 
 def is_enabled() -> bool:
-    """True si hay clave configurada (el reporte LLM no usa el switch de scrapers)."""
-    return bool(DEEPSEEK_API_KEY)
+    """True si el reporte LLM está habilitado (interruptor propio) y hay clave.
+
+    No usa el switch de scrapers (``USE_LLM_ENRICHMENT``): tiene el suyo
+    (``enable_llm_report_narrative`` en la Configuración del Sistema).
+    """
+    return system_settings.report_narrative_enabled()
 
 
 def _get_client():
@@ -53,7 +58,11 @@ def _get_client():
     para que siga siendo una dependencia opcional (no requerida si no hay clave)."""
     from openai import OpenAI  # noqa: import diferido (dependencia opcional)
 
-    return OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=_REQUEST_TIMEOUT)
+    return OpenAI(
+        api_key=DEEPSEEK_API_KEY,
+        base_url=system_settings.deepseek_base_url(),
+        timeout=_REQUEST_TIMEOUT,
+    )
 
 
 # ── Formateadores cortos para el bloque de hechos ─────────────────────────────
@@ -361,7 +370,7 @@ def _sanitize(data: dict, *, sensitive: bool, has_estimations: bool) -> dict:
 
     return {
         "available": True,
-        "generated_by": DEEPSEEK_MODEL,
+        "generated_by": system_settings.deepseek_model(),
         "situation": situation,
         "highlights": highlights,
         "risks": risks,
@@ -398,7 +407,7 @@ def generate(dashboard: dict, overview: dict | None, *, sensitive: bool) -> dict
 
     try:
         response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
+            model=system_settings.deepseek_model(),
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": _build_user_prompt(facts, sensitive, has_estimations)},
@@ -413,7 +422,7 @@ def generate(dashboard: dict, overview: dict | None, *, sensitive: bool) -> dict
         # Si el modelo no devolvió nada útil, mejor caer al determinista.
         if not result["situation"] and not result["risks"] and not result["actions"]:
             return {"available": False, "reason": "El modelo no devolvió contenido utilizable."}
-        logger.info("Reporte LLM generado (modelo=%s, riesgos=%d, acciones=%d).", DEEPSEEK_MODEL, len(result["risks"]), len(result["actions"]))
+        logger.info("Reporte LLM generado (modelo=%s, riesgos=%d, acciones=%d).", system_settings.deepseek_model(), len(result["risks"]), len(result["actions"]))
         return result
     except Exception as exc:
         logger.warning("Reporte LLM: falló la redacción vía DeepSeek: %s: %s", type(exc).__name__, exc)

@@ -88,9 +88,12 @@ python manage.py train_models
 python manage.py train_models --product 133   # producto base para demanda/precio
 
 # Update the exchange rate (BCV + parallel) and raise a freshness Alert if stale.
-# Pulls from pyDolarVe by default (override with EXCHANGE_RATE_API_URL); degrades
-# gracefully with no network. --bcv/--parallel load manually; --check-only just
-# verifies freshness (and resolves/creates the RATE alert accordingly).
+# Primary source: the **pyDolarVenezuela** library (`fetch_rates_from_library` — stable
+# official BCV + best-effort, sanity-checked parallel; some upstream parallel scrapers
+# are flaky, so parallel may come back null → system falls back to BCV). Only if the
+# library can't get the BCV does it fall back to the HTTP API in
+# `SystemSettings.exchange_rate_api_url` (pyDolarVe). Degrades gracefully with no
+# network. --bcv/--parallel load manually; --check-only just verifies freshness.
 python manage.py fetch_exchange_rate
 python manage.py fetch_exchange_rate --bcv 36.5 --parallel 40   # carga manual (offline)
 python manage.py fetch_exchange_rate --check-only               # solo verifica frescura
@@ -124,7 +127,7 @@ This API has all of its comments as well as API responses in Spanish. Functions,
 |-----|---------|
 | `apps/accounts` | Auth & RBAC: UserProfile (role), JWT login/logout/refresh/me, role-based permissions |
 | `apps/core` | Master data: Product, Category, Customer, Seller, ExchangeRate, ProductPriceHistory. Also exposes a read-only `GET /api/exchange-rate/latest` and the `seed_demo_data` command |
-| `apps/sales` | Transactions: Sale, SaleItem, Quote, QuoteItem. **REST API for registering sales** (`SaleViewSet` + `services.py`) |
+| `apps/sales` | Transactions: Sale, SaleItem, Quote, QuoteItem. **REST API for registering sales** (`SaleViewSet`) **and creating quotes** (`QuoteViewSet`), both over `services.py` (`create_sale`/`void_sale`/`create_quote`) |
 | `apps/inventory` | Audit trail: InventoryMovement (every stock change logged). **REST API for stock control** (`InventoryMovementViewSet`, `StockListView` + `services.py`) |
 | `apps/benchmarking` | Competitor intelligence: Competitor, CompetitorMarketData (with USD snapshot, `listing_key`, own-`Product` match, provenance), ScrapeRun (run traceability), RejectedMarketData (archived discards). Admin `merge_competitors` action |
 | `apps/analytics` | ML / predictive layer: PredictionLog (model registry), KPI, Alert; the `ml/` package (datasets→features→estimators→forecasters→registry), the `/api/analytics/` forecast API (`IsManager`), and the `train_models` command. See **Predictive / ML module** below |
@@ -203,12 +206,14 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 /api/categories               → read-only category list for the product form (operativo, unpaginated)
 /api/customers/               → CustomerViewSet (read/create = Seller+, delete = Manager+)
 /api/sales/                   → SaleViewSet (ver = operativo, registrar = Seller+); POST …/{id}/anular/ to void (Manager+)
+/api/quotes/                  → QuoteViewSet (ver = operativo, crear = Seller+): presupuestos. create_quote (apps/sales/services) no toca inventario; IVA 16% por defecto, número correlativo DDMMYYYY-N. El PDF se genera en el frontend
 /api/inventory/stock          → current stock summary per product (ver = operativo)
 /api/inventory/movements/     → InventoryMovementViewSet: history (ver = operativo) + register ENT/AJU/DEV (Inventario+)
 /api/exchange-rate/latest     → latest BCV/parallel rate, read-only (Seller+)
 /api/analytics/               → predictive module (Manager+): overview, forecast/{demand,sales,profit,exchange-rate,product-price,inventory,quote-conversion}, benchmark/competitors, forecastable-products. Plus report-narrative (IsViewer, ?from=&to=) — LLM-written prose for the home "Generar reporte PDF" (apps/analytics/report_narrative.py, reuses the DeepSeek creds, degrades safely)
 /api/analytics/benchmarking/  → módulo "Benchmarking Competitivo" (Manager+): comparison (descriptivo, ?from=&to=), forecast (gap por categoría + matched_products, ?from=&to=&horizon=), product-forecast (competidor vs. interno por producto, ?product=&competitor=&horizon=&from=&to=). Excluye source="FB" en todas las lecturas.
 /api/analytics/stats/         → descriptive statistics: dashboard (IsViewer — home panel, non-sensitive aggregates), {customers,products,sales,quotes} (Manager+). Live ORM aggregations in apps/analytics/stats.py
+/api/settings/                → configuración global (SystemSettings, apps/core/settings_api.py): GET (Manager+) / PATCH (Admin); acciones exchange-rate (carga manual), exchange-rate/fetch (API), llm-test (Admin); company (IsViewer, branding de los PDFs). Ver "System settings" abajo
 /scrapers/                    → <source>/start, <source>/status, <source>/finalize (ADMIN only)
 ```
 
@@ -360,6 +365,17 @@ knobs (revenue σ, margin jitter, cost, quote label, monthly price history). The
 Jan-2026 shock, seasonality, price elasticity, and the retail-vs-institutional story are
 **untouched**, so the business narrative the models learn is unchanged.
 
+### System settings (`SystemSettings` singleton)
+
+`apps/core/models.SystemSettings` is a **single-row** model (`pk=1`, `save()` forces it + busts the cache) read through the accessor **`apps/core/system_settings.py`**. It replaces scattered `os.environ` reads and business constants with one runtime-editable config. Key rules:
+
+- **DB-manda, sembrada del `.env`.** `get_settings()` does `get_or_create(pk=1, defaults=_env_defaults())` — the first access seeds the row from the current env vars; after that the **DB row wins** and the env vars are only *bootstrap defaults*. If the table doesn't exist yet (before `migrate`) or the DB errors, the getters return an **unsaved** instance built from env — they never raise, so no consumer breaks on config.
+- **Secrets never go in the DB.** `deepseek_api_key()` (and `APIFY_API_KEY`, DB creds, `SECRET_KEY`) are read straight from the environment; the API exposes only *presence* (`deepseek_key_present`), never the value.
+- **Cached** in `django.core.cache` for 30 s; `save()` deletes the key, so a PATCH from the UI takes effect immediately.
+- **Typed getters** (`llm_enrichment_enabled`, `deepseek_model`, `vision_ocr_enabled`, `ocr_*`, `discard_instagram_without_price`, `rate_basis`/`effective_rate`, `rate_max_age_days`, `exchange_rate_api_url`, `default_iva_pct`, `default_quote_expiry_days`, `scraper_default_limit`, `report_narrative_enabled`, `company_info`) are what consumers call. The env-reading modules were refactored from module-level constants to these getters: `enrichment/deepseek.py` (`use_llm_enrichment()`/`current_model()`/`current_base_url()`; the scrapers' log lines call them too), `enrichment/image_ocr.py` (switch + `ocr_*()`), `scrapers/validation.py` (`_discard_instagram_without_price()`), `analytics/report_narrative.py` (its own `enable_llm_report_narrative` switch + model), `sales/services.py` (`effective_rate` by `rate_basis`, IVA + expiry defaults in `create_quote`), `core/views.LatestExchangeRateView`, `competitor_market_data/views.ScraperStartView` (default limit), and `core/management/commands/fetch_exchange_rate` (threshold + API URL).
+- **`effective_rate(rate)`** centralizes the USD→VES rate choice (`rate_basis` ∈ PAR/BCV/AVG, default PAR = "paralela si existe, si no BCV") — previously a hard-coded `parallel_rate or bcv_rate`.
+- **API** (`settings_api.py`): `SystemSettingsView` (GET `IsManager` / PATCH `IsAdmin`, returns `{settings, meta}`), `ExchangeRateSetView`/`ExchangeRateFetchView` (Admin; the fetch uses `fetch_exchange_rate.fetch_rates` — **pyDolarVenezuela library primary**, pyDolarVe HTTP fallback — + `check_rate_freshness`), `SettingsLLMTestView` (Admin, reuses `deepseek.check_connection`), `CompanyInfoView` (`IsViewer`). Registered in `apps/core/urls.py`; admin-registered as a no-add/no-delete singleton.
+
 ### Key Design Decisions
 
 **Dual-currency everywhere:** Venezuela's economy requires tracking both official BCV rate and parallel market rate. Sale, Quote, ProductPriceHistory, and ExchangeRate all carry both `bcv_rate` and `parallel_rate`. All prices are stored in USD; VES values are derived or stored alongside.
@@ -415,7 +431,7 @@ DEEPSEEK_MODEL=deepseek-chat       # optional (default deepseek-chat)
 DEEPSEEK_BASE_URL=https://api.deepseek.com   # optional
 ```
 
-Requires `pip install openai` (already in `requirements.txt`). Read directly from the environment in `enrichment/deepseek.py` (same pattern as `APIFY_API_KEY`), not via `settings.py`.
+Requires `pip install openai` (already in `requirements.txt`). **These env vars now only *bootstrap* the `SystemSettings` singleton** — once seeded, the switch/model/base-url are edited from the UI (`/api/settings/`), and `enrichment/deepseek.py` reads them via `apps/core/system_settings`. The **`DEEPSEEK_API_KEY` stays env-only** (secret, never in the DB). See "System settings" above.
 
 Optional — image OCR price fallback for the **Instagram** scraper (neural network; all off/safe by default):
 
@@ -429,7 +445,7 @@ OCR_ASSUME_USD_FOR_BARE_NUMBER=False  # treat a bare number as a USD price when 
 OCR_BARE_NUMBER_MAX_USD=500        # safety cap for a CONTEXT-FREE bare number (default 500); numbers with a price cue are trusted higher
 ```
 
-Requires `pip install easyocr` (commented out in `requirements.txt` because it pulls in `torch`, ~hundreds of MB — install it separately when enabling OCR). Read directly from the environment in `enrichment/image_ocr.py`. When off, or if the package is missing, the scraper runs exactly as before.
+Requires `pip install easyocr` (commented out in `requirements.txt` because it pulls in `torch`, ~hundreds of MB — install it separately when enabling OCR). **These env vars now only *bootstrap* the `SystemSettings` singleton** — the switch + OCR params are edited from the UI (`/api/settings/`); `enrichment/image_ocr.py` reads them via `apps/core/system_settings` (the `_reader` singleton is built once, so a language/GPU change applies on the next reader init). When off, or if the package is missing, the scraper runs exactly as before.
 
 **Debugging OCR:** `python manage.py test_image_ocr <url-or-path> [...]` runs the same neural network on one or more images (URL or local file) and prints each recognized fragment **with its confidence**, the joined text, and the price both extractors would return — so you can confirm an image reaches the NN and see *what* it read (e.g. whether `250$` was recognized) without running a full scrape. It ignores the master switch (explicit intent) but still needs `easyocr` installed.
 
