@@ -1,6 +1,8 @@
 from rest_framework import viewsets
 
 from apps.accounts.permissions import IsManager, IsSeller
+from apps.audit import services as audit
+from apps.audit.models import ActionChoices
 from apps.core.models import Customer
 
 from .serializers import CustomerSerializer
@@ -48,3 +50,30 @@ class CustomerViewSet(viewsets.ModelViewSet):
             qs = qs.filter(is_active_customer=str(is_active).lower() in ("1", "true", "yes"))
 
         return qs.distinct()
+
+    def perform_create(self, serializer):
+        customer = serializer.save()
+        audit.log(
+            request=self.request,
+            action=ActionChoices.CUSTOMER_CREATE,
+            description=f"Creó el cliente «{customer.company_name}» (RIF {customer.rif}).",
+            target=customer,
+            metadata={"rif": customer.rif, "company_name": customer.company_name},
+        )
+
+    def perform_update(self, serializer):
+        customer = serializer.save()
+        audit.log(
+            request=self.request,
+            action=ActionChoices.CUSTOMER_UPDATE,
+            description=(
+                f"Actualizó el cliente «{customer.company_name}» (RIF {customer.rif})"
+                + ("." if customer.is_active_customer else " y lo desactivó.")
+            ),
+            target=customer,
+            metadata={
+                "rif": customer.rif,
+                "company_name": customer.company_name,
+                "is_active_customer": customer.is_active_customer,
+            },
+        )

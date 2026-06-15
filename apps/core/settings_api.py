@@ -23,6 +23,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.permissions import IsAdmin, IsManager, IsViewer
+from apps.audit import services as audit
+from apps.audit.models import ActionChoices
 from apps.competitor_market_data.enrichment import deepseek
 
 from . import system_settings
@@ -117,6 +119,16 @@ class SystemSettingsView(APIView):
         serializer = SystemSettingsSerializer(settings_obj, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()  # save() fuerza pk=1 e invalida la caché
+        changed = sorted(k for k in serializer.validated_data.keys())
+        audit.log(
+            request=request,
+            action=ActionChoices.SETTINGS_UPDATE,
+            description=(
+                "Actualizó la configuración del sistema"
+                + (f" ({', '.join(changed)})." if changed else ".")
+            ),
+            metadata={"changed": changed},
+        )
         return Response(
             {"settings": serializer.data, "meta": _meta_block()},
             status=status.HTTP_200_OK,
@@ -203,6 +215,21 @@ class ExchangeRateSetView(APIView):
             },
         )
         freshness = _check_freshness()
+        audit.log(
+            request=request,
+            action=ActionChoices.RATE_UPDATE,
+            description=(
+                f"Cargó manualmente la tasa de cambio del {target_date.isoformat()}: "
+                f"BCV {bcv}" + (f", paralela {parallel}" if parallel is not None else "") + "."
+            ),
+            target=rate,
+            metadata={
+                "date": target_date.isoformat(),
+                "bcv": str(bcv),
+                "parallel": str(parallel) if parallel is not None else None,
+                "manual": True,
+            },
+        )
         return Response(_rate_payload(rate, freshness), status=status.HTTP_200_OK)
 
 
@@ -241,6 +268,22 @@ class ExchangeRateFetchView(APIView):
         freshness = _check_freshness()
         payload = _rate_payload(rate, freshness)
         payload["provider"] = provider
+        audit.log(
+            request=request,
+            action=ActionChoices.RATE_UPDATE,
+            description=(
+                f"Actualizó la tasa de cambio desde la fuente «{provider}»: BCV {bcv}"
+                + (f", paralela {parallel}" if parallel is not None else "") + "."
+            ),
+            target=rate,
+            metadata={
+                "date": rate.date.isoformat(),
+                "bcv": str(bcv),
+                "parallel": str(parallel) if parallel is not None else None,
+                "provider": provider,
+                "manual": False,
+            },
+        )
         return Response(payload, status=status.HTTP_200_OK)
 
 

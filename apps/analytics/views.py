@@ -20,6 +20,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.permissions import IsManager, IsViewer
+from apps.audit import services as audit
+from apps.audit.models import ActionChoices
 from apps.core.models import SERVICE_SKU_PREFIX, Product
 from apps.sales.models import SaleItem
 
@@ -309,4 +311,13 @@ class ReportNarrativeView(APIView):
         dashboard = stats.executive_dashboard(start, end, sensitive=sensitive)
         # Las estimaciones (overview) son de gerencia; se cachean igual que en OverviewView.
         overview = registry.cached("overview", OverviewView._build) if sensitive else None
+        audit.log(
+            request=request,
+            action=ActionChoices.REPORT_GENERATE,
+            description=(
+                f"Generó el reporte ejecutivo para el período {start.isoformat()} a "
+                f"{end.isoformat()}."
+            ),
+            metadata={"from": start.isoformat(), "to": end.isoformat(), "sensitive": sensitive},
+        )
         return Response(report_narrative.generate(dashboard, overview, sensitive=sensitive))

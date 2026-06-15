@@ -1,6 +1,8 @@
 from rest_framework import viewsets
 
 from apps.accounts.permissions import IsManager, IsOperational
+from apps.audit import services as audit
+from apps.audit.models import ActionChoices
 from apps.core.models import Product
 
 from .serializer import ProductSerializer
@@ -46,3 +48,26 @@ class ProductViewset(viewsets.ModelViewSet):
             qs = qs.filter(is_active=self._as_bool(is_active))
 
         return qs.distinct()
+
+    def perform_create(self, serializer):
+        product = serializer.save()
+        audit.log(
+            request=self.request,
+            action=ActionChoices.PRODUCT_CREATE,
+            description=f"Creó el producto «{product.name}» (SKU {product.sku}).",
+            target=product,
+            metadata={"sku": product.sku, "name": product.name, "is_active": product.is_active},
+        )
+
+    def perform_update(self, serializer):
+        product = serializer.save()
+        audit.log(
+            request=self.request,
+            action=ActionChoices.PRODUCT_UPDATE,
+            description=(
+                f"Actualizó el producto «{product.name}» (SKU {product.sku})"
+                + ("." if product.is_active else " y lo desactivó.")
+            ),
+            target=product,
+            metadata={"sku": product.sku, "name": product.name, "is_active": product.is_active},
+        )

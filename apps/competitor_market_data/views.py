@@ -9,6 +9,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.permissions import IsAdmin
+from apps.audit import services as audit
+from apps.audit.models import ActionChoices
 from apps.benchmarking.models import CompetitorMarketData, RejectedMarketData, ScrapeRun
 from apps.competitor_market_data.enrichment import deepseek
 from apps.competitor_market_data.scrapers import get_run_progress
@@ -172,6 +174,15 @@ class ScraperStartView(APIView):
             apify_run_id=run.get("id") or "",
             dataset_id=run.get("defaultDatasetId") or "",
             status=ScrapeRun.StatusChoices.RUNNING,
+        )
+
+        audit.log(
+            request=request,
+            action=ActionChoices.SCRAPE_START,
+            description=f"Inició un scraping de «{source}» con límite {limit}.",
+            target=scrape_run,
+            target_model="ScrapeRun",
+            metadata={"source": source, "limit": limit, "query": urls},
         )
 
         return Response(

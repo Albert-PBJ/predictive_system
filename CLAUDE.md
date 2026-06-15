@@ -134,6 +134,7 @@ This API has all of its comments as well as API responses in Spanish. Functions,
 | `apps/competitor_market_data` | Apify scraper integration + REST endpoints to trigger scrapers |
 | `apps/products` | REST API (ModelViewSet) for Product CRUD — thin layer over `apps/core` models. **`stock` is read-only** in the serializer (it only moves via `InventoryMovement`), so editing a product can't bypass the audit trail. Read = operativo, write = Manager+ |
 | `apps/customers` | REST API (ModelViewSet) for Customer CRUD — thin layer over `apps/core` (no models of its own), same pattern as `apps/products` |
+| `apps/audit` | System logs / **bitácora de auditoría**: AuditLog model + `services.log()` (the single, non-throwing write helper) + the `/api/audit/` read-only API (ADMIN). Every relevant action writes here (who/what/when). See **System logs (auditoría)** below |
 
 ### Scraper Flow
 
@@ -214,6 +215,7 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 /api/analytics/benchmarking/  → módulo "Benchmarking Competitivo" (Manager+): comparison (descriptivo, ?from=&to=), forecast (gap por categoría + matched_products, ?from=&to=&horizon=), product-forecast (competidor vs. interno por producto, ?product=&competitor=&horizon=&from=&to=). Excluye source="FB" en todas las lecturas.
 /api/analytics/stats/         → descriptive statistics: dashboard (IsViewer — home panel, non-sensitive aggregates), {customers,products,sales,quotes} (Manager+). Live ORM aggregations in apps/analytics/stats.py
 /api/settings/                → configuración global (SystemSettings, apps/core/settings_api.py): GET (Manager+) / PATCH (Admin); acciones exchange-rate (carga manual), exchange-rate/fetch (API), llm-test (Admin); company (IsViewer, branding de los PDFs). Ver "System settings" abajo
+/api/audit/                   → bitácora de auditoría (ADMIN, apps/audit): logs (listado paginado/filtrable), meta (facetas de filtro), logs/export (CSV), logs/purge (POST, borra por antigüedad). Ver "System logs (auditoría)" abajo
 /scrapers/                    → <source>/start, <source>/status, <source>/finalize (ADMIN only)
 ```
 
@@ -375,6 +377,35 @@ Jan-2026 shock, seasonality, price elasticity, and the retail-vs-institutional s
 - **Typed getters** (`llm_enrichment_enabled`, `deepseek_model`, `vision_ocr_enabled`, `ocr_*`, `discard_instagram_without_price`, `rate_basis`/`effective_rate`, `rate_max_age_days`, `exchange_rate_api_url`, `default_iva_pct`, `default_quote_expiry_days`, `scraper_default_limit`, `report_narrative_enabled`, `company_info`) are what consumers call. The env-reading modules were refactored from module-level constants to these getters: `enrichment/deepseek.py` (`use_llm_enrichment()`/`current_model()`/`current_base_url()`; the scrapers' log lines call them too), `enrichment/image_ocr.py` (switch + `ocr_*()`), `scrapers/validation.py` (`_discard_instagram_without_price()`), `analytics/report_narrative.py` (its own `enable_llm_report_narrative` switch + model), `sales/services.py` (`effective_rate` by `rate_basis`, IVA + expiry defaults in `create_quote`), `core/views.LatestExchangeRateView`, `competitor_market_data/views.ScraperStartView` (default limit), and `core/management/commands/fetch_exchange_rate` (threshold + API URL).
 - **`effective_rate(rate)`** centralizes the USD→VES rate choice (`rate_basis` ∈ PAR/BCV/AVG, default PAR = "paralela si existe, si no BCV") — previously a hard-coded `parallel_rate or bcv_rate`.
 - **API** (`settings_api.py`): `SystemSettingsView` (GET `IsManager` / PATCH `IsAdmin`, returns `{settings, meta}`), `ExchangeRateSetView`/`ExchangeRateFetchView` (Admin; the fetch uses `fetch_exchange_rate.fetch_rates` — **pyDolarVenezuela library primary**, pyDolarVe HTTP fallback — + `check_rate_freshness`), `SettingsLLMTestView` (Admin, reuses `deepseek.check_connection`), `CompanyInfoView` (`IsViewer`). Registered in `apps/core/urls.py`; admin-registered as a no-add/no-delete singleton.
+
+### System logs (auditoría) (`apps/audit`)
+
+Append-only **bitácora de auditoría** so the admin can answer *qué pasó, quién lo hizo y
+cuándo*. One model `AuditLog` (`db_table="audit_logs"`) with: `actor` (FK `auth.User`,
+`SET_NULL`) **plus snapshots** `actor_username`/`actor_role` (survive user deletion / role
+change), `action` (`ActionChoices`), `category` (`CategoryChoices`, derived from the action via
+`ACTION_CATEGORY`), a Spanish `description`, the affected object (`target_model`/`target_id`),
+`metadata` (JSON), `ip_address`, and `created_at` (indexed).
+
+- **`services.log(*, request=None, actor=None, action, description, target=None, metadata=None,
+  category=None)`** is the single write helper. It is **defensive by design**: the whole body is
+  wrapped in `try/except` and logs a WARNING on failure — auditing must **never** break the
+  business operation it records. It resolves the actor + IP from `request` when passed.
+- **Instrumentation** (explicit `audit.log(...)` after success, where the request/actor is known):
+  sales create/void + quote create (`apps/sales/views`), manual inventory movements
+  (`apps/inventory/views` — sale-driven `SAL` movements are **not** double-logged, they go through
+  `inventory.services.apply_movement`), scrape start (`apps/competitor_market_data/views`), report
+  generation (`analytics/views.ReportNarrativeView`), settings PATCH + exchange-rate set/fetch
+  (`core/settings_api`), product & customer create/update (`perform_create`/`perform_update`),
+  login/logout (`accounts/views`). **User creation** is logged via a `post_save` signal on the User
+  model (`apps/audit/signals.py`, registered in `AppConfig.ready()`) since it happens in the Django
+  admin / `createsuperuser` with no request to thread (actor = null = "sistema").
+- **API** (`apps/audit/{views,serializers,urls}.py`, all `IsAdmin`, mounted `/api/audit/`):
+  `GET logs` (`ListAPIView` + `StandardResultsSetPagination`; filters `category`/`action`/`actor`/
+  `date_from`/`date_to`/`search`), `GET meta` (filter facets), `GET logs/export` (CSV of the
+  filtered set, UTF-8 BOM for Excel), `POST logs/purge` (`{before}` → bulk-delete older rows; the
+  purge itself logs a `LOG_PURGE` entry). The log is **read-only**: no per-row edit/delete endpoint.
+  Admin-registered read-only (`has_add_permission`/`has_change_permission` → False; delete kept).
 
 ### Key Design Decisions
 

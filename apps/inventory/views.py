@@ -3,6 +3,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.permissions import IsOperational, IsWarehouse
+from apps.audit import services as audit
+from apps.audit.models import ActionChoices
 from apps.core.models import SERVICE_SKU_PREFIX, Product
 
 from .models import InventoryMovement
@@ -85,6 +87,21 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
         except InsufficientStockError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
+        audit.log(
+            request=request,
+            action=ActionChoices.INVENTORY_MOVEMENT,
+            description=(
+                f"Registró un movimiento de inventario «{movement.get_movement_type_display()}» "
+                f"de {movement.quantity:+d} sobre «{movement.product.name}»."
+            ),
+            target=movement,
+            metadata={
+                "movement_type": movement.movement_type,
+                "quantity": movement.quantity,
+                "product": movement.product.name,
+                "product_id": movement.product_id,
+            },
+        )
         return Response(
             InventoryMovementSerializer(movement).data,
             status=status.HTTP_201_CREATED,

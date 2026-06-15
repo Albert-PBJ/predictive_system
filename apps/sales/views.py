@@ -5,6 +5,8 @@ from rest_framework.response import Response
 
 from apps.accounts.models import Role
 from apps.accounts.permissions import IsManager, IsOperational, IsSeller
+from apps.audit import services as audit
+from apps.audit.models import ActionChoices
 from apps.core.models import Seller
 from apps.inventory.services import InsufficientStockError
 
@@ -134,6 +136,22 @@ class SaleViewSet(viewsets.ModelViewSet):
         except (SaleValidationError, InsufficientStockError) as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
+        audit.log(
+            request=request,
+            action=ActionChoices.SALE_CREATE,
+            description=(
+                f"Registró la venta #{sale.pk} por {sale.total_sale_usd} USD "
+                f"a {sale.customer.company_name}."
+            ),
+            target=sale,
+            metadata={
+                "total_usd": str(sale.total_sale_usd),
+                "customer": sale.customer.company_name,
+                "seller": seller.user.username if seller and seller.user_id else None,
+                "items": sale.items.count(),
+                "sale_type": sale.sale_type,
+            },
+        )
         return Response(SaleSerializer(sale).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"])  # permiso resuelto en get_permissions
@@ -143,6 +161,16 @@ class SaleViewSet(viewsets.ModelViewSet):
             void_sale(sale=sale, user=request.user)
         except SaleValidationError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        audit.log(
+            request=request,
+            action=ActionChoices.SALE_VOID,
+            description=(
+                f"Anuló la venta #{sale.pk} de {sale.customer.company_name} "
+                f"({sale.total_sale_usd} USD), reingresando el stock."
+            ),
+            target=sale,
+            metadata={"total_usd": str(sale.total_sale_usd), "customer": sale.customer.company_name},
+        )
         return Response(SaleSerializer(sale).data, status=status.HTTP_200_OK)
 
 
@@ -233,4 +261,19 @@ class QuoteViewSet(viewsets.ModelViewSet):
         except QuoteValidationError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
+        audit.log(
+            request=request,
+            action=ActionChoices.QUOTE_CREATE,
+            description=(
+                f"Creó el presupuesto {quote.quote_number} por {quote.total_usd} USD "
+                f"a {quote.customer.company_name}."
+            ),
+            target=quote,
+            metadata={
+                "quote_number": quote.quote_number,
+                "total_usd": str(quote.total_usd),
+                "customer": quote.customer.company_name,
+                "status": quote.status,
+            },
+        )
         return Response(QuoteSerializer(quote).data, status=status.HTTP_201_CREATED)
