@@ -142,16 +142,27 @@ def _position(own_avg: float | None, prices: list[float]):
 # --------------------------------------------------------------------------- #
 # Comparación descriptiva (página "Comparaciones")
 # --------------------------------------------------------------------------- #
-def comparison(start: date, end: date) -> dict:
-    """Radiografía de la competencia para el rango ``[start, end]``."""
+def comparison(start: date, end: date, competitor: str | None = None) -> dict:
+    """Radiografía de la competencia para el rango ``[start, end]``.
+
+    ``competitor`` (nombre exacto de un competidor) acota TODO el panel a ese único
+    competidor; ``None`` o ``"__all__"`` agrega todos (comportamiento por defecto).
+    La lista completa de competidores del rango se devuelve siempre en ``competitors``
+    para alimentar el selector, aunque la vista esté filtrada a uno."""
     if start > end:
         start, end = end, start
-    rows = _window_rows(start, end)
+    all_rows = _window_rows(start, end)
     range_block = _range_block(start, end)
+
+    # Lista completa de competidores del rango (alimenta el selector), antes de filtrar.
+    competitors = sorted({_competitor_name(r) for r in all_rows})
+    selected = competitor if (competitor and competitor != "__all__" and competitor in competitors) else None
+    rows = [r for r in all_rows if _competitor_name(r) == selected] if selected else all_rows
 
     if not rows:
         return {
             "range": range_block, "narrative": [],
+            "competitors": competitors, "selected_competitor": selected or "__all__",
             "meta": {"n_obs": 0, "n_competitors": 0, "n_products": 0, "n_with_promo": 0, "n_unmatched": 0},
             "by_state": [], "by_source": [], "promotions": {"competitors_with_promo": [], "breakdown": [], "share_obs_pct": 0.0, "total_competitors": 0},
             "by_competitor": [], "catalog_coverage": [], "products_not_in_catalog": [],
@@ -361,9 +372,14 @@ def comparison(start: date, end: date) -> dict:
 
     # Resumen automatizado (data storytelling), 3-5 frases — igual que el panel de Inicio.
     n_comp = len(comp)
-    narrative = [
-        f"Se observaron {n_obs} publicaciones de {n_comp} competidor(es) en {len(by_source)} plataforma(s)."
-    ]
+    if selected:
+        narrative = [
+            f"Vista filtrada a {selected}: {n_obs} publicación(es) en {len(by_source)} plataforma(s)."
+        ]
+    else:
+        narrative = [
+            f"Se observaron {n_obs} publicaciones de {n_comp} competidor(es) en {len(by_source)} plataforma(s)."
+        ]
     if by_source:
         top_src = by_source[0]
         narrative.append(f"{top_src['label']} concentra el {top_src['obs_pct']:.0f}% de las observaciones.")
@@ -390,6 +406,8 @@ def comparison(start: date, end: date) -> dict:
     return {
         "range": range_block,
         "narrative": narrative[:5],
+        "competitors": competitors,
+        "selected_competitor": selected or "__all__",
         "meta": {
             "n_obs": n_obs,
             "n_competitors": len(comp),

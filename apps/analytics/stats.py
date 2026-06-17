@@ -655,6 +655,155 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool, personal: bo
 
 
 # --------------------------------------------------------------------------- #
+# Panel de inicio del ENCARGADO DE INVENTARIO (rol WAREHOUSE)
+# --------------------------------------------------------------------------- #
+def warehouse_dashboard(start: date, end: date) -> dict:
+    """Panel de Inicio acotado al rol **WAREHOUSE** (encargado de inventario).
+
+    A diferencia del panel ejecutivo, solo muestra lo relevante para su trabajo:
+    estado del stock, productos a reabastecer, composición del inventario por
+    categoría y productos sin rotación. **No incluye ventas, clientes, ingresos ni
+    utilidad** — el encargado de inventario no los necesita. El inventario es una
+    instantánea actual; el rango ``[start, end]`` solo afecta a la "rotación"
+    (productos sin salidas en el período). Los servicios (sin stock) se excluyen.
+    """
+    if start > end:
+        start, end = end, start
+
+    phys = Product.objects.filter(is_active=True).exclude(sku__startswith=SERVICE_SKU_PREFIX)
+    inv = phys.aggregate(retail=Sum(F("stock") * F("sale_price_usd")), units=Sum("stock"))
+    active_products = phys.count()
+    out_of_stock = phys.filter(stock__lte=0).count()
+    low_stock = phys.filter(stock__gt=0, stock__lte=F("min_stock")).count()
+    ok_stock = max(active_products - out_of_stock - low_stock, 0)
+    inventory_health = {
+        "active_products": active_products,
+        "units_in_stock": int(inv["units"] or 0),
+        "ok_stock": ok_stock,
+        "low_stock": low_stock,
+        "out_of_stock": out_of_stock,
+        "inventory_retail_usd": _f(inv["retail"]),
+    }
+
+    # Composición del inventario por categoría (productos, unidades y stock crítico).
+    stock_by_category = [
+        {
+            "category": r["category__name"] or "Sin categoría",
+            "products": int(r["products"]),
+            "units": int(r["units"] or 0),
+            "low_stock": int(r["low"]),
+            "out_of_stock": int(r["out"]),
+        }
+        for r in (
+            phys.values("category__name")
+            .annotate(
+                products=Count("id"),
+                units=Sum("stock"),
+                out=Count("id", filter=Q(stock__lte=0)),
+                low=Count("id", filter=Q(stock__gt=0, stock__lte=F("min_stock"))),
+            )
+            .order_by("-units")[:10]
+        )
+    ]
+
+    # Lista de reabastecimiento: productos en o por debajo de su mínimo (sin stock
+    # primero). Es la acción principal del encargado de inventario.
+    restock_qs = phys.filter(stock__lte=F("min_stock")).select_related("category").order_by("stock")
+    restock_count = restock_qs.count()
+    restock_list = [
+        {
+            "product_id": p.id,
+            "name": p.name,
+            "sku": p.sku,
+            "category": p.category.name if p.category else "—",
+            "stock": p.stock,
+            "min_stock": p.min_stock,
+            "deficit": max((p.min_stock or 0) - p.stock, 0),
+            "status": "out" if p.stock <= 0 else "low",
+        }
+        for p in restock_qs[:12]
+    ]
+
+    # Productos sin rotación: activos sin ninguna salida (venta) en el rango — capital
+    # inmovilizado a vigilar (no es un dato de ventas, sino de movimiento de stock).
+    sold_ids = set(
+        SaleItem.objects.filter(
+            sale__status=COMP, sale__sale_date__gte=start, sale__sale_date__lte=end
+        ).values_list("product_id", flat=True)
+    )
+    no_demand_qs = phys.exclude(id__in=sold_ids).select_related("category").order_by("-stock")
+    no_demand = [
+        {
+            "product_id": p.id,
+            "name": p.name,
+            "sku": p.sku,
+            "category": p.category.name if p.category else "—",
+            "stock": p.stock,
+            "retail_value": _f(p.stock * (p.sale_price_usd or 0)),
+        }
+        for p in no_demand_qs[:10]
+    ]
+    no_demand_count = no_demand_qs.count()
+
+    # Alertas tempranas SOLO de inventario (quiebre/sobrestock/caída de demanda).
+    inv_types = [
+        Alert.TypeChoices.STOCK_BREAK,
+        Alert.TypeChoices.OVERSTOCK,
+        Alert.TypeChoices.DEMAND_DROP,
+    ]
+    sev_order = {Alert.SeverityChoices.CRITICAL: 0, Alert.SeverityChoices.WARNING: 1, Alert.SeverityChoices.INFO: 2}
+    alert_rows = sorted(
+        Alert.objects.filter(is_resolved=False, alert_type__in=inv_types).order_by("-created_at")[:30],
+        key=lambda a: sev_order.get(a.severity, 3),
+    )
+    alerts = [
+        {
+            "id": a.id,
+            "type": a.alert_type,
+            "type_label": a.get_alert_type_display(),
+            "severity": a.severity,
+            "severity_label": a.get_severity_display(),
+            "title": a.title,
+            "message": a.message,
+            "created_at": a.created_at.isoformat(),
+        }
+        for a in alert_rows[:8]
+    ]
+
+    # Resumen automatizado (data storytelling) enfocado en inventario.
+    narrative = [
+        f"El catálogo activo tiene {active_products} producto(s) con {inventory_health['units_in_stock']} unidad(es) en stock."
+    ]
+    if out_of_stock or low_stock:
+        narrative.append(
+            f"{out_of_stock} sin stock y {low_stock} con stock bajo requieren atención."
+        )
+    else:
+        narrative.append("Todo el inventario está por encima de su mínimo.")
+    if restock_count:
+        narrative.append(
+            f"{restock_count} producto(s) están en o por debajo de su mínimo y conviene reabastecer."
+        )
+    if no_demand_count:
+        narrative.append(
+            f"{no_demand_count} producto(s) no registraron salidas en el período (baja rotación)."
+        )
+
+    return {
+        "range": _range_block(start, end),
+        "scope": {"type": "warehouse", "label": "Inventario"},
+        "narrative": narrative[:5],
+        "inventory_health": inventory_health,
+        "stock_by_category": stock_by_category,
+        "restock_list": restock_list,
+        "restock_count": restock_count,
+        "no_demand": no_demand,
+        "no_demand_count": no_demand_count,
+        "alerts": alerts,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Clientes
 # --------------------------------------------------------------------------- #
 def customers(start: date, end: date) -> dict:

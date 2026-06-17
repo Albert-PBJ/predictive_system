@@ -24,11 +24,13 @@ from .views import (
     ProfitForecastView,
     QuoteConversionForecastView,
     ReportNarrativeView,
+    RetrainModelsView,
     SalesForecastView,
 )
 
 urlpatterns = [
     path("overview", OverviewView.as_view(), name="analytics-overview"),
+    path("retrain", RetrainModelsView.as_view(), name="analytics-retrain"),
     path("report-narrative", ReportNarrativeView.as_view(), name="analytics-report-narrative"),
     path("forecastable-products", ForecastableProductsView.as_view(), name="analytics-products"),
     path("forecast/demand", DemandForecastView.as_view(), name="analytics-demand"),

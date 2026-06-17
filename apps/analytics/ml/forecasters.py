@@ -1071,7 +1071,8 @@ def _benchmark_range_block(start, end) -> dict:
     }
 
 
-def competitor_forecast(start=None, end=None, horizon: int = 6, category: str | None = None) -> dict:
+def competitor_forecast(start=None, end=None, horizon: int = 6, category: str | None = None,
+                        competitor: str | None = None) -> dict:
     """Proyecta el precio promedio de mercado (competencia) y lo compara con el precio
     promedio realizado de NUESTRO catálogo, global y por categoría.
 
@@ -1079,14 +1080,23 @@ def competitor_forecast(start=None, end=None, horizon: int = 6, category: str | 
     competencia usada para ajustar la tendencia; el pronóstico la extiende ``horizon``
     meses. Devuelve, por gráfico, ``history``/``forecast`` (forma estándar de
     pronóstico) y ``own_series`` ya alineada al eje ``history+forecast`` para pintarla
-    como una serie extra."""
+    como una serie extra.
+
+    ``competitor`` (nombre exacto) acota el "mercado" a UN solo competidor (el promedio
+    pasa a ser el de ese competidor); ``None``/``"__all__"`` usa todos (por defecto). La
+    lista completa de competidores del rango se devuelve en ``competitors`` y los
+    ``matched_products`` quedan acotados al competidor elegido."""
     title = "Pronóstico de mercado vs. nuestros precios"
-    obs = datasets.competitor_observations(start=start, end=end)
+    obs_all = datasets.competitor_observations(start=start, end=end)
+    competitors = sorted(obs_all["competitor"].dropna().unique().tolist()) if not obs_all.empty else []
+    selected = competitor if (competitor and competitor != "__all__" and competitor in competitors) else None
+    obs = obs_all[obs_all["competitor"] == selected] if selected else obs_all
     all_obs = datasets.competitor_observations()
     categories = sorted(all_obs["category"].dropna().unique().tolist()) if not all_obs.empty else []
     range_block = _benchmark_range_block(start, end)
 
-    # Productos propios con equivalente en la competencia (para el selector de la UI).
+    # Productos propios con equivalente en la competencia (para el selector de la UI),
+    # acotados al competidor elegido cuando aplica.
     matched_products = []
     if not obs.empty:
         matched = obs[obs["matched_product_id"].notna()]
@@ -1102,6 +1112,7 @@ def competitor_forecast(start=None, end=None, horizon: int = 6, category: str | 
     base = {
         "target": "competitor_forecast", "title": title, "range": range_block,
         "horizon": horizon, "categories": categories, "matched_products": matched_products,
+        "competitors": competitors, "selected_competitor": selected or "__all__",
         "narrative": [],
     }
     if obs.empty:
@@ -1172,6 +1183,8 @@ def competitor_forecast(start=None, end=None, horizon: int = 6, category: str | 
 
     # Resumen automatizado (data storytelling), 3-5 frases — igual que el panel de Inicio.
     narrative = []
+    if selected:
+        narrative.append(f"Comparación enfocada en {selected} (no en el promedio de mercado).")
     slope = (market_overall.get("model") or {}).get("slope_usd_per_month")
     if slope is not None:
         if slope > 0.5:

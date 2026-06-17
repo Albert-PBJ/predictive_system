@@ -211,9 +211,9 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 /api/inventory/stock          → current stock summary per product (ver = operativo)
 /api/inventory/movements/     → InventoryMovementViewSet: history (ver = operativo) + register ENT/AJU/DEV (Inventario+)
 /api/exchange-rate/latest     → latest BCV/parallel rate, read-only (Seller+)
-/api/analytics/               → predictive module (Manager+): overview, forecast/{demand,sales,profit,exchange-rate,product-price,inventory,quote-conversion}, benchmark/competitors, forecastable-products. Plus report-narrative (IsViewer, ?from=&to=) — LLM-written prose for the home "Generar reporte PDF" (apps/analytics/report_narrative.py, reuses the DeepSeek creds, degrades safely)
-/api/analytics/benchmarking/  → módulo "Benchmarking Competitivo" (Manager+): comparison (descriptivo, ?from=&to=), forecast (gap por categoría + matched_products, ?from=&to=&horizon=), product-forecast (competidor vs. interno por producto, ?product=&competitor=&horizon=&from=&to=). Excluye source="FB" en todas las lecturas.
-/api/analytics/stats/         → descriptive statistics: dashboard (IsViewer — home panel, non-sensitive aggregates), {customers,products,sales,quotes} (Manager+). Live ORM aggregations in apps/analytics/stats.py
+/api/analytics/               → predictive module (Manager+): overview, retrain (POST — reentrena todo = `train_models` desde la UI, reescribe PredictionLog + limpia caché, audita MODELS_RETRAIN), forecast/{demand,sales,profit,exchange-rate,product-price,inventory,quote-conversion}, benchmark/competitors, forecastable-products. Plus report-narrative (IsViewer, ?from=&to=) — LLM-written prose for the home "Generar reporte PDF" (apps/analytics/report_narrative.py, reuses the DeepSeek creds, degrades safely)
+/api/analytics/benchmarking/  → módulo "Benchmarking Competitivo" (Manager+): comparison (descriptivo, ?from=&to=&competitor=), forecast (gap por categoría + matched_products + competitors, ?from=&to=&horizon=&competitor=), product-forecast (competidor vs. interno por producto, ?product=&competitor=&horizon=&from=&to=). El parámetro opcional ?competitor= acota todo a un competidor (default: todos). Excluye source="FB" en todas las lecturas.
+/api/analytics/stats/         → descriptive statistics: dashboard (IsViewer — home panel; role-aware: Manager/Admin & Viewer get the company exec panel, SELLER gets a personal scope, WAREHOUSE gets stats.warehouse_dashboard — inventory/products only, no sales/clients/revenue), {customers,products,sales,quotes} (Manager+). Live ORM aggregations in apps/analytics/stats.py
 /api/settings/                → configuración global (SystemSettings, apps/core/settings_api.py): GET (Manager+) / PATCH (Admin); acciones exchange-rate (carga manual), exchange-rate/fetch (API), llm-test (Admin); company (IsViewer, branding de los PDFs). Ver "System settings" abajo
 /api/audit/                   → bitácora de auditoría (ADMIN, apps/audit): logs (listado paginado/filtrable), meta (facetas de filtro), logs/export (CSV), logs/purge (POST, borra por antigüedad). Ver "System logs (auditoría)" abajo
 /scrapers/                    → <source>/start, <source>/status, <source>/finalize (ADMIN only)
@@ -289,12 +289,16 @@ The ML layer turns the seeded history into decision-support forecasts. Code live
   (the bolívar devalues exponentially → linear-on-log beats trees, which can't extrapolate).
   `competitor_analysis` is **separate** (cross-sectional positioning + like-with-like via the
   existing product match + a linear price trend); `competitor_forecast(start, end, horizon,
-  category)` powers the **Benchmarking module** — it projects the competitor market-average price
-  (per category) with a plain `LinearRegression` on the month index (the series are too short for
-  the lag-matrix `forecast_series`), overlays our catalog price (`_own_price_panel`, from
-  `ProductPriceHistory`), and returns `matched_products`; `competitor_product_forecast(product_id,
+  category, competitor=None)` powers the **Benchmarking module** — it projects the competitor
+  market-average price (per category) with a plain `LinearRegression` on the month index (the
+  series are too short for the lag-matrix `forecast_series`), overlays our catalog price
+  (`_own_price_panel`, from `ProductPriceHistory`), and returns `matched_products` + the full
+  `competitors` list. Passing `competitor` scopes the "market" to that single competitor (the
+  average becomes its own, `matched_products` narrows to it); `competitor_product_forecast(product_id,
   competitor, …)` compares one product's competitor price (a specific one, or the mean of all) vs.
-  our internal price, aligning both to the same months. `forecast_quote_conversion` is a
+  our internal price, aligning both to the same months. The descriptive `benchmarking.comparison(start,
+  end, competitor=None)` takes the same optional single-competitor filter and always returns the full
+  `competitors` list (computed before filtering) so the UI selector stays populated. `forecast_quote_conversion` is a
   **classifier** (probability + expected pipeline). The descriptive side of benchmarking lives in
   `apps/analytics/benchmarking.py` (`comparison(start, end)`, deduped by `listing_key`, not cached).
   **All benchmarking reads exclude `source="FB"`** (`EXCLUDED_COMPETITOR_SOURCES` in `ml/datasets.py`).
@@ -407,7 +411,8 @@ change), `action` (`ActionChoices`), `category` (`CategoryChoices`, derived from
   sales create/void + quote create (`apps/sales/views`), manual inventory movements
   (`apps/inventory/views` — sale-driven `SAL` movements are **not** double-logged, they go through
   `inventory.services.apply_movement`), scrape start (`apps/competitor_market_data/views`), report
-  generation (`analytics/views.ReportNarrativeView`), settings PATCH + exchange-rate set/fetch
+  generation (`analytics/views.ReportNarrativeView`), predictive-model retraining
+  (`analytics/views.RetrainModelsView`, `MODELS_RETRAIN`/`ANALITICA`), settings PATCH + exchange-rate set/fetch
   (`core/settings_api`), product & customer create/update (`perform_create`/`perform_update`),
   login/logout + password recovery request/reset (`accounts/views`). **User creation** is logged via a `post_save` signal on the User
   model (`apps/audit/signals.py`, registered in `AppConfig.ready()`) since it happens in the Django

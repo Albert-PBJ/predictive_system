@@ -11,9 +11,11 @@ invalidándolo cuando cambian los datos. Se puede sobreescribir el modelo por
 
 from __future__ import annotations
 
+import io
 import logging
 from datetime import date
 
+from django.core.management import call_command
 from django.db.models import Count, Sum
 from rest_framework import status
 from rest_framework.response import Response
@@ -244,11 +246,12 @@ class BenchmarkingComparisonView(_BaseForecastView):
         default_start, default_end = benchmarking.default_range()
         start = _date(request, "from", default_start)
         end = _date(request, "to", default_end)
-        return Response(benchmarking.comparison(start, end))
+        competitor = request.query_params.get("competitor") or None
+        return Response(benchmarking.comparison(start, end, competitor))
 
 
 class BenchmarkingForecastView(_BaseForecastView):
-    """GET /api/analytics/benchmarking/forecast?from=&to=&horizon=&category= —
+    """GET /api/analytics/benchmarking/forecast?from=&to=&horizon=&category=&competitor= —
     pronóstico del precio de mercado vs. nuestros precios (entrena bajo demanda + cachea)."""
 
     def get(self, request):
@@ -256,8 +259,9 @@ class BenchmarkingForecastView(_BaseForecastView):
         start = _date(request, "from", default_start)
         end = _date(request, "to", default_end)
         h, category = _horizon(request), (request.query_params.get("category") or None)
-        key = f"benchmark_fc:{start.isoformat()}:{end.isoformat()}:{h}:{category}"
-        return Response(registry.cached(key, lambda: F.competitor_forecast(start, end, h, category)))
+        competitor = request.query_params.get("competitor") or None
+        key = f"benchmark_fc:{start.isoformat()}:{end.isoformat()}:{h}:{category}:{competitor}"
+        return Response(registry.cached(key, lambda: F.competitor_forecast(start, end, h, category, competitor)))
 
 
 class BenchmarkingProductForecastView(_BaseForecastView):
@@ -346,6 +350,44 @@ class OverviewView(_BaseForecastView):
             "restock_alerts": restock,
             "registry": registry_rows,
         }
+
+
+class RetrainModelsView(_BaseForecastView):
+    """POST /api/analytics/retrain — reentrena y reescribe el registro de modelos.
+
+    Hace lo mismo que ``manage.py train_models`` pero desde la UI (botón "Reentrenar
+    modelos" del panel predictivo): vuelve a entrenar las tres técnicas por objetivo,
+    reescribe ``PredictionLog`` (marcando activa la técnica asignada) y **limpia la caché
+    en memoria**, de modo que los siguientes pronósticos se sirvan con los modelos recién
+    entrenados. El entrenamiento es de sub-segundo por modelo con estos datos, así que se
+    ejecuta de forma síncrona. Gerente/Administrador (``IsManager``)."""
+
+    def post(self, request):
+        buf = io.StringIO()
+        try:
+            call_command("train_models", stdout=buf, stderr=buf)
+        except Exception as exc:  # pragma: no cover - depende del entorno ML
+            logger.exception("Fallo al reentrenar los modelos")
+            return Response(
+                {"detail": f"No se pudieron reentrenar los modelos: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        active = list(PredictionLog.objects.filter(is_active=True).order_by("model_type"))
+        trained_at = max((pl.trained_at for pl in active if pl.trained_at), default=None)
+        total = PredictionLog.objects.count()
+        audit.log(
+            request=request,
+            action=ActionChoices.MODELS_RETRAIN,
+            description=f"Reentrenó los modelos predictivos ({len(active)} modelos activos).",
+            metadata={"active_models": len(active), "total_rows": total},
+        )
+        return Response({
+            "ok": True,
+            "active_models": len(active),
+            "total_rows": total,
+            "trained_at": trained_at.isoformat() if trained_at else None,
+        })
 
 
 class ReportNarrativeView(APIView):

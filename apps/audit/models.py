@@ -15,6 +15,7 @@ class ActionChoices(models.TextChoices):
     INVENTORY_MOVEMENT = "INVENTORY_MOVEMENT", _("Movimiento de inventario")
     SCRAPE_START = "SCRAPE_START", _("Scraping iniciado")
     REPORT_GENERATE = "REPORT_GENERATE", _("Reporte ejecutivo generado")
+    MODELS_RETRAIN = "MODELS_RETRAIN", _("Modelos predictivos reentrenados")
     USER_CREATE = "USER_CREATE", _("Usuario creado")
     SETTINGS_UPDATE = "SETTINGS_UPDATE", _("Configuración actualizada")
     RATE_UPDATE = "RATE_UPDATE", _("Tasa de cambio cargada")
@@ -41,6 +42,7 @@ class CategoryChoices(models.TextChoices):
     CLIENTES = "CLIENTES", _("Clientes")
     CONFIG = "CONFIG", _("Configuración")
     AUTH = "AUTH", _("Autenticación")
+    ANALITICA = "ANALITICA", _("Analítica")
 
 
 # Categoría por defecto de cada acción (el servicio la usa si no se indica una).
@@ -51,6 +53,7 @@ ACTION_CATEGORY = {
     ActionChoices.INVENTORY_MOVEMENT: CategoryChoices.INVENTARIO,
     ActionChoices.SCRAPE_START: CategoryChoices.SCRAPERS,
     ActionChoices.REPORT_GENERATE: CategoryChoices.REPORTES,
+    ActionChoices.MODELS_RETRAIN: CategoryChoices.ANALITICA,
     ActionChoices.USER_CREATE: CategoryChoices.USUARIOS,
     ActionChoices.SETTINGS_UPDATE: CategoryChoices.CONFIG,
     ActionChoices.RATE_UPDATE: CategoryChoices.CONFIG,
