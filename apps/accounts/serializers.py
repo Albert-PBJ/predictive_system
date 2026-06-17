@@ -40,6 +40,24 @@ class UserSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class PasswordResetRequestSerializer(serializers.Serializer):
+    """Entrada de la solicitud de recuperación: solo el correo de contacto."""
+
+    email = serializers.EmailField()
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    """Entrada de la confirmación: uid + token (del enlace del correo) + nueva contraseña.
+
+    La fortaleza de la contraseña se valida en la vista con los validadores de Django
+    (necesitan el usuario), no aquí; este serializer solo valida la forma de los datos.
+    """
+
+    uid = serializers.CharField()
+    token = serializers.CharField()
+    new_password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     """Incluye el rol y datos básicos del usuario en el token y en la respuesta."""
 

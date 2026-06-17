@@ -162,9 +162,12 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_CLASSES": (
         "rest_framework.throttling.ScopedRateThrottle",
     ),
-    # Limita los intentos de login para frenar ataques de fuerza bruta.
+    # Limita los intentos de login y de recuperación de contraseña para frenar
+    # ataques de fuerza bruta y el abuso del envío de correos.
     "DEFAULT_THROTTLE_RATES": {
         "login": "10/min",
+        "password_reset": "5/min",
+        "password_reset_confirm": "20/min",
     },
     # Paginación estándar para los listados (ventas, movimientos de inventario,
     # productos, clientes). Las vistas APIView de scrapers traen su propia
@@ -200,6 +203,41 @@ CORS_ALLOWED_ORIGINS = [
     if o.strip()
 ]
 CORS_ALLOW_CREDENTIALS = True
+
+
+# ---------------------------------------------------------------------------
+# Correo electrónico y recuperación de contraseña
+# ---------------------------------------------------------------------------
+# Por defecto usa el backend de CONSOLA (imprime el correo en la terminal): así la
+# recuperación de contraseña funciona en desarrollo sin un servidor SMTP. En
+# producción, fija EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend y las
+# variables EMAIL_* (ver .env).
+EMAIL_BACKEND = os.environ.get(
+    "EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend"
+)
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+# STARTTLS (puertos 587/2525) vs SSL implícito (puerto 465). No deben ir ambos en True.
+EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "True").lower() in ("1", "true", "yes")
+EMAIL_USE_SSL = os.environ.get("EMAIL_USE_SSL", "False").lower() in ("1", "true", "yes")
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+# Tope de espera al SMTP: el correo se envía dentro de la petición de recuperación,
+# así que un servidor lento/no disponible no debe colgarla indefinidamente.
+EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "15"))
+DEFAULT_FROM_EMAIL = os.environ.get(
+    "DEFAULT_FROM_EMAIL", "Inversiones Maescar <no-responder@maescar.local>"
+)
+
+# Base del frontend para construir los enlaces de los correos (p. ej. el de
+# restablecer contraseña). Por defecto, el primer origen permitido por CORS.
+FRONTEND_BASE_URL = os.environ.get(
+    "FRONTEND_BASE_URL",
+    CORS_ALLOWED_ORIGINS[0] if CORS_ALLOWED_ORIGINS else "http://localhost:5173",
+)
+
+# Vigencia del enlace de restablecimiento (en segundos; la usa el token de Django).
+PASSWORD_RESET_TIMEOUT = int(os.environ.get("PASSWORD_RESET_TIMEOUT_HOURS", "2")) * 3600
 
 
 # Endurecimiento de seguridad. En producción (DEBUG=False) se fuerza HTTPS,

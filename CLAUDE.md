@@ -409,7 +409,7 @@ change), `action` (`ActionChoices`), `category` (`CategoryChoices`, derived from
   `inventory.services.apply_movement`), scrape start (`apps/competitor_market_data/views`), report
   generation (`analytics/views.ReportNarrativeView`), settings PATCH + exchange-rate set/fetch
   (`core/settings_api`), product & customer create/update (`perform_create`/`perform_update`),
-  login/logout (`accounts/views`). **User creation** is logged via a `post_save` signal on the User
+  login/logout + password recovery request/reset (`accounts/views`). **User creation** is logged via a `post_save` signal on the User
   model (`apps/audit/signals.py`, registered in `AppConfig.ready()`) since it happens in the Django
   admin / `createsuperuser` with no request to thread (actor = null = "sistema").
 - **API** (`apps/audit/{views,serializers,urls}.py`, all `IsAdmin`, mounted `/api/audit/`):
@@ -443,7 +443,9 @@ JWT auth via `djangorestframework-simplejwt`. DRF defaults to `JWTAuthentication
 
 **Endpoints** (`/api/auth/`): `login`, `refresh`, `logout` (blacklists refresh token), `me`. Public sign-up is intentionally **not** implemented — only admins create users.
 
-**Security config** (`settings.py`): 15-min access tokens, 7-day refresh with rotation + blacklist (`token_blacklist` app), `login` throttle at 10/min, CORS restricted to the Vite origin with credentials, and production-gated (`if not DEBUG`) SSL redirect / HSTS / secure cookies / `CSRF_TRUSTED_ORIGINS`. Passwords use Django's default PBKDF2 hasher; minimum length raised to 10.
+**Password recovery by email** (`apps/accounts/views.py`, both `AllowAny`): `POST password-reset` `{email}` looks the email up on **`UserProfile.email`** (the source of truth, *not* `auth_user.email`) for an active user, emails a reset link using Django's `default_token_generator`, and **always returns the same generic 200** (no account-existence leak; throttle scope `password_reset` 5/min). `POST password-reset/confirm` `{uid, token, new_password}` decodes the uid, checks the **single-use, time-limited** token (`PASSWORD_RESET_TIMEOUT`, default 2 h — the token hash embeds the password, so it dies after one successful reset), runs `validate_password` (errors mapped to Spanish by code via `_password_errors_es`), sets the password, and **blacklists the user's outstanding refresh tokens** to revoke active sessions (throttle scope `password_reset_confirm` 20/min). Both log to the auditoría (`PASSWORD_RESET_REQUEST` / `PASSWORD_RESET`, category `AUTH` — migration `audit/0002`). The email link points at `FRONTEND_BASE_URL` + `/restablecer-contrasena?uid=&token=`.
+
+**Security config** (`settings.py`): 15-min access tokens, 7-day refresh with rotation + blacklist (`token_blacklist` app), `login` throttle at 10/min (+ `password_reset*` scopes), CORS restricted to the Vite origin with credentials, and production-gated (`if not DEBUG`) SSL redirect / HSTS / secure cookies / `CSRF_TRUSTED_ORIGINS`. Passwords use Django's default PBKDF2 hasher; minimum length raised to 10. **Email**: `EMAIL_BACKEND` defaults to the **console backend** (prints to the terminal) so password recovery works in dev with no SMTP; set the `EMAIL_*` env vars + `DEFAULT_FROM_EMAIL` for real delivery, and `FRONTEND_BASE_URL` so the link in the email points at the right host.
 
 To create the first admin: `python manage.py createsuperuser` (gets ADMIN role automatically).
 
@@ -464,6 +466,27 @@ DB_HOST=127.0.0.1
 DB_PORT=5432
 APIFY_API_KEY=...
 ```
+
+Optional — email for password recovery (defaults to the console backend, so it works in dev with no SMTP). The dev setup uses **Mailtrap** (Email Testing sandbox — captures the email in a web inbox, no domain verification needed); only `EMAIL_HOST_USER`/`EMAIL_HOST_PASSWORD` come from the Mailtrap inbox:
+
+```
+# Entrega por SMTP (si se omite, el correo se imprime en la consola):
+EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend
+EMAIL_HOST=sandbox.smtp.mailtrap.io      # producción: live.smtp.mailtrap.io
+EMAIL_PORT=587                            # 587/2525 → STARTTLS; 465 → SSL
+EMAIL_USE_TLS=True
+EMAIL_USE_SSL=False                       # True solo si usas el puerto 465 (y TLS en False)
+EMAIL_HOST_USER=...                       # username de la bandeja Mailtrap
+EMAIL_HOST_PASSWORD=...                   # password de la bandeja Mailtrap
+EMAIL_TIMEOUT=15                          # tope de espera al SMTP (segundos)
+DEFAULT_FROM_EMAIL=Inversiones Maescar <no-responder@maescar.com>
+FRONTEND_BASE_URL=http://localhost:5173   # base de los enlaces del correo (default: 1er origen CORS)
+PASSWORD_RESET_TIMEOUT_HOURS=2            # vigencia del enlace de restablecimiento (default 2)
+```
+
+`EMAIL_USE_TLS` y `EMAIL_USE_SSL` no pueden ir ambos en `True`. Verifica el envío con
+`python manage.py sendtestemail <correo>` (con Mailtrap sandbox, el destinatario da igual:
+el correo aparece en la bandeja de Mailtrap).
 
 Optional — LLM competitor enrichment for the Facebook scraper (all off/safe by default):
 

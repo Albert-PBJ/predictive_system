@@ -24,6 +24,8 @@ class ActionChoices(models.TextChoices):
     CUSTOMER_UPDATE = "CUSTOMER_UPDATE", _("Cliente actualizado")
     LOGIN = "LOGIN", _("Inicio de sesión")
     LOGOUT = "LOGOUT", _("Cierre de sesión")
+    PASSWORD_RESET_REQUEST = "PASSWORD_RESET_REQUEST", _("Solicitud de recuperación de contraseña")
+    PASSWORD_RESET = "PASSWORD_RESET", _("Contraseña restablecida")
     LOG_PURGE = "LOG_PURGE", _("Registros de auditoría purgados")
 
 
@@ -58,6 +60,8 @@ ACTION_CATEGORY = {
     ActionChoices.CUSTOMER_UPDATE: CategoryChoices.CLIENTES,
     ActionChoices.LOGIN: CategoryChoices.AUTH,
     ActionChoices.LOGOUT: CategoryChoices.AUTH,
+    ActionChoices.PASSWORD_RESET_REQUEST: CategoryChoices.AUTH,
+    ActionChoices.PASSWORD_RESET: CategoryChoices.AUTH,
     ActionChoices.LOG_PURGE: CategoryChoices.CONFIG,
 }
 
