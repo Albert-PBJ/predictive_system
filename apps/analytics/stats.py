@@ -183,33 +183,43 @@ def _price_competitiveness() -> tuple[float | None, list[dict]]:
     return score, top
 
 
-def _build_narrative(start, end, cur, prev, type_split, no_demand_count, at_risk, rate, sensitive) -> list[str]:
-    """Narrativa automatizada (data storytelling): 3-5 frases con lo esencial del rango."""
+def _build_narrative(start, end, cur, prev, type_split, no_demand_count, at_risk, rate, sensitive, personal=False) -> list[str]:
+    """Narrativa automatizada (data storytelling): 3-5 frases con lo esencial del rango.
+
+    En modo ``personal`` (vendedor) la redacción se dirige al propio vendedor ("generaste…")
+    y solo habla de SUS cifras; omite los bloques de empresa (capital inmovilizado).
+    """
     out: list[str] = []
     period_txt = f"{period_label(period_of(start))} – {period_label(period_of(end))}"
     g = _pct(cur["revenue"], prev["revenue"])
+    verb = "generaste" if personal else "se facturaron"
     if g is None:
-        out.append(f"En {period_txt} se facturaron ${cur['revenue']:,.0f} en {cur['count']} ventas.")
+        out.append(f"En {period_txt} {verb} ${cur['revenue']:,.0f} en {cur['count']} ventas.")
     else:
         trend = "más" if g >= 0 else "menos"
         out.append(
-            f"En {period_txt} se facturaron ${cur['revenue']:,.0f} en {cur['count']} ventas, "
+            f"En {period_txt} {verb} ${cur['revenue']:,.0f} en {cur['count']} ventas, "
             f"{abs(g):.0f}% {trend} que el periodo anterior."
         )
     ret = next((t for t in type_split if t["type"] == Sale.TypeChoices.RETAIL), None)
     ins = next((t for t in type_split if t["type"] == Sale.TypeChoices.INSTITUTIONAL), None)
     if ret and ins:
+        prefix = "De tus ingresos, el" if personal else "El segmento"
+        suffix = "" if personal else " de los ingresos"
         out.append(
-            f"El segmento institucional aporta el {ins['share_pct']:.0f}% de los ingresos "
+            f"{prefix} institucional aporta el {ins['share_pct']:.0f}%{suffix} "
             f"y el detal el {ret['share_pct']:.0f}%."
         )
     if sensitive and cur["revenue"]:
         margin = cur["profit"] / cur["revenue"] * 100
         out.append(f"La utilidad del periodo fue ${cur['profit']:,.0f} (margen {margin:.0f}%).")
-    if no_demand_count:
+    if not personal and no_demand_count:
         out.append(f"{no_demand_count} productos activos no registraron ninguna venta en el rango.")
     if at_risk:
-        out.append(f"{len(at_risk)} clientes activos llevan más de 6 meses sin comprar (riesgo de fuga).")
+        if personal:
+            out.append(f"{len(at_risk)} de tus clientes llevan más de 6 meses sin comprarte (riesgo de fuga).")
+        else:
+            out.append(f"{len(at_risk)} clientes activos llevan más de 6 meses sin comprar (riesgo de fuga).")
     if rate and rate.get("parallel_change_pct") is not None and abs(rate["parallel_change_pct"]) >= 5:
         out.append(
             f"El dólar paralelo varió {rate['parallel_change_pct']:+.0f}% en el periodo, "
@@ -218,11 +228,19 @@ def _build_narrative(start, end, cur, prev, type_split, no_demand_count, at_risk
     return out[:5]
 
 
-def executive_dashboard(start: date, end: date, *, sensitive: bool) -> dict:
+def executive_dashboard(start: date, end: date, *, sensitive: bool, personal: bool = False, seller=None) -> dict:
     """Resumen ejecutivo del negocio para el rango [start, end].
 
     ``sensitive`` (Gerente/Admin) habilita utilidad, margen, índice de ventaja
     competitiva, análisis de competencia y salud de modelos.
+
+    ``personal`` (rol Vendedor) acota TODO lo derivado de ventas/presupuestos al
+    ``seller`` indicado: el panel muestra solo SUS números (ingresos, conversión,
+    productos, clientes, ventas recientes, clientes en riesgo), nunca los totales de la
+    empresa. Los bloques de contexto operativo (inventario actual, tasa de cambio) se
+    mantienen globales. Un vendedor nunca es ``sensitive``, así que no ve utilidad ni
+    márgenes. Con ``seller=None`` (vendedor sin ficha) el scope queda vacío (cero filas),
+    nunca cae a las cifras de la empresa.
     """
     if start > end:
         start, end = end, start
@@ -230,7 +248,12 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool) -> dict:
     prev_end = start - timedelta(days=1)
     prev_start = prev_end - timedelta(days=span_days)
 
+    seller_name = None
     base = Sale.objects.filter(status=COMP)
+    if personal:
+        base = base.filter(seller=seller)  # seller None → sin filas (el FK no es nulo)
+        if seller is not None:
+            seller_name = f"{seller.first_name} {seller.last_name}".strip() or None
     cur_qs = base.filter(sale_date__gte=start, sale_date__lte=end)
     prev_qs = base.filter(sale_date__gte=prev_start, sale_date__lte=prev_end)
 
@@ -246,10 +269,18 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool) -> dict:
     cur_cust_ids = set(cur_qs.values_list("customer_id", flat=True))
     prev_cust_ids = set(prev_qs.values_list("customer_id", flat=True))
     retention = round(len(cur_cust_ids & prev_cust_ids) / len(prev_cust_ids) * 100, 1) if prev_cust_ids else None
-    new_customers = Customer.objects.filter(created_at__date__gte=start, created_at__date__lte=end).count()
+    if personal:
+        # "Nuevos para el vendedor": clientes que le compraron en el rango y a los que
+        # no le había vendido antes (no las altas globales del CRM).
+        prior_ids = set(base.filter(sale_date__lt=start).values_list("customer_id", flat=True))
+        new_customers = len(cur_cust_ids - prior_ids)
+    else:
+        new_customers = Customer.objects.filter(created_at__date__gte=start, created_at__date__lte=end).count()
 
-    # Presupuestos emitidos/convertidos en el rango.
+    # Presupuestos emitidos/convertidos en el rango (acotados al vendedor en modo personal).
     q_in = Quote.objects.filter(issued_date__gte=start, issued_date__lte=end)
+    if personal:
+        q_in = q_in.filter(seller=seller)
     quotes_issued = q_in.count()
     quotes_converted = q_in.filter(status=Quote.StatusChoices.CONVERTED).count()
     conversion_rate = round(quotes_converted / quotes_issued * 100, 1) if quotes_issued else None
@@ -349,28 +380,33 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool) -> dict:
 
     # Productos sin demanda en el rango (activos sin ninguna venta) — "¿qué no rota?".
     # Se excluyen los servicios: no llevan stock, no representan capital inmovilizado.
-    sold_ids = {a["product_id"] for a in item_agg}
-    no_demand_qs = (
-        Product.objects.filter(is_active=True)
-        .exclude(id__in=sold_ids)
-        .exclude(sku__startswith=SERVICE_SKU_PREFIX)
-        .select_related("category")
-        .order_by("-stock")
-    )
-    no_demand = []
-    for p in no_demand_qs[:10]:
-        row = {
-            "product_id": p.id,
-            "name": p.name,
-            "sku": p.sku,
-            "category": p.category.name if p.category else "—",
-            "stock": p.stock,
-            "retail_value": _f(p.stock * (p.sale_price_usd or 0)),
-        }
-        if sensitive:
-            row["cost_value"] = _f(p.stock * (p.purchase_price_usd or 0))
-        no_demand.append(row)
-    no_demand_count = no_demand_qs.count()
+    # Es capital inmovilizado de la EMPRESA (no del vendedor), así que en modo personal
+    # se omite (se calcularía contra todo el catálogo, no contra lo que vende el vendedor).
+    if personal:
+        no_demand, no_demand_count = [], 0
+    else:
+        sold_ids = {a["product_id"] for a in item_agg}
+        no_demand_qs = (
+            Product.objects.filter(is_active=True)
+            .exclude(id__in=sold_ids)
+            .exclude(sku__startswith=SERVICE_SKU_PREFIX)
+            .select_related("category")
+            .order_by("-stock")
+        )
+        no_demand = []
+        for p in no_demand_qs[:10]:
+            row = {
+                "product_id": p.id,
+                "name": p.name,
+                "sku": p.sku,
+                "category": p.category.name if p.category else "—",
+                "stock": p.stock,
+                "retail_value": _f(p.stock * (p.sale_price_usd or 0)),
+            }
+            if sensitive:
+                row["cost_value"] = _f(p.stock * (p.purchase_price_usd or 0))
+            no_demand.append(row)
+        no_demand_count = no_demand_qs.count()
 
     # Clientes en riesgo de fuga: activos cuya última compra es anterior a end-6m.
     cutoff = _first_of(add_period(period_of(end), -6))
@@ -454,9 +490,10 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool) -> dict:
             "series": rate_series,
         }
 
-    # Alertas tempranas (sistema de alerta): no resueltas, críticas primero.
+    # Alertas tempranas (sistema de alerta): no resueltas, críticas primero. Son alertas
+    # de EMPRESA (tasa desactualizada, etc.); en modo personal no aplican al vendedor.
     sev_order = {Alert.SeverityChoices.CRITICAL: 0, Alert.SeverityChoices.WARNING: 1, Alert.SeverityChoices.INFO: 2}
-    alert_rows = sorted(
+    alert_rows = [] if personal else sorted(
         Alert.objects.filter(is_resolved=False).order_by("-created_at")[:30],
         key=lambda a: sev_order.get(a.severity, 3),
     )
@@ -474,11 +511,15 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool) -> dict:
         for a in alert_rows[:8]
     ]
 
+    # Distribución geográfica: todos los clientes (empresa) o solo los del vendedor (personal).
+    if personal:
+        seller_cust_ids = set(base.values_list("customer_id", flat=True))
+        cbs_qs = Customer.objects.filter(id__in=seller_cust_ids).exclude(state="")
+    else:
+        cbs_qs = Customer.objects.exclude(state="")
     customers_by_state = [
         {"state": r["state"], "count": int(r["n"])}
-        for r in (
-            Customer.objects.exclude(state="").values("state").annotate(n=Count("id")).order_by("-n")[:8]
-        )
+        for r in cbs_qs.values("state").annotate(n=Count("id")).order_by("-n")[:8]
     ]
 
     recent_sales = [
@@ -583,7 +624,15 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool) -> dict:
             "data_from": bounds["lo"].isoformat() if bounds["lo"] else start.isoformat(),
             "data_to": bounds["hi"].isoformat() if bounds["hi"] else end.isoformat(),
         },
-        "narrative": _build_narrative(start, end, cur, prev, type_split, no_demand_count, at_risk, exchange_rate, sensitive),
+        # Ámbito del panel: "company" (empresa, Gerente/Admin/operativos) o "seller"
+        # (solo los números del vendedor). El frontend reetiqueta y oculta los bloques
+        # de empresa cuando es "seller".
+        "scope": {
+            "type": "seller" if personal else "company",
+            "label": "Tus resultados" if personal else "Empresa",
+            "seller_name": seller_name,
+        },
+        "narrative": _build_narrative(start, end, cur, prev, type_split, no_demand_count, at_risk, exchange_rate, sensitive, personal=personal),
         "kpis": kpis,
         "health_index": health_index,
         "monthly": monthly,

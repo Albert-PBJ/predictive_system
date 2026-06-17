@@ -21,6 +21,7 @@ from datetime import date
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.accounts.models import Role
 from apps.accounts.permissions import IsManager, IsViewer
 
 from . import stats
@@ -53,6 +54,10 @@ class DashboardStatsView(APIView):
     panel se recalcula para ese rango). Por defecto, los últimos 2 meses. Es
     ``IsViewer`` (lo carga cualquier usuario), pero la utilidad/margen/índice/
     competencia/modelos solo se incluyen para Gerente/Admin (``sensitive``).
+
+    **Personalizado por rol:** un VENDEDOR ve solo SUS números (no los de la empresa).
+    El panel se acota a su ficha de vendedor (``seller_profile``); Gerente/Admin y el
+    resto del personal operativo siguen viendo la empresa.
     """
 
     permission_classes = [IsViewer]
@@ -60,7 +65,14 @@ class DashboardStatsView(APIView):
     def get(self, request):
         start, end = _range_params(request)
         sensitive = IsManager().has_permission(request, self)
-        return Response(stats.executive_dashboard(start, end, sensitive=sensitive))
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        # Solo el rol Vendedor recibe la vista personal (Gerente/Admin ven la empresa
+        # aunque tengan ficha de vendedor; inventario/consulta ven la empresa operativa).
+        personal = role == Role.SELLER and not sensitive
+        seller = getattr(request.user, "seller_profile", None) if personal else None
+        return Response(
+            stats.executive_dashboard(start, end, sensitive=sensitive, personal=personal, seller=seller)
+        )
 
 
 class _ManagerStatsView(APIView):
