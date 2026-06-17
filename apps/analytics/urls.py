@@ -17,6 +17,7 @@ from .views import (
     DemandForecastView,
     ExchangeRateForecastView,
     ForecastableProductsView,
+    ForecastAdviceView,
     InventoryForecastView,
     OverviewView,
     ProductPriceForecastView,
@@ -37,6 +38,7 @@ urlpatterns = [
     path("forecast/product-price", ProductPriceForecastView.as_view(), name="analytics-price"),
     path("forecast/inventory", InventoryForecastView.as_view(), name="analytics-inventory"),
     path("forecast/quote-conversion", QuoteConversionForecastView.as_view(), name="analytics-quote"),
+    path("forecast/advice", ForecastAdviceView.as_view(), name="analytics-forecast-advice"),
     path("benchmark/competitors", CompetitorAnalysisView.as_view(), name="analytics-competitors"),
     # Benchmarking Competitivo (módulo dedicado con rango de fechas).
     path("benchmarking/comparison", BenchmarkingComparisonView.as_view(), name="analytics-benchmarking-comparison"),

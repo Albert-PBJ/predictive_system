@@ -300,7 +300,19 @@ The ML layer turns the seeded history into decision-support forecasts. Code live
   **All benchmarking reads exclude `source="FB"`** (`EXCLUDED_COMPETITOR_SOURCES` in `ml/datasets.py`).
 - **`ml/registry.py`** — in-process cache keyed by a cheap **data fingerprint** (counts + last
   mod), so endpoints **lazy-train on demand and cache** (training is sub-second) and invalidate
-  when data changes; plus joblib helpers and `upsert_prediction_log`.
+  when data changes; plus joblib helpers and `upsert_prediction_log`. `get_cached`/`set_cached`
+  expose the same fingerprint cache for **conditional** caching (used by the advice endpoint to
+  store only successful LLM readings).
+- **`forecast_advice.py`** — LLM **reading/advice** for one forecast graphic, the per-chart analog
+  of `report_narrative.py`. `generate(payload, *, target)` builds a compact facts block from the
+  forecast dict (recent history, forecast points + bands, trend, model metrics, per-target context;
+  inventory adds reorder meta — or the quote-conversion pipeline for `target="quote"`) and asks
+  DeepSeek for `{headline, reading, recommendations}`. **Degrades safely**: disabled/error → a
+  deterministic reading (trend, % change, reliability caveat, target tips), `available: False`.
+  Reuses the report narrative's switch (`report_narrative_enabled`) + creds. Served by
+  `ForecastAdviceView` (`IsManager`) at `GET /api/analytics/forecast/advice?target=&product=&horizon=&metric=&rate=`,
+  which dispatches to the right forecaster reusing the **same cache keys** (no recompute) and caches
+  valid LLM advice under `advice:<fc_key>`.
 
 **Model assignment** (each required technique used where it performs best; `ASSIGNED_MODEL`):
 XGBoost→demand/inventory, Decision Tree→quote conversion, linear regression→sales/profit/

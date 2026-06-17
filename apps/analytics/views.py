@@ -25,7 +25,7 @@ from apps.audit.models import ActionChoices
 from apps.core.models import SERVICE_SKU_PREFIX, Product
 from apps.sales.models import SaleItem
 
-from . import benchmarking, report_narrative, stats
+from . import benchmarking, forecast_advice, report_narrative, stats
 from .ml import forecasters as F
 from .ml import registry
 from .models import PredictionLog
@@ -158,6 +158,67 @@ class QuoteConversionForecastView(_BaseForecastView):
         m = _model(request)
         key = f"quote:{m}"
         return Response(registry.cached(key, lambda: F.forecast_quote_conversion(m)))
+
+
+class ForecastAdviceView(_BaseForecastView):
+    """GET /api/analytics/forecast/advice?target=&product=&horizon=&metric=&rate=&model=
+
+    Lectura accionable de un gráfico de pronóstico, redactada por el LLM (cae a un consejo
+    determinista si el LLM no está disponible). Reutiliza el **mismo caché** del pronóstico
+    (mismas claves que las vistas de arriba), así que normalmente no recalcula nada. La
+    respuesta del LLM se cachea aparte (solo cuando es válida) para no repetir llamadas.
+    """
+
+    def get(self, request):
+        target = request.query_params.get("target")
+        h, m = _horizon(request), _model(request)
+        pid = _int(request, "product")
+
+        if target == "demand":
+            if not pid:
+                return Response({"detail": "Falta el parámetro 'product'."}, status=status.HTTP_400_BAD_REQUEST)
+            fc_key = f"demand:{pid}:{h}:{m}"
+            builder = lambda: F.forecast_demand(pid, h, m)  # noqa: E731
+        elif target == "sales":
+            metric = request.query_params.get("metric", "revenue")
+            metric = metric if metric in ("revenue", "count") else "revenue"
+            fc_key = f"sales:{metric}:{h}:{m}"
+            builder = lambda: F.forecast_sales(metric, h, m)  # noqa: E731
+        elif target == "profit":
+            fc_key = f"profit:{h}:{m}"
+            builder = lambda: F.forecast_profit(h, m)  # noqa: E731
+        elif target == "exchange-rate":
+            rate = request.query_params.get("rate", "bcv")
+            rate = rate if rate in ("bcv", "parallel") else "bcv"
+            fc_key = f"rate:{rate}:{h}:{m}"
+            builder = lambda: F.forecast_exchange_rate(rate, h, m)  # noqa: E731
+        elif target == "product-price":
+            if not pid:
+                return Response({"detail": "Falta el parámetro 'product'."}, status=status.HTTP_400_BAD_REQUEST)
+            fc_key = f"price:{pid}:{h}:{m}"
+            builder = lambda: F.forecast_product_price(pid, h, m)  # noqa: E731
+        elif target == "inventory":
+            if not pid:
+                return Response({"detail": "Falta el parámetro 'product'."}, status=status.HTTP_400_BAD_REQUEST)
+            fc_key = f"inventory:{pid}:{h}"
+            builder = lambda: F.forecast_inventory(pid, h)  # noqa: E731
+        elif target == "quote":
+            fc_key = f"quote:{m}"
+            builder = lambda: F.forecast_quote_conversion(m)  # noqa: E731
+        else:
+            return Response({"detail": "Parámetro 'target' inválido."}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = registry.cached(fc_key, builder)
+
+        # El consejo del LLM se cachea aparte y SOLO cuando es válido (available=True), para
+        # no "congelar" un fallback determinista por un fallo transitorio de red.
+        advice_key = f"advice:{fc_key}"
+        found, advice = registry.get_cached(advice_key)
+        if not found:
+            advice = forecast_advice.generate(payload, target=target)
+            if advice.get("available"):
+                registry.set_cached(advice_key, advice)
+        return Response(advice)
 
 
 # --------------------------------------------------------------------------- #

@@ -51,6 +51,22 @@ def cached(key: str, builder):
     return value
 
 
+def get_cached(key: str):
+    """Lectura sin builder: devuelve ``(True, value)`` si hay un valor cacheado cuya huella
+    coincide con la actual, o ``(False, None)`` si no. Útil para cachear de forma
+    **condicional** (p. ej. guardar solo respuestas válidas del LLM y no los fallbacks)."""
+    fp = data_fingerprint()
+    hit = _CACHE.get(key)
+    if hit is not None and hit[0] == fp:
+        return True, hit[1]
+    return False, None
+
+
+def set_cached(key: str, value) -> None:
+    """Guarda ``value`` bajo ``key`` con la huella de datos actual."""
+    _CACHE[key] = (data_fingerprint(), value)
+
+
 def clear_cache() -> None:
     _CACHE.clear()
 
