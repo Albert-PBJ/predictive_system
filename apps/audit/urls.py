@@ -7,6 +7,7 @@ from .views import (
     AuditLogListView,
     AuditLogPurgeView,
     AuditMetaView,
+    DatabaseBackupView,
 )
 
 urlpatterns = [
@@ -14,4 +15,5 @@ urlpatterns = [
     path("logs/export", AuditLogExportView.as_view(), name="audit-logs-export"),
     path("logs/purge", AuditLogPurgeView.as_view(), name="audit-logs-purge"),
     path("meta", AuditMetaView.as_view(), name="audit-meta"),
+    path("backup", DatabaseBackupView.as_view(), name="audit-backup"),
 ]
