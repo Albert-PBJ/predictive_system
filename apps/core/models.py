@@ -1,6 +1,8 @@
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
+from .price_band_defaults import default_price_bands
+
 # Prefijo de SKU que marca un **servicio** (p. ej. "Mantenimiento"): un producto sin
 # inventario y de precio flexible (se fija al registrar la venta). Se usa de forma
 # transversal para tratar a los servicios como "sin stock": no validan/descuentan
@@ -17,7 +19,6 @@ class Category(models.Model):
         help_text=_("Nombre de la categoría de producto"),
     )
     slug = models.SlugField(max_length=100, unique=True)
-    description = models.TextField(blank=True, help_text=_("Descripción de la categoría"))
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -74,19 +75,6 @@ class Product(models.Model):
         help_text=_("Lista de colores disponibles"),
     )
 
-    # Medidas físicas en cm (sillas)
-    seat_length_cm = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True, help_text=_("Largo del asiento en cm"))
-    seat_width_cm = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True, help_text=_("Ancho del asiento en cm"))
-    back_length_cm = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True, help_text=_("Largo del espaldar en cm"))
-    back_width_cm = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True, help_text=_("Ancho del espaldar en cm"))
-    min_height_cm = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True, help_text=_("Altura mínima en cm"))
-    max_height_cm = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True, help_text=_("Altura máxima en cm"))
-
-    # Medidas físicas en cm (escritorios/mesas)
-    desk_length_cm = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True, help_text=_("Largo del escritorio en cm"))
-    desk_width_cm = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True, help_text=_("Ancho del escritorio en cm"))
-    desk_height_cm = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True, help_text=_("Alto del escritorio en cm"))
-
     # Precios actuales
     purchase_price_usd = models.DecimalField(
         max_digits=10, decimal_places=2, null=True, blank=True,
@@ -106,7 +94,6 @@ class Product(models.Model):
         default=True,
         help_text=_("True si Maescar lo fabrica; False si es importado/revendido"),
     )
-    image = models.URLField(max_length=500, null=True, blank=True, help_text=_("URL de la imagen del producto"))
     is_active = models.BooleanField(default=True, help_text=_("Producto activo en el catálogo"))
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -234,7 +221,6 @@ class Seller(models.Model):
     )
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100)
-    phone = models.CharField(max_length=20, blank=True)
     email = models.EmailField(blank=True)
     commission_rate = models.DecimalField(
         max_digits=5, decimal_places=2, default=10.00,
@@ -384,6 +370,13 @@ class SystemSettings(models.Model):
     )
     scraper_default_limit = models.PositiveSmallIntegerField(
         default=50, help_text=_("Límite de resultados por defecto al lanzar un scraper."),
+    )
+    price_bands = models.JSONField(
+        default=default_price_bands, blank=True,
+        help_text=_(
+            "Rangos de precio plausibles (USD) por categoría para la validación de "
+            "datos scrapeados. Estructura: {categories: {<cat>: {min, max}}, default: {min, max}}."
+        ),
     )
 
     # ── Valores por defecto de negocio ────────────────────────────────────────

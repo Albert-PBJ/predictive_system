@@ -495,7 +495,7 @@ _NON_PRICE_UNIT_RE = re.compile(
 # Piso del precio adivinado.
 _BARE_PRICE_MIN = Decimal("5")
 # Techo de SANIDAD para números CON indicador de precio actual ("AHORA 750"): se
-# confía en ellos hasta aquí y el gate por categoría (validation.PRICE_BANDS) hace el
+# confía en ellos hasta aquí y el gate por categoría (validation.band_for_category) hace el
 # filtrado fino. Es amplio a propósito (por encima de toda banda) para no recortar un
 # precio legítimo; solo bloquea errores groseros de OCR. Los números SIN indicador
 # (más arriesgados) usan el tope más estricto `OCR_BARE_NUMBER_MAX_USD`.

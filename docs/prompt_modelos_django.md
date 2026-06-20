@@ -32,7 +32,7 @@ Fecha | Cliente | Precio Venta Total | Precio Compra Total | Utilidad | Vendedor
 ```
 
 ### Lista de Precios / Catálogo de Productos (PDF actual)
-Los productos tienen: nombre comercial (ej: "Stanford", "Manhattan", "BE"), código/SKU (ej: "OK-6611N", "OCO22N"), precio en USD, categoría implícita (Sillería Presidencial, Ejecutiva, Visitante, Gamer, Escritorios, Tandem/Espera, Archivadores, Bibliotecas), material (Malla Mesh, Bipiel, Tela), colores disponibles, y medidas físicas (asiento largo/ancho, espaldar largo/ancho, altura min/max).
+Los productos tienen: nombre comercial (ej: "Stanford", "Manhattan", "BE"), código/SKU (ej: "OK-6611N", "OCO22N"), precio en USD, categoría implícita (Sillería Presidencial, Ejecutiva, Visitante, Gamer, Escritorios, Tandem/Espera, Archivadores, Bibliotecas), material (Malla Mesh, Bipiel, Tela), colores disponibles.
 
 Rango de precios: desde $40 (sillas de espera) hasta $315 (silla premium Lexus) en sillas; desde $95 hasta $255 en escritorios/mesas.
 
@@ -107,12 +107,10 @@ Debe reflejar el catálogo real de Maescar:
 - **Categoría** (Sillería Presidencial, Ejecutiva, Secretarial, Visitante, Gamer, Cajero, Escritorios, Mesas de Conferencia, Tandem/Espera, Archivadores, Bibliotecas, Módulos de Recepción, Accesorios)
 - Material (Malla Mesh, Bipiel, Tela, Metal, Madera/Melamina)
 - Colores disponibles (puede ser JSONField o una M2M)
-- Medidas físicas (largo asiento, ancho asiento, largo espaldar, ancho espaldar, altura min, altura max — en cm; para escritorios: largo, ancho, alto)
 - Precio de compra USD, precio de venta USD (los precios actuales)
 - Stock actual
 - Stock mínimo (umbral para alertas de reabastecimiento)
 - Indicador de si es producto fabricado por Maescar o importado/revendido
-- Imagen (URL o ImageField)
 - Activo/inactivo
 - Timestamps
 
@@ -143,7 +141,7 @@ Basado en el formato real de clientes de Maescar:
 
 ### 5. `Seller` (NUEVO)
 - FK a User de Django (o datos propios si prefieres)
-- Nombre, teléfono, email
+- Nombre, email
 - Porcentaje de comisión (por defecto 10% de la utilidad, según los datos reales)
 - Activo/inactivo
 
@@ -212,7 +210,7 @@ El modelo existente está bien estructurado. Sugerencias de mejora:
 ### 11. `Competitor` (NUEVO)
 - Nombre de la empresa competidora
 - Ubicación (estado, municipio)
-- Sitio web, Instagram, Facebook
+- Sitio web, Instagram
 - Notas
 - Activo/inactivo
 
@@ -221,7 +219,6 @@ Para el sistema de alertas automáticas:
 - Tipo: quiebre_stock, sobrestock, cambio_precio_competidor, caida_demanda, meta_cumplida
 - Severidad: info, warning, critical
 - Título, mensaje descriptivo
-- FK a Product (nullable), FK a Competitor (nullable)
 - Leída (bool)
 - Resuelta (bool)
 - Fecha de creación
@@ -234,7 +231,6 @@ Para versionar los modelos de IA y sus métricas:
 - Parámetros/hiperparámetros (JSONField)
 - Fecha de entrenamiento
 - Dataset usado (descripción o referencia)
-- Ruta al archivo del modelo serializado (FileField o CharField con path)
 - Activo (bool) — para marcar cuál es el modelo en producción
 
 ### 14. `KPI` (NUEVO)

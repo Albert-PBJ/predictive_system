@@ -19,14 +19,16 @@ Excepción de Instagram: como el precio rara vez es explícito en el caption, lo
 posts de Instagram SIN precio se conservan por defecto (toggle
 `DISCARD_INSTAGRAM_WITHOUT_PRICE`). Si tienen precio, igual se valida el rango.
 
-Los rangos de precio son globales: el mismo rango aplica a las cuatro fuentes (Instagram,
-Facebook, Web, Mercado Libre).
+Los rangos de precio son globales (el mismo rango aplica a las cuatro fuentes:
+Instagram, Facebook, Web, Mercado Libre) y CONFIGURABLES en caliente desde la
+pantalla de Configuración (``SystemSettings.price_bands``); sus valores por defecto
+viven en ``core.price_band_defaults``.
 """
 
 import logging
 import re
 import unicodedata
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -34,26 +36,15 @@ logger = logging.getLogger(__name__)
 
 # ── Rangos de precio por categoría (USD), calibrados al mercado venezolano ─────
 #
-# (mínimo, máximo) en dólares. Editá estos valores para ajustar la validación.
-# Las claves deben coincidir EXACTAMENTE con las categorías de
-# `scrapers.__init__.CATEGORY_KEYWORDS` / `CATEGORY_NAMES`.
+# Los rangos (mínimo, máximo) en dólares ya NO son una constante de código: viven
+# en ``SystemSettings.price_bands`` y se editan en caliente desde la pantalla de
+# Configuración. Los valores POR DEFECTO (semilla + respaldo) son la fuente única
+# ``core.price_band_defaults.DEFAULT_PRICE_BANDS``; las claves de categoría coinciden
+# con ``scrapers.__init__.CATEGORY_NAMES``.
 #
 # El TECHO depende de la categoría a propósito: así se puede descartar un
 # escritorio a 1000$ (no viable) sin descartar un juego de recepción legítimo a
 # 1100$. Un único rango global no podría distinguir ambos casos.
-PRICE_BANDS: dict[str, tuple[Decimal, Decimal]] = {
-    "Sillas":               (Decimal("10"), Decimal("500")),
-    "Escritorios":          (Decimal("25"), Decimal("800")),
-    "Mesas":                (Decimal("20"), Decimal("1000")),
-    "Archivadores":         (Decimal("25"), Decimal("500")),
-    "Estantes y Libreros":  (Decimal("15"), Decimal("500")),
-    "Sofás y Recepción":    (Decimal("50"), Decimal("1200")),
-    "Gabinetes y Armarios": (Decimal("30"), Decimal("800")),
-}
-
-# Rango de respaldo cuando la categoría no se pudo determinar. Amplio para no
-# descartar productos válidos sin clasificar, pero acota lo claramente absurdo.
-DEFAULT_BAND: tuple[Decimal, Decimal] = (Decimal("10"), Decimal("1500"))
 
 # En Instagram el precio casi nunca está explícito en el caption y extraerlo es
 # poco fiable, así que por defecto NO se descartan los posts que quedan SIN
@@ -69,9 +60,34 @@ def _discard_instagram_without_price() -> bool:
 _INSTAGRAM_SOURCE = "IG"
 
 
+def _band_value(raw, fallback: Decimal) -> Decimal:
+    """Convierte un valor de banda (número o texto) a ``Decimal`` no negativo."""
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError):
+        return fallback
+    return value if value >= 0 else fallback
+
+
 def band_for_category(category: Optional[str]) -> tuple[Decimal, Decimal]:
-    """Rango (min, max) en USD para la categoría dada (o el de respaldo)."""
-    return PRICE_BANDS.get(category or "", DEFAULT_BAND)
+    """Rango (mín, máx) en USD para la categoría dada (o el de respaldo).
+
+    Lee los rangos configurados en ``SystemSettings.price_bands`` (editables desde la
+    UI); si una categoría no tiene rango propio, usa el rango ``default``. Cae a
+    ``core.price_band_defaults`` ante cualquier valor faltante o inválido.
+    """
+    from apps.core import system_settings
+    from apps.core.price_band_defaults import DEFAULT_PRICE_BANDS
+
+    bands = system_settings.price_bands()
+    categories = bands.get("categories") or {}
+    fallback = bands.get("default") or DEFAULT_PRICE_BANDS["default"]
+    entry = categories.get(category or "") or fallback
+
+    code_default = DEFAULT_PRICE_BANDS["default"]
+    low = _band_value(entry.get("min"), _band_value(code_default["min"], Decimal("0")))
+    high = _band_value(entry.get("max"), _band_value(code_default["max"], Decimal("999999")))
+    return low, high
 
 
 # ── Limpieza del nombre de producto ───────────────────────────────────────────

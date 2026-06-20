@@ -168,6 +168,21 @@ def scraper_default_limit() -> int:
     return int(get_settings().scraper_default_limit or 50)
 
 
+def price_bands() -> dict:
+    """Rangos de precio de validación (USD) configurados, o los defaults.
+
+    Estructura: ``{"categories": {<cat>: {"min", "max"}}, "default": {"min", "max"}}``.
+    Cae a `price_band_defaults.default_price_bands()` si la fila no tiene un valor
+    utilizable (BD recién creada, configuración vacía o corrupta).
+    """
+    from .price_band_defaults import default_price_bands
+
+    raw = getattr(get_settings(), "price_bands", None)
+    if isinstance(raw, dict) and isinstance(raw.get("default"), dict):
+        return raw
+    return default_price_bands()
+
+
 def rate_max_age_days() -> int:
     return int(get_settings().rate_max_age_days or 2)
 

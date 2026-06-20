@@ -29,10 +29,6 @@ class PredictionLog(models.Model):
     hyperparameters = models.JSONField(default=dict, blank=True, help_text=_("Hiperparámetros usados en el entrenamiento"))
     trained_at = models.DateTimeField(help_text=_("Fecha y hora en que se entrenó el modelo"))
     dataset_description = models.TextField(blank=True, help_text=_("Descripción del dataset usado para entrenar"))
-    model_file_path = models.CharField(
-        max_length=500, blank=True,
-        help_text=_("Ruta al archivo del modelo serializado (.pkl, .joblib, etc.)"),
-    )
     is_active = models.BooleanField(
         default=False,
         help_text=_("True si es el modelo activo en producción para su tipo"),
@@ -105,20 +101,6 @@ class Alert(models.Model):
     severity = models.CharField(max_length=4, choices=SeverityChoices.choices, default=SeverityChoices.INFO)
     title = models.CharField(max_length=200)
     message = models.TextField()
-    product = models.ForeignKey(
-        "core.Product",
-        on_delete=models.CASCADE,
-        null=True, blank=True,
-        related_name="alerts",
-        help_text=_("Producto relacionado con la alerta (si aplica)"),
-    )
-    competitor = models.ForeignKey(
-        "benchmarking.Competitor",
-        on_delete=models.CASCADE,
-        null=True, blank=True,
-        related_name="alerts",
-        help_text=_("Competidor relacionado con la alerta (si aplica)"),
-    )
     is_read = models.BooleanField(default=False)
     is_resolved = models.BooleanField(default=False)
 

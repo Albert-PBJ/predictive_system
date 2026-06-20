@@ -18,7 +18,7 @@ class CompetitorAdmin(admin.ModelAdmin):
     def merge_competitors(self, request, queryset):
         """Funde varios competidores duplicados en uno solo (el de menor id).
 
-        Reasigna sus datos de mercado y alertas al canónico, rellena los campos
+        Reasigna sus datos de mercado al canónico, rellena los campos
         vacíos del canónico con los del duplicado y borra los duplicados. Resuelve
         a mano los duplicados que el dedupe difuso automático no haya unificado.
         """
@@ -31,9 +31,6 @@ class CompetitorAdmin(admin.ModelAdmin):
             )
             return
 
-        # Import diferido: evita acoplar la carga del admin con la app analytics.
-        from apps.analytics.models import Alert
-
         canonical = comps[0]
         merged = 0
         moved_records = 0
@@ -41,9 +38,8 @@ class CompetitorAdmin(admin.ModelAdmin):
             moved_records += CompetitorMarketData.objects.filter(competitor=dup).update(
                 competitor=canonical
             )
-            Alert.objects.filter(competitor=dup).update(competitor=canonical)
             # Rellena los campos vacíos del canónico con los del duplicado.
-            for field in ("state", "municipality", "website", "instagram", "facebook", "notes"):
+            for field in ("state", "municipality", "website", "instagram", "notes"):
                 if not getattr(canonical, field) and getattr(dup, field):
                     setattr(canonical, field, getattr(dup, field))
             dup.delete()

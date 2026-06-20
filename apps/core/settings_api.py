@@ -26,6 +26,7 @@ from apps.accounts.permissions import IsAdmin, IsManager, IsViewer
 from apps.audit import services as audit
 from apps.audit.models import ActionChoices
 from apps.competitor_market_data.enrichment import deepseek
+from apps.competitor_market_data.scrapers import CATEGORY_NAMES
 
 from . import system_settings
 from .models import ExchangeRate, SystemSettings
@@ -55,6 +56,7 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
             # Scrapers
             "discard_instagram_without_price",
             "scraper_default_limit",
+            "price_bands",
             # Valores por defecto de negocio
             "default_iva_pct",
             "default_quote_expiry_days",
@@ -69,6 +71,38 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
             "updated_at",
         )
         read_only_fields = ("updated_at",)
+
+    def validate_price_bands(self, value):
+        """Valida/normaliza los rangos: min/max numéricos, no negativos y min ≤ max."""
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Estructura inválida.")
+        categories = value.get("categories")
+        default = value.get("default")
+        if not isinstance(categories, dict) or not isinstance(default, dict):
+            raise serializers.ValidationError(
+                "Debe incluir 'categories' (objeto) y 'default' (objeto)."
+            )
+
+        def _norm(entry, label):
+            if not isinstance(entry, dict):
+                raise serializers.ValidationError(f"Rango inválido para «{label}».")
+            try:
+                low = Decimal(str(entry.get("min")))
+                high = Decimal(str(entry.get("max")))
+            except (InvalidOperation, TypeError, ValueError):
+                raise serializers.ValidationError(f"Los valores de «{label}» deben ser numéricos.")
+            if low < 0 or high < 0:
+                raise serializers.ValidationError(f"Los rangos de «{label}» no pueden ser negativos.")
+            if low > high:
+                raise serializers.ValidationError(
+                    f"En «{label}», el mínimo ({low}) no puede superar al máximo ({high})."
+                )
+            return {"min": float(low), "max": float(high)}
+
+        return {
+            "categories": {str(k): _norm(v, k) for k, v in categories.items()},
+            "default": _norm(default, "Sin categoría"),
+        }
 
 
 def _package_available(name: str) -> bool:
@@ -88,6 +122,8 @@ def _meta_block() -> dict:
         "deepseek_key_present": bool(system_settings.deepseek_api_key()),
         "openai_installed": _package_available("openai"),
         "easyocr_installed": _package_available("easyocr"),
+        # Categorías conocidas (para poblar el editor de rangos de precio).
+        "price_band_categories": list(CATEGORY_NAMES),
         "latest_rate": None if rate is None else {
             "date": rate.date.isoformat(),
             "bcv_rate": str(rate.bcv_rate),

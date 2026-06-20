@@ -11,7 +11,6 @@ class Competitor(models.Model):
     municipality = models.CharField(max_length=100, blank=True, help_text=_("Municipio donde opera"))
     website = models.URLField(max_length=500, blank=True, help_text=_("Sitio web del competidor"))
     instagram = models.CharField(max_length=200, blank=True, help_text=_("URL o @usuario de Instagram"))
-    facebook = models.CharField(max_length=200, blank=True, help_text=_("URL de la página de Facebook"))
     notes = models.TextField(blank=True)
     is_active = models.BooleanField(default=True, help_text=_("Competidor activo en el seguimiento"))
 

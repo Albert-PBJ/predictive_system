@@ -16,7 +16,8 @@ Diseño de los datos (alineado con la historia de negocio de ``seed_company_data
     **por encima** de Maescar.
   * Cada fila se deriva del catálogo propio: para los productos que el competidor
     "tiene", el precio = precio propio × multiplicador del tier × deriva mensual ×
-    ruido, recortado a la banda de precio de su categoría (``validation.PRICE_BANDS``).
+    ruido, recortado a la banda de precio de su categoría (``validation.band_for_category``,
+    configurable en SystemSettings.price_bands).
     Se enlaza al ``Product`` propio (match like-with-like). Las categorías que el
     catálogo propio casi no cubre (Sofás/Recepción, Estantes, Gabinetes) se generan
     "genéricas" (sin match) a partir de un precio base por categoría.

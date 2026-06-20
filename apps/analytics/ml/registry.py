@@ -96,7 +96,7 @@ def load_artifact(name: str):
 def upsert_prediction_log(
     *, name: str, model_type: str, metrics: dict | None,
     hyperparameters: dict | None = None, dataset_description: str = "",
-    model_file_path: str = "", make_active: bool = True,
+    make_active: bool = True,
 ) -> PredictionLog:
     """Crea una fila de ``PredictionLog`` (y desactiva las anteriores del mismo tipo
     si ``make_active``)."""
@@ -113,6 +113,5 @@ def upsert_prediction_log(
         hyperparameters=hyperparameters or {},
         trained_at=timezone.now(),
         dataset_description=dataset_description,
-        model_file_path=model_file_path,
         is_active=make_active,
     )
