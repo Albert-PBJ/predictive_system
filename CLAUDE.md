@@ -127,7 +127,7 @@ This API has all of its comments as well as API responses in Spanish. Functions,
 |-----|---------|
 | `apps/accounts` | Auth & RBAC: UserProfile (role), JWT login/logout/refresh/me, role-based permissions |
 | `apps/core` | Master data: Product, Category, Customer, Seller, ExchangeRate, ProductPriceHistory. Also exposes a read-only `GET /api/exchange-rate/latest` and the `seed_demo_data` command |
-| `apps/sales` | Transactions: Sale, SaleItem, Quote, QuoteItem. **REST API for registering sales** (`SaleViewSet`) **and creating quotes** (`QuoteViewSet`), both over `services.py` (`create_sale`/`void_sale`/`create_quote`) |
+| `apps/sales` | Transactions: Sale (con desglose de IVA + facturación fiscal), SaleItem, Quote, QuoteItem, DispatchOrder, DispatchOrderItem. **REST API** for registering/invoicing sales (`SaleViewSet`), creating/converting quotes (`QuoteViewSet`) and dispatch orders (`DispatchOrderViewSet`), all over `services.py` (`create_sale`/`void_sale`/`invoice_sale`/`create_quote`/`convert_quote_to_sale`/`create_dispatch_order`) |
 | `apps/inventory` | Audit trail: InventoryMovement (every stock change logged). **REST API for stock control** (`InventoryMovementViewSet`, `StockListView` + `services.py`) |
 | `apps/benchmarking` | Competitor intelligence: Competitor, CompetitorMarketData (with USD snapshot, `listing_key`, own-`Product` match, provenance), ScrapeRun (run traceability), RejectedMarketData (archived discards). Admin `merge_competitors` action |
 | `apps/analytics` | ML / predictive layer: PredictionLog (model registry), KPI, Alert; the `ml/` package (datasets→features→estimators→forecasters→registry), the `/api/analytics/` forecast API (`IsManager`), and the `train_models` command. See **Predictive / ML module** below |
@@ -206,8 +206,9 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 /api/products/                → ProductViewset CRUD (read = operativo, write = Manager+); `stock` is read-only (append-only inventory)
 /api/categories               → read-only category list for the product form (operativo, unpaginated)
 /api/customers/               → CustomerViewSet (read/create = Seller+, delete = Manager+)
-/api/sales/                   → SaleViewSet (ver = operativo, registrar = Seller+); POST …/{id}/anular/ to void (Manager+)
-/api/quotes/                  → QuoteViewSet (ver = operativo, crear = Seller+): presupuestos. create_quote (apps/sales/services) no toca inventario; IVA 16% por defecto, número correlativo DDMMYYYY-N. El PDF se genera en el frontend
+/api/sales/                   → SaleViewSet (ver = operativo, registrar = Seller+); POST …/{id}/anular/ to void (Manager+); POST …/{id}/facturar/ (Seller+, multipart) fija nº factura + nº control + adjunto (opcional, se factura después); GET …/siguiente-factura/ sugiere el correlativo. La venta lleva desglose de IVA (base = total_sale_usd; + iva_amount_usd/total_with_iva_usd(+ves))
+/api/quotes/                  → QuoteViewSet (ver = operativo, crear = Seller+): presupuestos. create_quote (apps/sales/services) no toca inventario; IVA 16% por defecto, número correlativo DDMMYYYY-N. El PDF se genera en el frontend. POST …/{id}/convertir/ (Seller+) genera la venta desde el presupuesto (convert_quote_to_sale → descuenta stock, marca CONVERTED + converted_to_sale). ?convertible=true filtra los presupuestos vigentes aún convertibles (buscador del formulario de venta). Relacionar un presupuesto **también** se puede al registrar la venta: `POST /api/sales/` acepta `quote` → `create_sale` enlaza vía `_link_quote_to_sale`
+/api/dispatch-orders/         → DispatchOrderViewSet (ver/crear/estado = operativo): órdenes de despacho (nota de entrega, OD-DDMMYYYY-N, estado PEN→PREP→DESP→ENT/ANU). Se generan desde una venta y NO mueven inventario; POST …/{id}/estado/ actualiza estado/datos de entrega. El PDF (con firmas) se genera en el frontend
 /api/inventory/stock          → current stock summary per product (ver = operativo)
 /api/inventory/movements/     → InventoryMovementViewSet: history (ver = operativo) + register ENT/AJU/DEV (Inventario+)
 /api/exchange-rate/latest     → latest BCV/parallel rate, read-only (Seller+)
@@ -240,13 +241,29 @@ and both run inside a single `transaction.atomic` so a sale/movement never lands
   `SaleItem.unit_list_price_usd`, derives the net `unit_sale_price_usd = list × (1 − pct/100)` (or,
   if a net price is sent instead, back-computes the %), and totals the saving into
   `Sale.total_discount_usd`. The serializer exposes the list price + % on read and accepts
-  `discount_pct` on write.
+  `discount_pct` on write. It also computes the **IVA breakdown** (`iva_rate` default from
+  `system_settings.default_iva_pct()`; `iva_amount_usd`/`total_with_iva_usd`(+ves)) on top of the base
+  imponible — `total_sale_usd` stays the base (what the analytics reads), so revenue is unchanged.
+  Optionally takes a `quote`: when the sale is registered from a related presupuesto, it links it and
+  marks it CONVERTED via `_link_quote_to_sale` (the shared helper `convert_quote_to_sale` also uses) —
+  same-customer + not-already-converted enforced.
 - **`apps/sales/services.void_sale`** — reverses a sale: writes a `DEV` movement per line (returns the
   qty to stock) and sets status `ANU`. Gated to Manager+ via `@action(permission_classes=[IsManager])`.
+- **`apps/sales/services.invoice_sale`** — asocia los datos fiscales (nº factura, nº control,
+  `invoice_date`, adjunto opcional) a una venta ya registrada, validando unicidad; `suggest_invoice_numbers`
+  sugiere el siguiente correlativo. Facturar es opcional y posterior al registro.
+- **`apps/sales/services.convert_quote_to_sale`** — crea una venta desde un presupuesto (reutiliza
+  `create_sale`, así que valida/descuenta stock), enlaza `Quote.converted_to_sale` y marca `CONVERTED`.
+- **`apps/sales/services.create_dispatch_order` / `update_dispatch_order`** — orden de despacho
+  (`DispatchOrder`/`DispatchOrderItem`, correlativo `OD-DDMMYYYY-N`, estados PEN→PREP→DESP→ENT/ANU) a
+  partir de una venta; **no toca inventario** (el stock ya salió al vender), sólo lista la mercancía a
+  entregar (por defecto las líneas físicas de la venta; admite despacho parcial).
 - **`apps/inventory/services.apply_movement`** — the single chokepoint for stock mutation (append-only):
   locks the product, refuses to drive stock negative (`InsufficientStockError`), writes the
   `InventoryMovement` and updates `Product.stock`. Used by both the sales service and the manual
-  movement endpoint. Manual movements only allow `ENT`/`AJU`/`DEV` (`SAL` is reserved for sales).
+  movement endpoint. Manual movements only allow `ENT`/`AJU`/`DEV` (`SAL` is reserved for sales). It
+  also **persists a low-stock `Alert`** (`STOCK_BREAK`, deduped per product, resolved when stock
+  recovers) via `_sync_low_stock_alert` — best-effort, wrapped in try/except so it never breaks the movement.
 
 **Permissions (separation of duties):** the model is **not a single linear ladder** —
 `ADMIN > MANAGER > {SELLER, WAREHOUSE} > VIEWER`, where `SELLER` (vendedor) and `WAREHOUSE`
@@ -261,10 +278,14 @@ and both run inside a single `transaction.atomic` so a sale/movement never lands
   catalog) is any operational role (`IsOperational` = ADMIN/MANAGER/SELLER/WAREHOUSE), so a seller
   can view stock and a warehouse manager can view sales.
 - **Voiding a sale** is `Manager`+ (`IsManager`), since it erases revenue and returns stock.
+- **Invoicing a sale** (`facturar`) and **converting a quote** (`convertir`) are `SELLER`+ (`IsSeller`),
+  same capability as registering a sale.
+- **Dispatch orders** (create / status / read / print) are any operational role (`IsOperational`),
+  incl. the warehouse role — despacho es un control de entrega, no una venta.
 - Product/customer *writes* are Manager+; customer reads/creates are Seller+ (the sale form's quick-add).
 
-The sale/inventory viewsets implement this per-action in `get_permissions()` (create vs anular vs the
-read default).
+The sale/inventory viewsets implement this per-action in `get_permissions()` (create vs anular vs
+facturar/convertir vs the read default).
 
 ### Predictive / ML module (`apps/analytics`)
 
@@ -408,7 +429,8 @@ change), `action` (`ActionChoices`), `category` (`CategoryChoices`, derived from
   wrapped in `try/except` and logs a WARNING on failure — auditing must **never** break the
   business operation it records. It resolves the actor + IP from `request` when passed.
 - **Instrumentation** (explicit `audit.log(...)` after success, where the request/actor is known):
-  sales create/void + quote create (`apps/sales/views`), manual inventory movements
+  sales create/void/**invoice** + quote create/**convert** + **dispatch-order create/status** (`apps/sales/views`;
+  actions `SALE_INVOICE`/`QUOTE_CONVERT`/`DISPATCH_CREATE`/`DISPATCH_UPDATE`, all category `VENTAS`), manual inventory movements
   (`apps/inventory/views` — sale-driven `SAL` movements are **not** double-logged, they go through
   `inventory.services.apply_movement`), scrape start (`apps/competitor_market_data/views`), report
   generation (`analytics/views.ReportNarrativeView`), predictive-model retraining

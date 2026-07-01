@@ -1,6 +1,9 @@
+from datetime import date
+
 from django.db.models import Q
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from apps.accounts.models import Role
@@ -10,18 +13,29 @@ from apps.audit.models import ActionChoices
 from apps.core.models import Seller
 from apps.inventory.services import InsufficientStockError
 
-from .models import Quote, Sale
+from .models import DispatchOrder, Quote, Sale
 from .serializers import (
+    DispatchOrderCreateSerializer,
+    DispatchOrderSerializer,
+    DispatchStatusSerializer,
+    InvoiceInputSerializer,
+    QuoteConvertSerializer,
     QuoteCreateSerializer,
     QuoteSerializer,
     SaleCreateSerializer,
     SaleSerializer,
 )
 from .services import (
+    DispatchValidationError,
     QuoteValidationError,
     SaleValidationError,
+    convert_quote_to_sale,
+    create_dispatch_order,
     create_quote,
     create_sale,
+    invoice_sale,
+    suggest_invoice_numbers,
+    update_dispatch_order,
     void_sale,
 )
 
@@ -52,13 +66,19 @@ class SaleViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "head", "options"]
 
     def get_permissions(self):
-        # Registrar requiere capacidad de vender; anular, ser gerente; consultar,
-        # cualquier rol operativo (incluido el encargado de inventario).
-        if self.action == "create":
+        # Registrar/facturar requieren capacidad de vender; anular, ser gerente;
+        # consultar, cualquier rol operativo (incluido el encargado de inventario).
+        if self.action in ("create", "facturar", "siguiente_factura"):
             return [IsSeller()]
         if self.action == "anular":
             return [IsManager()]
         return super().get_permissions()
+
+    def get_parsers(self):
+        # Facturar puede traer el archivo de la factura (multipart); el resto es JSON.
+        if getattr(self, "action", None) == "facturar":
+            return [MultiPartParser(), FormParser(), JSONParser()]
+        return super().get_parsers()
 
     def get_serializer_class(self):
         return SaleCreateSerializer if self.action == "create" else SaleSerializer
@@ -66,7 +86,7 @@ class SaleViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = (
             Sale.objects.select_related("customer", "seller", "seller__user__profile")
-            .prefetch_related("items__product")
+            .prefetch_related("items__product", "source_quote", "dispatch_orders")
             .order_by("-sale_date", "-created_at")
         )
         params = self.request.query_params
@@ -122,6 +142,7 @@ class SaleViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        quote = data.get("quote")
         try:
             sale = create_sale(
                 seller=seller,
@@ -132,6 +153,8 @@ class SaleViewSet(viewsets.ModelViewSet):
                 sale_type=data.get("sale_type") or Sale.TypeChoices.RETAIL,
                 status=data.get("status") or Sale.StatusChoices.COMPLETED,
                 notes=data.get("notes", ""),
+                iva_rate=data.get("iva_rate"),
+                quote=quote,
             )
         except (SaleValidationError, InsufficientStockError) as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -141,7 +164,9 @@ class SaleViewSet(viewsets.ModelViewSet):
             action=ActionChoices.SALE_CREATE,
             description=(
                 f"Registró la venta #{sale.pk} por {sale.total_sale_usd} USD "
-                f"a {sale.customer.company_name}."
+                f"a {sale.customer.company_name}"
+                + (f" (desde el presupuesto {quote.quote_number})" if quote else "")
+                + "."
             ),
             target=sale,
             metadata={
@@ -150,9 +175,13 @@ class SaleViewSet(viewsets.ModelViewSet):
                 "seller": seller.user.username if seller and seller.user_id else None,
                 "items": sale.items.count(),
                 "sale_type": sale.sale_type,
+                "quote_number": quote.quote_number if quote else None,
             },
         )
-        return Response(SaleSerializer(sale).data, status=status.HTTP_201_CREATED)
+        return Response(
+            SaleSerializer(sale, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=True, methods=["post"])  # permiso resuelto en get_permissions
     def anular(self, request, pk=None):
@@ -171,7 +200,53 @@ class SaleViewSet(viewsets.ModelViewSet):
             target=sale,
             metadata={"total_usd": str(sale.total_sale_usd), "customer": sale.customer.company_name},
         )
-        return Response(SaleSerializer(sale).data, status=status.HTTP_200_OK)
+        return Response(
+            SaleSerializer(sale, context=self.get_serializer_context()).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["get"], url_path="siguiente-factura")
+    def siguiente_factura(self, request):
+        """Sugiere el siguiente número correlativo de factura y de control."""
+        return Response(suggest_invoice_numbers(), status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"])  # permiso resuelto en get_permissions
+    def facturar(self, request, pk=None):
+        """Asocia los datos fiscales (nº factura, nº control, adjunto) a la venta."""
+        sale = self.get_object()
+        serializer = InvoiceInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            invoice_sale(
+                sale=sale,
+                invoice_number=data["invoice_number"],
+                control_number=data["control_number"],
+                invoice_date=data.get("invoice_date"),
+                invoice_file=data.get("invoice_file"),
+                user=request.user,
+            )
+        except SaleValidationError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        audit.log(
+            request=request,
+            action=ActionChoices.SALE_INVOICE,
+            description=(
+                f"Facturó la venta #{sale.pk} de {sale.customer.company_name} "
+                f"(factura {sale.invoice_number}, control {sale.control_number})."
+            ),
+            target=sale,
+            metadata={
+                "invoice_number": sale.invoice_number,
+                "control_number": sale.control_number,
+                "has_file": bool(sale.invoice_file),
+            },
+        )
+        return Response(
+            SaleSerializer(sale, context=self.get_serializer_context()).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 class QuoteViewSet(viewsets.ModelViewSet):
@@ -190,7 +265,7 @@ class QuoteViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "head", "options"]
 
     def get_permissions(self):
-        if self.action == "create":
+        if self.action in ("create", "convertir"):
             return [IsSeller()]
         return super().get_permissions()
 
@@ -212,6 +287,14 @@ class QuoteViewSet(viewsets.ModelViewSet):
         customer = params.get("customer")
         if customer:
             qs = qs.filter(customer_id=customer)
+
+        # `convertible=true`: presupuestos vigentes que aún pueden convertirse en venta
+        # (no convertidos ni rechazados; sin vencer). Alimenta el buscador del formulario
+        # de venta para relacionar un presupuesto.
+        if str(params.get("convertible", "")).lower() in ("1", "true", "yes"):
+            qs = qs.filter(converted_to_sale__isnull=True).exclude(
+                status__in=[Quote.StatusChoices.CONVERTED, Quote.StatusChoices.REJECTED]
+            ).filter(Q(expiry_date__isnull=True) | Q(expiry_date__gte=date.today()))
 
         date_from = params.get("date_from")
         if date_from:
@@ -277,3 +360,169 @@ class QuoteViewSet(viewsets.ModelViewSet):
             },
         )
         return Response(QuoteSerializer(quote).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])  # permiso resuelto en get_permissions
+    def convertir(self, request, pk=None):
+        """Convierte el presupuesto en una venta real (descuenta inventario)."""
+        quote = self.get_object()
+        serializer = QuoteConvertSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        # Vendedor: el explícito (si es gerente), si no el del presupuesto, si no el
+        # del usuario autenticado (para que un vendedor convierta un presupuesto sin
+        # vendedor asignado).
+        explicit = data.get("seller")
+        seller = explicit if (explicit and _is_manager(request.user)) else None
+        if seller is None:
+            seller = quote.seller or Seller.objects.filter(user=request.user, is_active=True).first()
+
+        try:
+            sale = convert_quote_to_sale(
+                quote=quote,
+                user=request.user,
+                seller=seller,
+                sale_date=data.get("sale_date"),
+                sale_type=data.get("sale_type"),
+            )
+        except (QuoteValidationError, SaleValidationError, InsufficientStockError) as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        audit.log(
+            request=request,
+            action=ActionChoices.QUOTE_CONVERT,
+            description=(
+                f"Convirtió el presupuesto {quote.quote_number} en la venta #{sale.pk} "
+                f"({sale.total_sale_usd} USD) a {sale.customer.company_name}."
+            ),
+            target=sale,
+            metadata={
+                "quote_number": quote.quote_number,
+                "sale_id": sale.pk,
+                "total_usd": str(sale.total_sale_usd),
+                "customer": sale.customer.company_name,
+            },
+        )
+        return Response(
+            {
+                "sale": SaleSerializer(sale, context=self.get_serializer_context()).data,
+                "quote": QuoteSerializer(quote).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class DispatchOrderViewSet(viewsets.ModelViewSet):
+    """Órdenes de despacho: documento de control de entrega de una venta.
+
+    - GET  /api/dispatch-orders/            → listado (paginado, filtrable).
+    - POST /api/dispatch-orders/            → genera una orden desde una venta.
+    - GET  /api/dispatch-orders/{id}/       → detalle con sus líneas.
+    - POST /api/dispatch-orders/{id}/estado → actualiza estado/datos de entrega.
+
+    Acceso: **consultar** e **imprimir** es para todo el personal operativo; **crear**
+    y **actualizar el estado** también (almacén, vendedor, gerente/admin). No mueve
+    inventario: el stock ya se descontó al registrar la venta.
+    """
+
+    permission_classes = [IsOperational]
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_serializer_class(self):
+        return DispatchOrderCreateSerializer if self.action == "create" else DispatchOrderSerializer
+
+    def get_queryset(self):
+        qs = (
+            DispatchOrder.objects.select_related("sale", "sale__customer", "sale__seller", "created_by")
+            .prefetch_related("items__product")
+            .order_by("-created_at")
+        )
+        params = self.request.query_params
+
+        status_param = params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+
+        sale = params.get("sale")
+        if sale:
+            qs = qs.filter(sale_id=sale)
+
+        search = (params.get("search") or "").strip()
+        if search:
+            qs = qs.filter(
+                Q(order_number__icontains=search)
+                | Q(sale__customer__company_name__icontains=search)
+            )
+
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        serializer = DispatchOrderCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            order = create_dispatch_order(
+                sale=data["sale"],
+                user=request.user,
+                items=data.get("items") or None,
+                dispatch_date=data.get("dispatch_date"),
+                delivery_address=data.get("delivery_address", ""),
+                carrier=data.get("carrier", ""),
+                notes=data.get("notes", ""),
+                status=data.get("status") or DispatchOrder.StatusChoices.PENDING,
+            )
+        except DispatchValidationError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        audit.log(
+            request=request,
+            action=ActionChoices.DISPATCH_CREATE,
+            description=(
+                f"Generó la orden de despacho {order.order_number} "
+                f"para la venta #{order.sale_id} ({order.sale.customer.company_name})."
+            ),
+            target=order,
+            metadata={
+                "order_number": order.order_number,
+                "sale_id": order.sale_id,
+                "items": order.items.count(),
+            },
+        )
+        return Response(
+            DispatchOrderSerializer(order, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"])  # IsOperational
+    def estado(self, request, pk=None):
+        """Actualiza el estado y/o los datos de entrega de la orden."""
+        order = self.get_object()
+        serializer = DispatchStatusSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if not data:
+            return Response({"error": "No se enviaron cambios."}, status=status.HTTP_400_BAD_REQUEST)
+
+        update_dispatch_order(
+            order=order,
+            status=data.get("status"),
+            dispatch_date=data.get("dispatch_date"),
+            carrier=data.get("carrier"),
+            received_by=data.get("received_by"),
+            notes=data.get("notes"),
+        )
+        audit.log(
+            request=request,
+            action=ActionChoices.DISPATCH_UPDATE,
+            description=(
+                f"Actualizó la orden de despacho {order.order_number} "
+                f"(estado: {order.get_status_display()})."
+            ),
+            target=order,
+            metadata={"order_number": order.order_number, "status": order.status},
+        )
+        return Response(
+            DispatchOrderSerializer(order, context=self.get_serializer_context()).data,
+            status=status.HTTP_200_OK,
+        )

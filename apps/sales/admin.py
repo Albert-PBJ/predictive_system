@@ -1,6 +1,13 @@
 from django.contrib import admin
 
-from .models import Quote, QuoteItem, Sale, SaleItem
+from .models import (
+    DispatchOrder,
+    DispatchOrderItem,
+    Quote,
+    QuoteItem,
+    Sale,
+    SaleItem,
+)
 
 
 class SaleItemInline(admin.TabularInline):
@@ -10,11 +17,24 @@ class SaleItemInline(admin.TabularInline):
 
 @admin.register(Sale)
 class SaleAdmin(admin.ModelAdmin):
-    list_display = ("pk", "customer", "seller", "sale_date", "total_sale_usd", "total_profit_usd", "status")
+    list_display = ("pk", "customer", "seller", "sale_date", "total_sale_usd", "total_profit_usd", "invoice_number", "status")
     list_filter = ("status", "sale_type", "sale_date")
-    search_fields = ("customer__company_name", "seller__first_name", "seller__last_name")
+    search_fields = ("customer__company_name", "seller__first_name", "seller__last_name", "invoice_number", "control_number")
     date_hierarchy = "sale_date"
     inlines = [SaleItemInline]
+
+
+class DispatchOrderItemInline(admin.TabularInline):
+    model = DispatchOrderItem
+    extra = 0
+
+
+@admin.register(DispatchOrder)
+class DispatchOrderAdmin(admin.ModelAdmin):
+    list_display = ("order_number", "sale", "status", "dispatch_date", "created_by", "created_at")
+    list_filter = ("status", "dispatch_date")
+    search_fields = ("order_number", "sale__customer__company_name")
+    inlines = [DispatchOrderItemInline]
 
 
 class QuoteItemInline(admin.TabularInline):

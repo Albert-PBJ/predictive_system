@@ -146,6 +146,12 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 
+# Archivos subidos por los usuarios (p. ej. el adjunto de la factura fiscal). En
+# desarrollo se sirven desde MEDIA_ROOT (ver urls.py); en producción los sirve el
+# servidor web / almacenamiento de objetos.
+MEDIA_URL = "media/"
+MEDIA_ROOT = Path(os.environ.get("MEDIA_ROOT", BASE_DIR / "media"))
+
 
 # Django REST Framework + JWT
 # https://www.django-rest-framework.org/ | https://django-rest-framework-simplejwt.readthedocs.io/

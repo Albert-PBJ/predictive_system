@@ -1061,6 +1061,11 @@ class Command(BaseCommand):
             total_disc += line_disc
         profit = d2(total_sale - total_cost)
         commission = d2(profit * seller.commission_rate / Decimal("100"))
+        # Desglose de IVA (16% sobre la base imponible = total_sale). La base sigue
+        # siendo total_sale_usd (lo que consume la analítica); el total a pagar lleva IVA.
+        iva_rate = Decimal("16")
+        iva_amount = d2(total_sale * iva_rate / Decimal("100"))
+        total_with_iva = d2(total_sale + iva_amount)
         if status is None:
             roll = self.rng.random()
             status = (Sale.StatusChoices.CANCELLED if roll < 0.04
@@ -1070,6 +1075,8 @@ class Command(BaseCommand):
                     status=status, total_sale_usd=d2(total_sale), total_cost_usd=d2(total_cost),
                     total_profit_usd=profit, total_discount_usd=d2(total_disc),
                     total_sale_ves=d2(total_sale * par), commission_usd=commission,
+                    iva_rate=iva_rate, iva_amount_usd=iva_amount,
+                    total_with_iva_usd=total_with_iva, total_with_iva_ves=d2(total_with_iva * par),
                     bcv_rate=bcv, parallel_rate=par, items=items)
 
     def _basket(self, d, segment):

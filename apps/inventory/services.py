@@ -69,4 +69,60 @@ def apply_movement(
 
     locked.stock = new_stock
     locked.save(update_fields=["stock", "updated_at"])
+
+    # Alerta persistente de reabastecimiento: cada vez que el stock cae en o por
+    # debajo del mínimo se registra/actualiza una alerta de quiebre de stock (y se
+    # resuelve al recuperarse). Es best-effort: nunca debe romper el movimiento.
+    _sync_low_stock_alert(locked)
     return movement
+
+
+def _sync_low_stock_alert(product):
+    """Crea o resuelve la alerta de stock bajo de un producto según su nivel actual.
+
+    Si el stock cae en o por debajo de ``min_stock`` se registra una alerta de
+    ``STOCK_BREAK`` no resuelta (crítica si quedó en 0, de advertencia si no),
+    deduplicada por producto. Si el stock vuelve por encima del mínimo, se resuelven
+    las alertas abiertas de ese producto. Envuelto en try/except: el registro de una
+    alerta jamás debe interrumpir el movimiento de inventario que la origina.
+    """
+    try:
+        # Los servicios no llevan inventario; un mínimo de 0 significa "sin control".
+        if getattr(product, "is_service", False) or not product.min_stock:
+            return
+
+        from apps.analytics.models import Alert
+
+        title = f"Stock bajo: {product.name}"
+        if product.stock <= product.min_stock:
+            severity = (
+                Alert.SeverityChoices.CRITICAL
+                if product.stock <= 0
+                else Alert.SeverityChoices.WARNING
+            )
+            estado = "sin stock" if product.stock <= 0 else f"{product.stock} unidad(es)"
+            message = (
+                f"El producto '{product.name}' (SKU {product.sku or '—'}) tiene {estado}, "
+                f"en o por debajo de su mínimo de {product.min_stock}. Conviene reabastecer."
+            )
+            alert, created = Alert.objects.get_or_create(
+                alert_type=Alert.TypeChoices.STOCK_BREAK,
+                title=title,
+                is_resolved=False,
+                defaults={"severity": severity, "message": message},
+            )
+            if not created and (alert.severity != severity or alert.message != message):
+                alert.severity = severity
+                alert.message = message
+                alert.save(update_fields=["severity", "message"])
+        else:
+            # Recuperó nivel: resuelve las alertas abiertas de ese producto.
+            Alert.objects.filter(
+                alert_type=Alert.TypeChoices.STOCK_BREAK,
+                title=title,
+                is_resolved=False,
+            ).update(is_resolved=True)
+    except Exception:  # noqa: BLE001 — auditar/alertar nunca debe romper la operación
+        import logging
+
+        logging.getLogger("apps").warning("No se pudo sincronizar la alerta de stock bajo", exc_info=True)

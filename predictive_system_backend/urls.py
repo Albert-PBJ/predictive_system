@@ -15,6 +15,8 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 
+from django.conf import settings
+from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import path, include
 
@@ -31,3 +33,7 @@ urlpatterns = [
     path("api/audit/", include("apps.audit.urls")),
     path("scrapers/", include("apps.competitor_market_data.urls")),
 ]
+
+# En desarrollo, Django sirve los archivos subidos (adjuntos de factura, etc.).
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

@@ -16,7 +16,14 @@ from apps.core.models import ExchangeRate, Product
 from apps.inventory.models import InventoryMovement
 from apps.inventory.services import InsufficientStockError, apply_movement
 
-from .models import Quote, QuoteItem, Sale, SaleItem
+from .models import (
+    DispatchOrder,
+    DispatchOrderItem,
+    Quote,
+    QuoteItem,
+    Sale,
+    SaleItem,
+)
 
 CENTS = Decimal("0.01")
 
@@ -57,6 +64,8 @@ def create_sale(
     sale_type=Sale.TypeChoices.RETAIL,
     status=Sale.StatusChoices.COMPLETED,
     notes="",
+    iva_rate=None,
+    quote=None,
 ):
     """Crea una venta con sus líneas y descuenta el inventario, todo atómicamente.
 
@@ -115,6 +124,13 @@ def create_sale(
     rate = _latest_rate()
     eff_rate = _effective_rate(rate)
 
+    # IVA por defecto desde la Configuración del Sistema (16%) si no se indica.
+    if iva_rate is None:
+        from apps.core import system_settings
+
+        iva_rate = system_settings.default_iva_pct()
+    iva_rate = Decimal(str(iva_rate))
+
     sale = Sale.objects.create(
         customer=customer,
         seller=seller,
@@ -122,6 +138,7 @@ def create_sale(
         sale_type=sale_type,
         status=status,
         notes=notes,
+        iva_rate=iva_rate,
         bcv_rate=rate.bcv_rate if rate else None,
         parallel_rate=rate.parallel_rate if rate else None,
     )
@@ -189,12 +206,20 @@ def create_sale(
     commission_rate = seller.commission_rate or Decimal("0")
     commission = _money(total_profit * commission_rate / Decimal("100"))
 
+    # Desglose de IVA sobre la base imponible (total_sale). El total a pagar es
+    # base + IVA; la analítica sigue leyendo `total_sale_usd` (la base), intacta.
+    iva_amount = _money(total_sale * iva_rate / Decimal("100"))
+    total_with_iva = total_sale + iva_amount
+
     sale.total_sale_usd = total_sale
     sale.total_cost_usd = total_cost
     sale.total_profit_usd = total_profit
     sale.total_discount_usd = total_discount
     sale.commission_usd = commission
+    sale.iva_amount_usd = iva_amount
+    sale.total_with_iva_usd = total_with_iva
     sale.total_sale_ves = _money(total_sale * eff_rate) if eff_rate else None
+    sale.total_with_iva_ves = _money(total_with_iva * eff_rate) if eff_rate else None
     sale.save(
         update_fields=[
             "total_sale_usd",
@@ -202,11 +227,42 @@ def create_sale(
             "total_profit_usd",
             "total_discount_usd",
             "commission_usd",
+            "iva_amount_usd",
+            "total_with_iva_usd",
             "total_sale_ves",
+            "total_with_iva_ves",
             "updated_at",
         ]
     )
+
+    # Si la venta se registró a partir de un presupuesto, se cierra la relación
+    # cotización→venta (mismo enlace que la acción "Convertir a venta").
+    if quote is not None:
+        _link_quote_to_sale(quote, sale)
     return sale
+
+
+def _link_quote_to_sale(quote, sale):
+    """Enlaza un presupuesto con la venta generada y lo marca como convertido.
+
+    Punto único usado por ``create_sale`` (registro con presupuesto relacionado) y por
+    ``convert_quote_to_sale`` (conversión desde el propio presupuesto). Valida que el
+    presupuesto no esté ya convertido a otra venta y que pertenezca al mismo cliente.
+    """
+    if (
+        quote.status == Quote.StatusChoices.CONVERTED or quote.converted_to_sale_id
+    ) and quote.converted_to_sale_id != sale.pk:
+        ref = f" a la venta #{quote.converted_to_sale_id}" if quote.converted_to_sale_id else ""
+        raise SaleValidationError(
+            f"El presupuesto {quote.quote_number} ya está convertido{ref} y no puede relacionarse de nuevo."
+        )
+    if quote.customer_id != sale.customer_id:
+        raise SaleValidationError(
+            f"El presupuesto {quote.quote_number} pertenece a otro cliente y no puede relacionarse con esta venta."
+        )
+    quote.converted_to_sale = sale
+    quote.status = Quote.StatusChoices.CONVERTED
+    quote.save(update_fields=["converted_to_sale", "status", "updated_at"])
 
 
 @transaction.atomic
@@ -236,6 +292,82 @@ def void_sale(*, sale, user):
     stamp = f"[Anulada por {user.username}]"
     sale.notes = f"{sale.notes}\n{stamp}".strip() if sale.notes else stamp
     sale.save(update_fields=["status", "notes", "updated_at"])
+    return sale
+
+
+# --------------------------------------------------------------------------- #
+# Facturación fiscal
+# --------------------------------------------------------------------------- #
+# En Venezuela el número de factura y el número de control provienen del bloc/
+# máquina fiscal autorizada por el SENIAT: los captura el usuario. El sistema solo
+# sugiere el siguiente correlativo (a partir de los ya registrados) y valida que sean
+# únicos. Facturar es un paso OPCIONAL y posterior al registro de la venta.
+
+
+def _next_correlative(values, pad: int = 8) -> str:
+    """Siguiente número correlativo a partir de una lista de valores ya usados.
+
+    Toma los dígitos de cada valor, halla el máximo y suma 1, con relleno de ceros.
+    Ignora prefijos/sufijos no numéricos. Si no hay ninguno, arranca en 1.
+    """
+    import re
+
+    max_n = 0
+    for v in values:
+        if not v:
+            continue
+        digits = re.sub(r"\D", "", str(v))
+        if digits:
+            max_n = max(max_n, int(digits))
+    return str(max_n + 1).zfill(pad)
+
+
+def suggest_invoice_numbers() -> dict:
+    """Sugiere el siguiente número de factura y de control (correlativos)."""
+    invoices = Sale.objects.exclude(invoice_number__isnull=True).values_list(
+        "invoice_number", flat=True
+    )
+    controls = Sale.objects.exclude(control_number__isnull=True).values_list(
+        "control_number", flat=True
+    )
+    return {
+        "invoice_number": _next_correlative(invoices),
+        "control_number": _next_correlative(controls),
+    }
+
+
+@transaction.atomic
+def invoice_sale(*, sale, invoice_number, control_number, user, invoice_date=None, invoice_file=None):
+    """Asocia los datos fiscales (factura, control, adjunto) a una venta ya registrada.
+
+    Valida que la venta no esté anulada y que los números no colisionen con otra
+    venta. `invoice_file` es opcional (PDF o imagen). Lanza `SaleValidationError`
+    ante datos inválidos. Es idempotente en el sentido de que permite corregir los
+    datos de una venta ya facturada (se sobrescriben).
+    """
+    if sale.status == Sale.StatusChoices.CANCELLED:
+        raise SaleValidationError("No se puede facturar una venta anulada.")
+
+    invoice_number = (invoice_number or "").strip()
+    control_number = (control_number or "").strip()
+    if not invoice_number:
+        raise SaleValidationError("El número de factura es obligatorio.")
+    if not control_number:
+        raise SaleValidationError("El número de control es obligatorio.")
+
+    clash = Sale.objects.filter(invoice_number=invoice_number).exclude(pk=sale.pk).exists()
+    if clash:
+        raise SaleValidationError(f"El número de factura '{invoice_number}' ya está en uso en otra venta.")
+    clash = Sale.objects.filter(control_number=control_number).exclude(pk=sale.pk).exists()
+    if clash:
+        raise SaleValidationError(f"El número de control '{control_number}' ya está en uso en otra venta.")
+
+    sale.invoice_number = invoice_number
+    sale.control_number = control_number
+    sale.invoice_date = invoice_date or sale.sale_date
+    if invoice_file is not None:
+        sale.invoice_file = invoice_file
+    sale.save(update_fields=["invoice_number", "control_number", "invoice_date", "invoice_file", "updated_at"])
     return sale
 
 
@@ -383,3 +515,178 @@ def create_quote(
         except IntegrityError:
             continue
     raise QuoteValidationError("No se pudo generar un número de presupuesto único. Intenta de nuevo.")
+
+
+@transaction.atomic
+def convert_quote_to_sale(
+    *,
+    quote,
+    user,
+    seller=None,
+    sale_date=None,
+    sale_type=None,
+    status=Sale.StatusChoices.COMPLETED,
+):
+    """Convierte un presupuesto aprobado en una venta real (descuenta inventario).
+
+    Reutiliza ``create_sale`` con las líneas del presupuesto (cada línea conserva su
+    precio unitario negociado). Marca el presupuesto como ``CONVERTED`` y lo enlaza a
+    la venta generada (``converted_to_sale``), cerrando la relación cotización→venta.
+    Lanza ``QuoteValidationError`` si ya fue convertido o no tiene líneas; los errores
+    de stock de ``create_sale`` (``SaleValidationError``) se propagan.
+    """
+    # Ya convertido: por el FK a la venta o por el estado CONVERTED (los presupuestos
+    # sembrados se etiquetan CONVERTED sin una venta enlazada — no se deben reconvertir).
+    if quote.status == Quote.StatusChoices.CONVERTED or quote.converted_to_sale_id:
+        ref = f" a la venta #{quote.converted_to_sale_id}" if quote.converted_to_sale_id else ""
+        raise QuoteValidationError(
+            f"El presupuesto {quote.quote_number} ya está convertido{ref}."
+        )
+    if quote.status == Quote.StatusChoices.REJECTED:
+        raise QuoteValidationError("No se puede convertir un presupuesto rechazado.")
+
+    seller = seller or quote.seller
+    if seller is None:
+        raise QuoteValidationError(
+            "El presupuesto no tiene un vendedor asociado; no se puede convertir en venta. "
+            "Asigna un vendedor o conviértelo desde una cuenta con perfil de vendedor."
+        )
+
+    items = [
+        {"product": qi.product_id, "quantity": qi.quantity, "unit_sale_price_usd": qi.unit_price_usd}
+        for qi in quote.items.all()
+    ]
+    if not items:
+        raise QuoteValidationError("El presupuesto no tiene líneas para convertir.")
+
+    sale = create_sale(
+        seller=seller,
+        customer=quote.customer,
+        items=items,
+        user=user,
+        sale_date=sale_date,
+        sale_type=sale_type or Sale.TypeChoices.INSTITUTIONAL,
+        status=status,
+        iva_rate=quote.iva_rate,
+        notes=f"Generada a partir del presupuesto {quote.quote_number}.",
+        quote=quote,  # cierra la relación cotización→venta (vía _link_quote_to_sale)
+    )
+    return sale
+
+
+# --------------------------------------------------------------------------- #
+# Órdenes de despacho
+# --------------------------------------------------------------------------- #
+# Una orden de despacho es un documento de control de entrega. NO mueve inventario
+# (el stock ya se descontó al vender): solo lista la mercancía a entregar, con un
+# número correlativo propio (OD-DDMMYYYY-N) y un estado (pendiente → despachada →
+# entregada). Se puede imprimir para las firmas físicas de almacén y despacho.
+
+
+class DispatchValidationError(Exception):
+    """Error de negocio al crear/actualizar una orden de despacho (HTTP 400)."""
+
+
+def _next_dispatch_number(created_date, offset: int = 0) -> str:
+    """Número de orden de despacho correlativo del día: ``OD-DDMMYYYY-N``."""
+    prefix = "OD-" + created_date.strftime("%d%m%Y")
+    existing = DispatchOrder.objects.filter(order_number__startswith=f"{prefix}-").values_list(
+        "order_number", flat=True
+    )
+    max_n = 0
+    for on in existing:
+        try:
+            max_n = max(max_n, int(on.rsplit("-", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return f"{prefix}-{max_n + 1 + offset}"
+
+
+@transaction.atomic
+def create_dispatch_order(
+    *,
+    sale,
+    user,
+    items=None,
+    dispatch_date=None,
+    delivery_address="",
+    carrier="",
+    notes="",
+    status=DispatchOrder.StatusChoices.PENDING,
+):
+    """Genera una orden de despacho para una venta (sin tocar inventario).
+
+    ``items`` es una lista opcional de ``{"product": <id>, "quantity": <int>}``; si se
+    omite, se toman las líneas de productos físicos de la venta (los servicios no se
+    despachan). Valida que la venta no esté anulada y que las cantidades sean válidas.
+    """
+    if sale.status == Sale.StatusChoices.CANCELLED:
+        raise DispatchValidationError("No se puede generar una orden de despacho de una venta anulada.")
+
+    # Por defecto, las líneas físicas de la venta (los servicios no se despachan).
+    if not items:
+        items = [
+            {"product": si.product_id, "quantity": si.quantity}
+            for si in sale.items.select_related("product")
+            if not si.product.is_service
+        ]
+    if not items:
+        raise DispatchValidationError("No hay mercancía física para despachar en esta venta.")
+
+    normalized = []
+    for it in items:
+        qty = int(it.get("quantity") or 0)
+        if qty < 1:
+            raise DispatchValidationError("Cada línea de la orden debe tener una cantidad de al menos 1.")
+        normalized.append({"product_id": it["product"], "quantity": qty})
+
+    created_date = dispatch_date or date.today()
+    fields = dict(
+        sale=sale,
+        status=status,
+        dispatch_date=dispatch_date,
+        delivery_address=delivery_address or "",
+        carrier=carrier or "",
+        notes=notes or "",
+        created_by=user,
+    )
+
+    for attempt in range(6):
+        number = _next_dispatch_number(created_date, attempt)
+        try:
+            with transaction.atomic():
+                order = DispatchOrder.objects.create(order_number=number, **fields)
+                DispatchOrderItem.objects.bulk_create([
+                    DispatchOrderItem(
+                        dispatch_order=order,
+                        product_id=n["product_id"],
+                        quantity=n["quantity"],
+                    )
+                    for n in normalized
+                ])
+            return order
+        except IntegrityError:
+            continue
+    raise DispatchValidationError("No se pudo generar un número de orden único. Intenta de nuevo.")
+
+
+def update_dispatch_order(*, order, status=None, dispatch_date=None, carrier=None, received_by=None, notes=None):
+    """Actualiza el estado y/o los datos de entrega de una orden de despacho."""
+    update_fields = ["updated_at"]
+    if status is not None:
+        order.status = status
+        update_fields.append("status")
+    if dispatch_date is not None:
+        order.dispatch_date = dispatch_date
+        update_fields.append("dispatch_date")
+    if carrier is not None:
+        order.carrier = carrier
+        update_fields.append("carrier")
+    if received_by is not None:
+        order.received_by = received_by
+        update_fields.append("received_by")
+    if notes is not None:
+        order.notes = notes
+        update_fields.append("notes")
+    order.save(update_fields=update_fields)
+    return order
