@@ -34,7 +34,10 @@ python manage.py seed_demo_data
 # 2022 sales, a real May-2026 quote) and generates a coherent operating history on top:
 # monthly BCV+parallel exchange rates following the real bolívar trajectory, price history,
 # ~2k sales with line items (each carrying its DISCOUNT: list price, %, total), append-only
-# inventory movements (stock = Σ movements, never negative), and quotes.
+# inventory movements (stock = Σ movements, never negative), and quotes. A final metadata-only
+# step (_link_and_invoice_sales) numbers the fiscal invoice+control on completed sales (recent
+# ~15 days left unfacturado) and links each CONVERTED quote to an existing same-customer sale
+# WITHOUT creating sales — so the ML series/metrics are unaffected (see that method's docstring).
 #
 # The synthetic data tells a deliberate BUSINESS STORY so the system has a problem to solve,
 # while staying LEARNABLE (good R²): RETAIL stagnates/declines (small customers leave for
@@ -46,8 +49,8 @@ python manage.py seed_demo_data
 # (retail ~5%, projects ~11%), and quote conversion is feature-driven (installation/deal-size/
 # customer-type/rate-shock) with a sharpened, separable label. Evaluated on an out-of-time
 # 80/20 holdout (most recent 20% = test; TEST_FRACTION in apps/analytics/ml/forecasters.py):
-# tasa ≈0.85, precio ≈0.92, conversión acc ≈0.83 clear 0.80; ventas ≈0.51, utilidad ≈0.59,
-# demanda ≈0.64 are low-signal/high-variance (R² swings ~0.1-0.6 across re-seeds), reported
+# tasa ≈0.85, precio ≈0.92, conversión acc ≈0.83 clear 0.80; ventas ≈0.63, utilidad ≈0.67,
+# demanda ≈0.66 are low-signal/high-variance (R² swings ~0.1-0.6 across re-seeds), reported
 # honestly with RMSE/MAE. The low synthetic noise is a disclosed DATA-DESIGN choice (see the
 # seed_company_data docstring) — raises the achievable ceiling, structure/story untouched.
 #
@@ -58,6 +61,7 @@ python manage.py seed_company_data                 # carga completa (recomendado
 python manage.py seed_company_data --scale 1.5     # más volumen de ventas
 python manage.py seed_company_data --purge-demo    # elimina además los datos de seed_demo_data
 python manage.py seed_company_data --no-fresh      # añade sin borrar la historia previa
+python manage.py seed_company_data --update-only    # NO borra/regenera: solo actualiza sobre lo existente (nº factura/control + enlace presupuesto→venta)
 python manage.py seed_company_data --resources "C:/ruta/resources" --seed 7
 
 # Genera datos de mercado de competidores SIMULADOS para los 10 principales del
@@ -384,9 +388,9 @@ reported honestly:
 | Exchange rate (BCV) | Regression | **R² ≈ 0.85** | clean log-linear trend |
 | Product price | Regression | **R² ≈ 0.92** | smooth monthly USD ramp |
 | Quote conversion | Decision Tree | **acc ≈ 0.83** (prec ≈ 0.91) | feature-separable label |
-| Demand | XGBoost | R² ≈ 0.64 | low-signal (per-product counts) |
-| Profit (utilidad) | Regression | R² ≈ 0.59 | tracks revenue |
-| Revenue (ventas) | Regression | R² ≈ 0.51 | shock-dominated |
+| Demand | XGBoost | R² ≈ 0.66 | low-signal (per-product counts) |
+| Profit (utilidad) | Regression | R² ≈ 0.67 | tracks revenue |
+| Revenue (ventas) | Regression | R² ≈ 0.63 | shock-dominated |
 
 **Framing the low-R² series (ventas/utilidad/demanda) for a jury.** These are genuinely
 **low-signal / high-variance** economic series — their R² swings ~0.1–0.6 across re-seeds because

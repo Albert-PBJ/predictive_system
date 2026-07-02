@@ -43,8 +43,8 @@ Combina dos fuentes:
    MENSUAL (antes ~cada 5 meses) con ±0,3% de ruido, lo que vuelve la serie de precio
    claramente aprendible. Es una decisión de diseño de DATOS sintéticos, no del modelo:
    sube el techo de R²/exactitud alcanzable por cualquier estimador. Resultados con split
-   80/20: tasa ≈0,85, precio ≈0,92, conversión acc ≈0,83 (≥0,80); ventas ≈0,51,
-   utilidad ≈0,59, demanda ≈0,64 — estas tres son series de baja señal y alta varianza
+   80/20: tasa ≈0,85, precio ≈0,92, conversión acc ≈0,83 (≥0,80); ventas ≈0,63,
+   utilidad ≈0,67, demanda ≈0,66 — estas tres son series de baja señal y alta varianza
    (su R² oscila ~0,1–0,6 entre semillas) que resisten subir más sin volver los datos
    irreales, así que se reportan con honestidad junto a RMSE/MAE.
 
@@ -83,7 +83,7 @@ from apps.core.models import (
     ProductPriceHistory, Seller,
 )
 from apps.inventory.models import InventoryMovement
-from apps.sales.models import Quote, QuoteItem, Sale, SaleItem
+from apps.sales.models import DispatchOrder, Quote, QuoteItem, Sale, SaleItem
 
 # --------------------------------------------------------------------------- #
 #  Constantes de la empresa (datos reales tomados de los archivos)            #
@@ -668,6 +668,11 @@ class Command(BaseCommand):
                             help="Multiplicador del volumen de ventas sintéticas (def. 1.0).")
         parser.add_argument("--no-fresh", action="store_true",
                             help="No borrar la historia transaccional existente antes de generar.")
+        parser.add_argument("--update-only", action="store_true",
+                            help="No borra ni regenera nada: solo ACTUALIZA sobre los datos "
+                                 "existentes lo que es idempotente (nº factura/control de las "
+                                 "ventas completadas y el enlace presupuesto→venta). Útil para "
+                                 "aplicar la capa fiscal sin perder los datos de prueba.")
         parser.add_argument("--purge-demo", action="store_true",
                             help="Eliminar también los productos/clientes de seed_demo_data.")
         parser.add_argument("--seed", type=int, default=42,
@@ -693,6 +698,17 @@ class Command(BaseCommand):
         self._svc_rng = random.Random(opt["seed"] + 7)
         self.rates = RateModel()
         openpyxl = _load_openpyxl()
+
+        # Modo actualización: no borra ni regenera; solo aplica sobre los datos
+        # existentes las actualizaciones idempotentes (facturación + enlace de
+        # presupuestos). No necesita los recursos ni toca el catálogo/clientes/ventas.
+        if opt.get("update_only"):
+            self.stdout.write(self.style.MIGRATE_HEADING(
+                "Modo actualización (--update-only): no se borra ni regenera nada."))
+            with transaction.atomic():
+                self._link_and_invoice_sales()
+            self.stdout.write(self.style.SUCCESS("Actualización completada."))
+            return
 
         res = Path(opt["resources"]) if opt["resources"] else (settings.BASE_DIR.parent / "resources")
         if not res.exists():
@@ -728,6 +744,12 @@ class Command(BaseCommand):
             # data principal queda intacta y solo se suma una capa suave a las series.
             self._build_maintenance(active, sellers)
 
+            # Enlaza los presupuestos convertidos con una venta existente y factura las
+            # ventas completadas (nº factura/control). Es POST-PROCESO de solo metadatos:
+            # no crea ventas ni cambia montos/estados, así que las series y las métricas
+            # de los modelos quedan intactas.
+            self._link_and_invoice_sales()
+
             # Fechas de alta (created_at) verosímiles para distinguir clientes nuevos de
             # antiguos en los paneles (no alimenta ningún modelo de ML).
             self._set_customer_registration_dates()
@@ -737,6 +759,9 @@ class Command(BaseCommand):
     # ---------------------------------------------------------------- wipe -- #
     def _wipe(self, *, purge_demo):
         self.stdout.write("Borrando ventas, productos e historia transaccional previa…")
+        # Las órdenes de despacho PROTEGEN su venta/producto (FK PROTECT), así que hay
+        # que borrarlas ANTES que las ventas y el catálogo (sus líneas caen en cascada).
+        DispatchOrder.objects.all().delete()
         InventoryMovement.objects.all().delete()
         QuoteItem.objects.all().delete()
         Quote.objects.all().delete()
@@ -1545,6 +1570,82 @@ class Command(BaseCommand):
         conv = sum(1 for s in specs if s["status"] == Quote.StatusChoices.CONVERTED)
         self.stdout.write(self.style.SUCCESS(
             f"Presupuestos: {len(quote_objs)} ({conv} convertidos, {len(qitems)} líneas)."))
+
+    # ---------------------------------------------- enlace + facturación ---- #
+    def _link_and_invoice_sales(self):
+        """Enlaza presupuestos convertidos con ventas existentes y factura las ventas
+        completadas. Es un POST-PROCESO de SOLO METADATOS: no crea ventas ni cambia
+        montos/estados, así que las series y las métricas de los modelos de ML quedan
+        intactas (el clasificador de conversión etiqueta por ``status``/FK, y como solo
+        se enlazan presupuestos ya CONVERTED, su etiqueta no cambia). Determinista e
+        idempotente: continúa la numeración desde el máximo existente y no reasigna lo
+        ya hecho, sin consumir del RNG principal (no altera el resto de la siembra)."""
+        from collections import defaultdict
+
+        # --- Facturación fiscal de las ventas completadas (correlativo 8 dígitos) ---
+        # El nº de control es su PROPIA serie, desfasada del nº de factura (como en la
+        # realidad: p. ej. factura 00001251 / control 00001551), no idéntica.
+        CONTROL_OFFSET = 300
+        # Se dejan SIN factura solo las 3 ventas completadas más recientes (para mostrar
+        # el estado "sin factura" en la UI); todas las demás se facturan.
+        start = 0
+        for v in Sale.objects.exclude(invoice_number__isnull=True).values_list(
+            "invoice_number", flat=True
+        ):
+            digits = "".join(ch for ch in (v or "") if ch.isdigit())
+            if digits:
+                start = max(start, int(digits))
+        completed = list(
+            Sale.objects.filter(status=Sale.StatusChoices.COMPLETED).order_by("sale_date", "id")
+        )
+        skip_ids = {s.id for s in completed[-3:]}  # las 3 más recientes quedan sin factura
+        n = start
+        to_invoice = []
+        for s in completed:
+            if s.invoice_number or s.id in skip_ids:
+                continue  # ya facturada, o entre las 3 más recientes
+            n += 1
+            s.invoice_number = f"{n:08d}"
+            s.control_number = f"{n + CONTROL_OFFSET:08d}"
+            s.invoice_date = s.sale_date
+            to_invoice.append(s)
+        Sale.objects.bulk_update(
+            to_invoice, ["invoice_number", "control_number", "invoice_date"], batch_size=500
+        )
+
+        # --- Enlace presupuesto CONVERTED -> venta existente del mismo cliente ---
+        # Sin crear ventas: se asocia cada presupuesto convertido a una venta ya
+        # generada del mismo cliente, preferentemente en/tras la fecha del presupuesto y
+        # única (1:1). Los que no encuentren venta quedan CONVERTED sin FK (válido).
+        sales_by_customer = defaultdict(list)
+        for s in Sale.objects.filter(status=Sale.StatusChoices.COMPLETED).order_by("sale_date", "id"):
+            sales_by_customer[s.customer_id].append(s)
+        used = set(
+            Quote.objects.exclude(converted_to_sale__isnull=True).values_list(
+                "converted_to_sale_id", flat=True
+            )
+        )
+        to_link = []
+        for q in Quote.objects.filter(
+            status=Quote.StatusChoices.CONVERTED, converted_to_sale__isnull=True
+        ).order_by("issued_date", "id"):
+            pool = [s for s in sales_by_customer.get(q.customer_id, []) if s.id not in used]
+            if not pool:
+                continue
+            after = [s for s in pool if s.sale_date >= q.issued_date]
+            chosen = (
+                min(after, key=lambda s: (s.sale_date - q.issued_date).days)
+                if after
+                else min(pool, key=lambda s: abs((s.sale_date - q.issued_date).days))
+            )
+            used.add(chosen.id)
+            q.converted_to_sale = chosen
+            to_link.append(q)
+        Quote.objects.bulk_update(to_link, ["converted_to_sale"], batch_size=500)
+
+        self.stdout.write(self.style.SUCCESS(
+            f"Facturación fiscal: {len(to_invoice)} venta(s) con nº factura/control. "
+            f"Presupuestos enlazados a su venta: {len(to_link)}."))
 
     # --------------------------------------------------------------- resumen -- #
     def _summary(self):
