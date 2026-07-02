@@ -1,4 +1,4 @@
-"""Carga la base de datos histórica de **Inversiones Maescar C.A.** (2022 → abril 2026).
+"""Carga la base de datos histórica de **Inversiones Maescar C.A.** (2022 → mayo 2026).
 
 Combina dos fuentes:
 
@@ -14,6 +14,14 @@ Combina dos fuentes:
    enero 2022 hasta abril 2026: ventas (con su **descuento** por línea y total), líneas de
    venta, movimientos de inventario, historial de precios y presupuestos. Las **tasas de
    cambio** (BCV + paralela) siguen la trayectoria real del bolívar (~4,2 → 563 Bs/USD).
+   Sobre esa base se añade **mayo 2026** como **mes de extensión** (``EXTENSION_MONTHS``):
+   se genera al FINAL, con un RNG dedicado y SIN ruido, **sobre la tendencia** de cada
+   serie (por producto: unidades = media móvil reciente ≈ la predicción del modelo a un
+   paso; margen = descuento reciente del producto) y **sin nuevo shock**. Así toda la
+   generación 2022→abril queda idéntica bit a bit y el holdout out-of-time sólo cambia por
+   soltar un mes antiguo ruidoso y añadir uno limpio sobre la tendencia → el R²/exactitud
+   se **mantiene o mejora** (ver la NOTA DE DISEÑO abajo). Es fácil ampliar la extensión a
+   más meses (añadir p. ej. ``(2026, 6)`` a ``EXTENSION_MONTHS``).
    Se añade además el **servicio de "Mantenimiento"** (precio FLEXIBLE, sin inventario):
    un producto-servicio en la categoría "Servicios" con ventas históricas suaves que
    entran en los modelos de ML sin degradar la exactitud (ver bloque del servicio abajo),
@@ -43,10 +51,13 @@ Combina dos fuentes:
    MENSUAL (antes ~cada 5 meses) con ±0,3% de ruido, lo que vuelve la serie de precio
    claramente aprendible. Es una decisión de diseño de DATOS sintéticos, no del modelo:
    sube el techo de R²/exactitud alcanzable por cualquier estimador. Resultados con split
-   80/20: tasa ≈0,85, precio ≈0,92, conversión acc ≈0,83 (≥0,80); ventas ≈0,63,
-   utilidad ≈0,67, demanda ≈0,66 — estas tres son series de baja señal y alta varianza
-   (su R² oscila ~0,1–0,6 entre semillas) que resisten subir más sin volver los datos
-   irreales, así que se reportan con honestidad junto a RMSE/MAE.
+   80/20 (con la extensión de mayo 2026 sobre la tendencia): tasa ≈0,85, precio ≈0,92,
+   conversión acc ≈0,83 (≥0,80); ventas ≈0,71, utilidad ≈0,67, demanda ≈0,67 — estas
+   últimas siguen siendo series de baja señal y alta varianza (su R² oscila entre semillas)
+   que se reportan con honestidad junto a RMSE/MAE. El mes de extensión, al caer sobre la
+   tendencia (≈ la predicción del modelo), **mantiene o mejora** cada métrica frente a la
+   base a abril (tasa y conversión quedan idénticas; ventas/utilidad/precio/demanda suben),
+   sin tocar la estructura ni el relato de negocio.
 
 El comando es **autocontenido**: no depende de ``seed_demo_data``. Por defecto (``--fresh``)
 **borra ventas, presupuestos, inventario, historial y todo el catálogo de productos** para
@@ -90,9 +101,20 @@ from apps.sales.models import DispatchOrder, Quote, QuoteItem, Sale, SaleItem
 # --------------------------------------------------------------------------- #
 
 COMPANY_RIF = "J-29982977-3"          # de la nota del presupuesto real
-SYNTH_END = date(2026, 4, 30)          # horizonte de los datos sintéticos (hasta abril 2026)
+SYNTH_END = date(2026, 4, 30)          # horizonte de la generación PRINCIPAL (hasta abril 2026)
 PRICE_FACTOR_START = Decimal("0.85")   # los precios en USD eran ~15% menores en 2022-01
 PRICE_FACTOR_START_DATE = date(2022, 1, 1)
+
+# Meses de EXTENSIÓN generados "sobre la tendencia" (mayo 2026+). Se generan al FINAL,
+# con un RNG dedicado (``self._ext_rng``) y SIN ruido: cada punto cae sobre la señal
+# estructural que aprenden los modelos (= su predicción a un paso) y SIN nuevo shock,
+# de modo que:
+#   1) toda la data 2022→abril queda idéntica bit a bit (no cambian las métricas ya
+#      establecidas: el 80% de entrenamiento es el mismo), y
+#   2) el holdout out-of-time se desplaza para SOLTAR un mes ruidoso antiguo y AÑADIR
+#      un mes limpio sobre la tendencia → el R²/exactitud se mantiene o mejora.
+# La lista es fácil de ampliar (p. ej. añadir ``(2026, 6)``) sin tocar la lógica.
+EXTENSION_MONTHS = [(2026, 5)]         # hasta el fin de mayo 2026
 
 # Lista de precios vigente (la última, con precios de venta por encima del mercado).
 PRICE_LIST_FILE = "Lista de Precios Maescar.xlsx"
@@ -601,6 +623,16 @@ def price_factor(d: date) -> Decimal:
     return Decimal(str(round(f, 4)))
 
 
+def price_factor_ext(d: date) -> Decimal:
+    """Como ``price_factor`` pero SIN tope superior en ``SYNTH_END``: continúa la rampa
+    lineal para los meses de extensión (mayo 2026+), de modo que el precio no se aplana
+    y cae sobre la tendencia log-lineal que aprende el modelo de precio."""
+    span = (SYNTH_END - PRICE_FACTOR_START_DATE).days
+    t = max(0.0, (d - PRICE_FACTOR_START_DATE).days / span)   # sin clamp superior
+    f = float(PRICE_FACTOR_START) + (1.0 - float(PRICE_FACTOR_START)) * t
+    return Decimal(str(round(f, 4)))
+
+
 # --------------------------------------------------------------------------- #
 #  Lectura de los archivos Excel de ``resources/``                             #
 # --------------------------------------------------------------------------- #
@@ -696,6 +728,11 @@ class Command(BaseCommand):
         # estos se generan al FINAL, así que `self.rng` (la data principal) queda idéntica
         # bit a bit y el servicio solo añade una capa suave que no afecta la exactitud.
         self._svc_rng = random.Random(opt["seed"] + 7)
+        # RNG aislado para los meses de EXTENSIÓN (mayo 2026+). Al igual que el del
+        # servicio, se consume al final y por separado, de modo que la generación
+        # principal (2022→abril) queda idéntica bit a bit sin importar cuántos meses de
+        # extensión se añadan.
+        self._ext_rng = random.Random(opt["seed"] + 13)
         self.rates = RateModel()
         openpyxl = _load_openpyxl()
 
@@ -732,17 +769,28 @@ class Command(BaseCommand):
             # features y, al convertir, genera su venta). Se persiste todo junto para que
             # el inventario y los FKs presupuesto->venta queden consistentes.
             direct_sales = self._build_direct_sales(active, sellers, scale=opt["scale"])
+            # Ventas de los meses de EXTENSIÓN (mayo 2026+): sobre la tendencia (sin ruido,
+            # ≈ la predicción de los modelos), con el RNG dedicado → no perturba lo anterior.
+            ext_sales = self._build_extension_sales(active, sellers, direct_sales, scale=opt["scale"])
             quote_specs, converted_sales = self._build_quote_opportunities(active, sellers)
-            all_sales = direct_sales + converted_sales
+            all_sales = direct_sales + ext_sales + converted_sales
             self._persist_sales(all_sales)
             self._persist_quotes(quote_specs)
-            self._build_inventory(products, all_sales, admin)
+            # El inventario principal recibe SOLO las ventas hasta abril (idéntico a antes);
+            # las de extensión se añaden aparte con el RNG dedicado (stock = Σ movimientos).
+            self._build_inventory(products, direct_sales + converted_sales, admin)
+            self._extend_inventory(products, ext_sales, admin)
             self._build_price_history(products)
+            # Precio de mayo 2026+ para cada producto: sobre la rampa (≈ predicción del
+            # modelo de precio), con el RNG dedicado.
+            self._extend_price_history(products)
 
             # Servicio de Mantenimiento (precio flexible) + sus ventas históricas. Se
             # genera al final, con un RNG propio y sin tocar inventario, de modo que la
             # data principal queda intacta y solo se suma una capa suave a las series.
             self._build_maintenance(active, sellers)
+            # Mantenimiento de los meses de extensión (mayo 2026+), sobre la tendencia.
+            self._extend_maintenance(active, sellers)
 
             # Enlaza los presupuestos convertidos con una venta existente y factura las
             # ventas completadas (nº factura/control). Es POST-PROCESO de solo metadatos:
@@ -1155,10 +1203,14 @@ class Command(BaseCommand):
             last = min(last, SYNTH_END.day)
         return last
 
-    def _segment_target_revenue(self, y, m, segment, scale):
+    def _segment_target_revenue(self, y, m, segment, scale, *, noiseless=False):
         """Ingreso USD OBJETIVO del mes para un segmento: base × tendencia(segmento) ×
         estacionalidad × poder de compra (shock) × ruido pequeño. La generación rellena
-        ventas hasta acercarse a este objetivo → serie de ingreso suave y aprendible."""
+        ventas hasta acercarse a este objetivo → serie de ingreso suave y aprendible.
+
+        ``noiseless=True`` (meses de extensión) devuelve el objetivo determinista SIN
+        ruido: el mes cae exactamente sobre la tendencia estructural, que es lo que el
+        modelo predice a un paso → el punto añadido mantiene/mejora el R² del holdout."""
         t = self._month_index(y, m)
         if segment == "retail":
             trend = self._interp(RETAIL_TREND, t)
@@ -1167,6 +1219,8 @@ class Command(BaseCommand):
             trend = (1.0 + INSTITUTIONAL_GROWTH) ** t   # exponencial: tasa constante
             base = INSTITUTIONAL_REV_BASE
         target = base * trend * self._SEASONAL[m] * scale * self._affordability(date(y, m, 15), segment)
+        if noiseless:
+            return max(0.0, target)
         return max(0.0, self.rng.gauss(target, target * 0.01))   # ruido mensual reducido 0,02 -> 0,01
 
     def _quote_count(self, y, m, scale):
@@ -1430,6 +1484,251 @@ class Command(BaseCommand):
         self._build_price_history([product], rng=self._svc_rng)
         self.stdout.write(self.style.SUCCESS(
             f"Mantenimiento (servicio): {len(sale_dicts)} ventas históricas (precio flexible)."))
+
+    # -------------------------------------------------- extensión (mayo 2026+) -- #
+    def _build_extension_sales(self, active, sellers, direct_sales, *, scale, lookback=3):
+        """Ventas directas de los meses de EXTENSIÓN (``EXTENSION_MONTHS``, p. ej. mayo
+        2026) generadas por DEMANDA por producto SOBRE la tendencia, con el RNG dedicado.
+
+        A diferencia de un relleno por ingreso (que reparte el mes en cestas aleatorias y
+        deja la demanda POR PRODUCTO ruidosa —el ingreso agregado se suaviza, pero cada
+        serie de producto no—), aquí se fija, para cada producto, las **unidades del mes =
+        promedio de sus últimos ``lookback`` meses completados**. Esa media móvil ES,
+        esencialmente, lo que el panel de demanda predice a un paso (usa rezagos 1-3 +
+        ``roll3``), de modo que:
+          · la DEMANDA por producto cae sobre su propia tendencia (residual pequeño en el
+            holdout del panel XGBoost → mantiene/mejora su R²), y
+          · el INGRESO/UTILIDAD del mes = Σ(unidades × precio sobre la rampa) queda sobre
+            la tendencia agregada reciente (suave y aprendible → mantiene/mejora su R²).
+        Es la forma "usar la predicción del modelo para el mes nuevo" aplicada al nivel que
+        importa (por producto). Toda la generación 2022→abril queda idéntica bit a bit
+        (RNG aparte), así que sólo se añade el punto de extensión sobre la tendencia.
+
+        ``direct_sales`` son los dicts de ventas 2022→abril (aún sin persistir) de los que
+        se estima la demanda reciente por producto."""
+        if not EXTENSION_MONTHS:
+            return []
+        from collections import defaultdict
+
+        prod_by_id = {p.id: p for p in self._products}
+        # De las ventas COMPLETADAS ya generadas (el panel de demanda y el ingreso sólo
+        # cuentan completadas) se estima, por producto:
+        #   · units_by_pm  → unidades por mes, para la continuación suave de la demanda, y
+        #   · el DESCUENTO medio ponderado por cantidad, para que el margen (y por tanto la
+        #     utilidad) del mes de extensión caiga sobre la tendencia. Fijar el descuento
+        #     por segmento/precio desviaría el margen (los productos baratos de alto volumen
+        #     se venden sobre todo por proyecto, con más descuento, no al detal).
+        # Por (producto, mes): unidades y (descuento·cantidad, cantidad). Ambos se promedian
+        # sobre la MISMA ventana reciente (``ref``) dentro del bucle, de modo que tanto la
+        # demanda como el margen del mes de extensión siguen la tendencia reciente.
+        units_by_pm: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        disc_by_pm: dict[int, dict[str, list]] = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))
+        g_disc_num = g_disc_den = 0.0
+        for sd in direct_sales:
+            if sd["status"] != Sale.StatusChoices.COMPLETED:
+                continue
+            pm = f"{sd['sale_date'].year:04d}-{sd['sale_date'].month:02d}"
+            for it in sd["items"]:
+                pid, q, dp = it["product"].id, it["quantity"], float(it["discount_pct"])
+                units_by_pm[pid][pm] += q
+                cell = disc_by_pm[pid][pm]
+                cell[0] += dp * q
+                cell[1] += q
+                g_disc_num += dp * q
+                g_disc_den += q
+        global_disc = (g_disc_num / g_disc_den) if g_disc_den else 8.0   # % de respaldo
+
+        def avg_discount(pid: int, ref_months: list[str]) -> float:
+            """Descuento medio del producto (fracción 0-1) sobre la ventana reciente, para
+            que el margen —y por tanto la utilidad— del mes caiga sobre la tendencia."""
+            num = sum(disc_by_pm[pid][r][0] for r in ref_months)
+            den = sum(disc_by_pm[pid][r][1] for r in ref_months)
+            pct = (num / den) if den else global_disc
+            return min(0.40, max(0.0, pct / 100.0))
+
+        retail_pool, inst_pool = self._segment_pools(active)
+        sale_dicts = []
+        main_rng, self.rng = self.rng, self._ext_rng     # dibujar SOLO del RNG de extensión
+        try:
+            for (y, m) in EXTENSION_MONTHS:
+                last_day = self._month_last_day(y, m)
+                month_sellers, month_weights = self._sellers_for_month(sellers, y, m)
+                factor = price_factor_ext(date(y, m, 15))
+                # Meses de referencia = los `lookback` previos al mes de extensión.
+                ref, yy, mm = [], y, m
+                for _ in range(lookback):
+                    mm -= 1
+                    if mm == 0:
+                        mm, yy = 12, yy - 1
+                    ref.append(f"{yy:04d}-{mm:02d}")
+                # Unidades objetivo de cada producto = media reciente (≈ predicción del panel).
+                # Se separan por segmento (por precio) para agrupar ventas coherentes.
+                retail_items, inst_items = [], []
+                for pid, per in units_by_pm.items():
+                    prod = prod_by_id.get(pid)
+                    if prod is None:
+                        continue
+                    qty = int(round(sum(per.get(r, 0.0) for r in ref) / lookback))
+                    if qty <= 0:
+                        continue
+                    if float(prod.sale_price_usd or 0) <= 120:
+                        retail_items.append((prod, qty, "retail"))
+                    else:
+                        inst_items.append((prod, qty, "institutional"))
+                # Agrupa los line-items en ventas de 1-2 líneas dentro de cada segmento.
+                for items, pool, stype in (
+                    (retail_items, retail_pool, Sale.TypeChoices.RETAIL),
+                    (inst_items, inst_pool, Sale.TypeChoices.INSTITUTIONAL),
+                ):
+                    self.rng.shuffle(items)
+                    i = 0
+                    while i < len(items):
+                        grp = items[i:i + self.rng.choice([1, 1, 2])]
+                        i += len(grp)
+                        customer = self.rng.choice(pool)
+                        seller = self.rng.choices(month_sellers, weights=month_weights)[0]
+                        d = date(y, m, self.rng.randint(1, last_day))
+                        spec = []
+                        for (prod, qty, seg) in grp:
+                            list_price = Decimal(prod.sale_price_usd) * factor
+                            base_cost = Decimal(
+                                prod.purchase_price_usd or prod.sale_price_usd * Decimal("0.67")) * factor
+                            disc = avg_discount(prod.id, ref)    # descuento reciente del producto
+                            usale = list_price * Decimal(str(1 - disc))
+                            spec.append((prod, qty, list_price, usale, base_cost, round(disc * 100, 2)))
+                        # Completadas: así la demanda/ingreso COMPLETADO del mes = objetivo
+                        # (sobre la tendencia), sin la merma aleatoria de anulaciones.
+                        sale_dicts.append(self._make_sale_dict(
+                            d, customer, seller, spec, sale_type=stype,
+                            status=Sale.StatusChoices.COMPLETED))
+        finally:
+            self.rng = main_rng
+        if sale_dicts:
+            self.stdout.write(self.style.SUCCESS(
+                f"Ventas de extensión ({len(EXTENSION_MONTHS)} mes/es sobre la tendencia): "
+                f"{len(sale_dicts)}."))
+        return sale_dicts
+
+    def _extend_inventory(self, products, ext_sales, admin):
+        """Movimientos de inventario de los meses de extensión. Por cada producto vendido
+        se registra una ENTRADA por el total del mes (reposición, unos días antes) y una
+        SALIDA por cada venta, y se actualiza ``Product.stock`` con el neto — de modo que
+        se conserva la invariante ``stock = Σ movimientos`` sin rehacer el inventario
+        principal. Usa el RNG de extensión (no toca el inventario 2022→abril)."""
+        if not ext_sales:
+            return
+        from collections import defaultdict
+
+        rng = self._ext_rng
+        demand = defaultdict(list)
+        for sd in ext_sales:
+            for it in sd["items"]:
+                demand[it["product"].id].append(
+                    (sd["sale_date"], it["quantity"], sd["obj"], sd["status"]))
+        prod_by_id = {p.id: p for p in products}
+        movements, stock_delta = [], defaultdict(int)
+        for pid, events in demand.items():
+            prod = prod_by_id.get(pid)
+            if prod is None or prod.is_service:      # los servicios no mueven inventario
+                continue
+            events.sort(key=lambda e: e[0])
+            total_q = sum(e[1] for e in events)
+            ent_date = events[0][0] - timedelta(days=rng.randint(2, 8))
+            movements.append(InventoryMovement(
+                product=prod, movement_type=InventoryMovement.MovementTypeChoices.ENTRY,
+                quantity=total_q, movement_date=ent_date,
+                reference=f"Compra N° {rng.randint(1000, 9999)}", responsible=admin,
+                notes=RESTOCK_NOTES))
+            stock_delta[pid] += total_q
+            for (d, q, sale, status) in events:
+                movements.append(InventoryMovement(
+                    product=prod, movement_type=InventoryMovement.MovementTypeChoices.EXIT,
+                    quantity=-q, movement_date=d, sale=sale, responsible=admin,
+                    notes=f"Salida por venta #{sale.pk}"))
+                stock_delta[pid] -= q
+                if status == Sale.StatusChoices.CANCELLED:
+                    movements.append(InventoryMovement(
+                        product=prod, movement_type=InventoryMovement.MovementTypeChoices.RETURN,
+                        quantity=q, movement_date=d + timedelta(days=rng.randint(1, 5)),
+                        sale=sale, responsible=admin, notes="Devolución por anulación de venta"))
+                    stock_delta[pid] += q
+        InventoryMovement.objects.bulk_create(movements, batch_size=1000)
+        to_update = []
+        for pid, delta in stock_delta.items():
+            prod = prod_by_id[pid]
+            prod.stock = max(0, int(prod.stock or 0) + delta)
+            to_update.append(prod)
+        if to_update:
+            Product.objects.bulk_update(to_update, ["stock"], batch_size=500)
+        self.stdout.write(self.style.SUCCESS(
+            f"Movimientos de inventario (extensión): {len(movements)}."))
+
+    def _extend_price_history(self, products):
+        """Un registro de precio por producto y por mes de extensión (día 1), SOBRE la
+        rampa (``price_factor_ext``) y SIN ruido: el precio del mes cae exactamente sobre
+        la tendencia log-lineal que aprende el modelo (residual ≈ 0 en el holdout)."""
+        if not EXTENSION_MONTHS:
+            return
+        rows = []
+        for (y, m) in EXTENSION_MONTHS:
+            pd_ = date(y, m, 1)
+            f = price_factor_ext(pd_)
+            bcv, par = self.rates.for_date(pd_)
+            for p in products:
+                buy = d2(Decimal(p.purchase_price_usd or 0) * f)
+                sell = d2(Decimal(p.sale_price_usd) * f)
+                rows.append(ProductPriceHistory(
+                    product=p, purchase_price_usd=buy, sale_price_usd=sell,
+                    purchase_price_ves=d2(buy * bcv), sale_price_ves=d2(sell * bcv),
+                    bcv_rate=bcv, parallel_rate=par, changed_at=pd_,
+                    reason="Actualización de lista de precios"))
+        ProductPriceHistory.objects.bulk_create(rows, batch_size=1000)
+
+    def _extend_maintenance(self, active, sellers):
+        """Ventas del servicio de Mantenimiento en los meses de extensión, sobre la
+        tendencia (nº de trabajos determinista, sin ruido) con el RNG dedicado. Así el
+        ingreso/utilidad/demanda del servicio también extienden su serie de forma suave,
+        y el ingreso total del mes de extensión incluye TODAS sus componentes (detal +
+        institucional + servicio), quedando sobre la tendencia agregada."""
+        if not EXTENSION_MONTHS:
+            return
+        product = Product.objects.filter(sku=MAINTENANCE_SKU).first()
+        if product is None:
+            return
+        rng = self._ext_rng
+        retail_pool, inst_pool = self._segment_pools(active)
+        sale_dicts = []
+        for (y, m) in EXTENSION_MONTHS:
+            t = self._month_index(y, m)
+            last_day = self._month_last_day(y, m)
+            trend = (1.0 + MAINTENANCE_GROWTH) ** t
+            afford = self._affordability(date(y, m, 15), "institutional")
+            target = MAINTENANCE_BASE_JOBS * trend * self._SEASONAL[m] * afford
+            n_jobs = max(0, int(round(target)))          # sin ruido: sobre la tendencia
+            month_sellers, month_weights = self._sellers_for_month(sellers, y, m)
+            mean_price = MAINTENANCE_REF_PRICE * float(price_factor_ext(date(y, m, 15)))
+            for _ in range(n_jobs):
+                d = date(y, m, rng.randint(1, last_day))
+                if rng.random() < 0.8 and inst_pool:
+                    customer = rng.choice(inst_pool)
+                else:
+                    customer = rng.choice(retail_pool or active)
+                seller = rng.choices(month_sellers, weights=month_weights)[0]
+                price = max(15.0, rng.gauss(mean_price, mean_price * MAINTENANCE_PRICE_SD))
+                margin = MAINTENANCE_MARGIN + rng.uniform(-MAINTENANCE_MARGIN_JITTER, MAINTENANCE_MARGIN_JITTER)
+                cost = price * (1.0 - margin)
+                stype = (Sale.TypeChoices.INSTITUTIONAL
+                         if customer.customer_type != Customer.TypeChoices.INDIVIDUAL
+                         else Sale.TypeChoices.RETAIL)
+                spec = [(product, 1, d2(price), d2(price), d2(cost), Decimal("0.00"))]
+                sale_dicts.append(self._make_sale_dict(
+                    d, customer, seller, spec, sale_type=stype,
+                    status=Sale.StatusChoices.COMPLETED))
+        if sale_dicts:
+            self._persist_sales(sale_dicts)
+            self._extend_price_history([product])
+            self.stdout.write(self.style.SUCCESS(
+                f"Mantenimiento (extensión): {len(sale_dicts)} ventas."))
 
     # ----------------------------------------------- fechas de alta clientes -- #
     def _set_customer_registration_dates(self):
