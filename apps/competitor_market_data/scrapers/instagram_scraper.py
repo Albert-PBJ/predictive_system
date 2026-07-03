@@ -706,30 +706,46 @@ def start_instagram_run(urls: list[str], results_limit: int = 50) -> dict:
     return client.actor(INSTAGRAM_ACTOR_ID).start(run_input=actor_input)
 
 
-def finalize_instagram(dataset_id: str, scrape_run=None) -> list[CompetitorMarketData]:
-    """Lee el dataset de un run finalizado, mapea cada post y guarda los registros.
+def read_instagram_units(dataset_id: str, **_) -> list:
+    """Lee el dataset de Apify y devuelve la lista de posts (unidades a procesar).
 
-    El mapeo de campos es determinista; el producto, la categoría y la
-    identificación del competidor se afinan de forma opcional vía LLM (DeepSeek).
-    Como último recurso para el precio, si ni el caption ni el LLM lo encontraron,
-    se intenta leerlo de la imagen del post con OCR (red neuronal EasyOCR, opcional).
-    El guardado (snapshot USD, match al catálogo, validación, archivo de descartes
-    y enlace al run) lo centraliza `persist_records`.
+    Es la parte barata (una lectura de dataset); el trabajo caro (LLM + OCR) lo hace
+    `process_instagram_items` por lotes. Separarlas permite procesar el dataset en
+    trozos con checkpoints reanudables (ver la vista de procesamiento por lotes).
     """
-    scrape_run = ensure_scrape_run(
-        scrape_run, CompetitorMarketData.SourceChoices.INSTAGRAM, dataset_id
-    )
     client = get_client()
     items = list(client.dataset(dataset_id).iterate_items())
     logger.info("Se obtuvieron %d posts del dataset de Apify.", len(items))
+    return items
 
+
+def process_instagram_items(items: list, **_) -> list[CompetitorMarketData]:
+    """Mapea + enriquece (LLM + OCR) un lote de posts → instancias (sin persistir).
+
+    El mapeo de campos es determinista; el producto, la categoría y el competidor se
+    afinan de forma opcional vía LLM (DeepSeek), y como último recurso para el precio
+    se lee la imagen del post con OCR (red neuronal EasyOCR, opcional).
+    """
     pairs = [(_map_post_to_instance(item), item) for item in items]
     _enrich_posts(pairs)
     # Último recurso para el precio: leerlo de la imagen del post (red neuronal OCR),
     # solo para los posts que el caption y el LLM dejaron sin precio.
     _ocr_fallback_prices(pairs)
+    return [instance for instance, _ in pairs]
 
-    instances = [instance for instance, _ in pairs]
+
+def finalize_instagram(dataset_id: str, scrape_run=None) -> list[CompetitorMarketData]:
+    """Lee el dataset de un run finalizado, mapea cada post y guarda los registros.
+
+    Versión de un solo tiro (CLI/bloqueante). El guardado (snapshot USD, match al
+    catálogo, validación, archivo de descartes y enlace al run) lo centraliza
+    `persist_records`.
+    """
+    scrape_run = ensure_scrape_run(
+        scrape_run, CompetitorMarketData.SourceChoices.INSTAGRAM, dataset_id
+    )
+    items = read_instagram_units(dataset_id)
+    instances = process_instagram_items(items)
     return persist_records(instances, scrape_run=scrape_run, llm_used=deepseek.is_enabled())
 
 

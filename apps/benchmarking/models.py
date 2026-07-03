@@ -152,8 +152,10 @@ class ScrapeRun(models.Model):
     """
 
     class StatusChoices(models.TextChoices):
-        RUNNING = "RUN", _("En ejecución")
+        RUNNING = "RUN", _("En ejecución")          # recolectando en Apify
+        PROCESSING = "PRO", _("Procesando")         # leyendo el dataset y guardando por lotes
         SUCCEEDED = "OK", _("Completado")
+        STOPPED = "STP", _("Detenido por el usuario")  # se guardó lo procesado hasta ahí
         FAILED = "ERR", _("Fallido")
 
     source = models.CharField(max_length=3, choices=CompetitorMarketData.SourceChoices.choices)
@@ -163,9 +165,20 @@ class ScrapeRun(models.Model):
     dataset_id = models.CharField(max_length=100, blank=True, db_index=True)
     status = models.CharField(max_length=3, choices=StatusChoices.choices, default=StatusChoices.RUNNING)
 
+    # Señal cooperativa de parada: la marca el usuario al pulsar "Detener". El
+    # procesamiento por lotes la respeta entre checkpoints (guarda lo procesado y para).
+    stop_requested = models.BooleanField(default=False, help_text=_("El usuario pidió detener el run"))
+
     records_collected = models.IntegerField(default=0, help_text=_("Filas mapeadas desde el dataset"))
     records_saved = models.IntegerField(default=0, help_text=_("Filas que pasaron la validación y se guardaron"))
     records_discarded = models.IntegerField(default=0, help_text=_("Filas descartadas por la validación de calidad"))
+
+    # Progreso del PROCESAMIENTO por lotes (checkpoint reanudable): cuántas unidades
+    # del dataset se han procesado y el total. Si el proceso se interrumpe (cierre de
+    # pestaña, corte de luz), lo ya procesado quedó guardado y se puede reanudar desde
+    # `processed_items` sin repetir trabajo.
+    processed_items = models.IntegerField(default=0, help_text=_("Unidades del dataset ya procesadas (offset de checkpoint)"))
+    total_items = models.IntegerField(default=0, help_text=_("Total de unidades a procesar del dataset"))
 
     started_at = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(null=True, blank=True)

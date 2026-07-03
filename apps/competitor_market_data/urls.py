@@ -5,19 +5,25 @@ from apps.competitor_market_data.views import (
     ScraperDataDetailView,
     ScraperDataView,
     ScraperFinalizeView,
+    ScraperPendingView,
+    ScraperProcessChunkView,
     ScraperRejectedDetailView,
     ScraperRejectedView,
     ScraperStartView,
     ScraperStatusView,
+    ScraperStopView,
 )
 
-# `source` ∈ {instagram, facebook, website}. Las rutas existentes
+# `source` ∈ {instagram, facebook, website, mercadolibre}. Las rutas existentes
 # (/scrapers/instagram/start, etc.) siguen resolviendo aquí.
 # La ruta literal `llm/test` va primero para que no la capture `<str:source>`.
 urlpatterns = [
     path("llm/test", LLMConnectionTestView.as_view(), name="llm-connection-test"),
     path("<str:source>/start", ScraperStartView.as_view(), name="scraper-start"),
     path("<str:source>/status", ScraperStatusView.as_view(), name="scraper-status"),
+    path("<str:source>/stop", ScraperStopView.as_view(), name="scraper-stop"),
+    path("<str:source>/process-chunk", ScraperProcessChunkView.as_view(), name="scraper-process-chunk"),
+    path("<str:source>/pending", ScraperPendingView.as_view(), name="scraper-pending"),
     path("<str:source>/finalize", ScraperFinalizeView.as_view(), name="scraper-finalize"),
     path("<str:source>/data", ScraperDataView.as_view(), name="scraper-data"),
     path("<str:source>/data/<int:pk>", ScraperDataDetailView.as_view(), name="scraper-data-detail"),

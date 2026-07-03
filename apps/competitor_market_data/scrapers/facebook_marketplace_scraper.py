@@ -337,25 +337,33 @@ def start_facebook_run(urls: list[str], results_limit: int = 50) -> dict:
     return client.actor(FACEBOOK_MARKETPLACE_ACTOR_ID).start(run_input=actor_input)
 
 
+def read_facebook_units(dataset_id: str, **_) -> list:
+    """Lee el dataset de Apify y devuelve la lista de listings (unidades a procesar)."""
+    client = get_client()
+    items = list(client.dataset(dataset_id).iterate_items())
+    logger.info("Se obtuvieron %d listings del dataset de Apify.", len(items))
+    return items
+
+
+def process_facebook_items(items: list, **_) -> list[CompetitorMarketData]:
+    """Mapea + enriquece (LLM) un lote de listings → instancias (sin persistir)."""
+    pairs = [(_map_listing_to_instance(item), item) for item in items]
+    _enrich_listings(pairs)
+    return [instance for instance, _ in pairs]
+
+
 def finalize_facebook(dataset_id: str, scrape_run=None) -> list[CompetitorMarketData]:
     """Lee el dataset de un run finalizado, mapea cada listing y guarda los registros.
 
-    El mapeo de campos es determinista; la identificación del competidor se hace
-    de forma opcional vía LLM (DeepSeek) antes de persistir. El guardado (snapshot
-    USD, match al catálogo, validación, archivo de descartes y enlace al run) lo
-    centraliza `persist_records`.
+    Versión de un solo tiro (CLI/bloqueante). El guardado (snapshot USD, match al
+    catálogo, validación, archivo de descartes y enlace al run) lo centraliza
+    `persist_records`.
     """
     scrape_run = ensure_scrape_run(
         scrape_run, CompetitorMarketData.SourceChoices.FACEBOOK, dataset_id
     )
-    client = get_client()
-    items = list(client.dataset(dataset_id).iterate_items())
-    logger.info("Se obtuvieron %d listings del dataset de Apify.", len(items))
-
-    pairs = [(_map_listing_to_instance(item), item) for item in items]
-    _enrich_listings(pairs)
-
-    instances = [instance for instance, _ in pairs]
+    items = read_facebook_units(dataset_id)
+    instances = process_facebook_items(items)
     return persist_records(instances, scrape_run=scrape_run, llm_used=deepseek.is_enabled())
 
 

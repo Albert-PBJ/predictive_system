@@ -190,17 +190,26 @@ Shared helpers in `scrapers/__init__.py`: the keyword `category` vocabulary + `c
 
 The website scraper's `_flatten_dataset_items()` normalises the AI actor's output, which can arrive as a flat list of product dicts, a single wrapper dict with a nested list (`items`/`data`/`results`/`products`/`extractedData`), or a dataset item that is itself a list.
 
-**Each scraper module exposes three functions** so the work can be driven non-blocking from the frontend (poll-based progress) — Mercado Libre follows the same `start_*`/`finalize_*`/`scrape_*` shape, only searching by keywords instead of URLs:
+**Each scraper module exposes five functions** so the work can be driven non-blocking from the frontend **in resumable chunks** — Mercado Libre follows the same shape, only searching by keywords instead of URLs:
 - `start_<src>_run(urls, results_limit, …)` — kicks off the Apify run via `.start()` (non-blocking) and returns the run dict (`id`, `defaultDatasetId`).
-- `finalize_<src>(dataset_id, …)` — reads the finished dataset, maps and bulk-creates the records (website also takes `urls` + `competitor_name` to resolve the `Competitor` FK).
+- `read_<src>_units(dataset_id, urls=…)` — reads the dataset and returns the list of **processable units** (the cheap step: for IG/FB/ML the raw items; for website the flattened product dicts). `len()` = the total to process.
+- `process_<src>_items(units_chunk, urls=…, competitor_name=…)` — maps + enriches **one chunk** of units into `CompetitorMarketData` instances (the expensive step: LLM/OCR, competitor resolution). Does **not** persist.
+- `finalize_<src>(dataset_id, …)` — the one-shot path (`read_units` → `process_items` → `persist_records`), used by the CLI/blocking wrapper.
 - `scrape_<src>(…)` — the original **blocking** wrapper (start → `wait_for_finish()` → finalize), kept for the management commands / CLI.
 
-Shared helpers live in `scrapers/__init__.py`: `get_client()` (validates `APIFY_API_KEY`) and `get_run_progress(run_id, dataset_id)` (read-only run status + dataset `itemCount`).
+**Persistence: batch checkpoints.** `scrapers/persistence.py` splits the old monolithic `persist_records` into `persist_batch(instances, *, scrape_run, llm_used, processed_items, total_items)` — enrich (USD snapshot / listing_key / product match / provenance) + validate + bulk-create + archive discards + **increment** the run counters + advance the checkpoint, **all in one `transaction.atomic`** so a crash never leaves a partial checkpoint — and `finalize_run(scrape_run, *, status, notes)`. `persist_records` is now a thin wrapper (`persist_batch` + `finalize_run(SUCCEEDED)`) preserving the CLI contract.
+
+Shared helpers live in `scrapers/__init__.py`: `get_client()` (validates `APIFY_API_KEY`), `get_run_progress(run_id, dataset_id)` (read-only run status + dataset `itemCount`), and `TERMINAL_STATUSES` (Apify terminal set incl. `ABORTED`). `get_client().run(run_id).abort(gracefully=True)` aborts a run (keeps its dataset).
+
+`ScrapeRun` carries the resumable-processing state: `stop_requested` (cooperative stop signal), `processed_items`/`total_items` (checkpoint offset + total), and the extended `StatusChoices` `RUNNING`→`PROCESSING`→(`SUCCEEDED`|`STOPPED`), plus `FAILED`.
 
 REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by `<source>` ∈ `instagram|facebook|website|mercadolibre`; for `mercadolibre` the `urls` field carries the search terms). **All require role `ADMIN`** (`permission_classes = [IsAdmin]`):
-- `POST /scrapers/<source>/start` — `{"urls": [...], "limit": N, "competitor_name": "…"}` → `{run_id, dataset_id, status}` (202).
-- `GET  /scrapers/<source>/status?run_id=…&dataset_id=…` → `{status, items_scraped, is_terminal, succeeded}` (polled by the frontend).
-- `POST /scrapers/<source>/finalize` — `{"dataset_id": "…", "urls": [...], "competitor_name": "…"}` → `{saved, results: [...]}` (serialized records for display).
+- `POST /scrapers/<source>/start` — `{"urls": [...], "limit": N, "competitor_name": "…"}` → `{run_id, dataset_id, status, scrape_run_id}` (202).
+- `GET  /scrapers/<source>/status?run_id=…&dataset_id=…` → `{status, items_scraped, is_terminal, succeeded}` (polled during the scraping phase).
+- `POST /scrapers/<source>/process-chunk` — `{dataset_id, scrape_run_id, offset, chunk_size, resume?, urls?, competitor_name?}` → processes ONE chunk (map+enrich+validate+save as a committed checkpoint) and returns `{processed_items, total_items, total_saved, done, stopped, saved_in_chunk, results:[…]}`. The browser calls it in a loop until `done`; each call is a checkpoint. `resume=true` is required to continue a run already closed as `STOPPED` (so an in-flight chunk arriving right after a `/stop` can't accidentally un-stop it). A `SUCCEEDED` run is never reprocessed. `ScraperProcessChunkView`.
+- `POST /scrapers/<source>/stop` — `{scrape_run_id, run_id}` → phase-aware stop: if the Apify run is still **RUNNING**, aborts it gracefully (dataset keeps what it collected; the browser then processes that partial data to the end); if **PROCESSING**, sets `stop_requested` and closes the run as `STOPPED` (everything saved so far is kept, the rest is resumable). Audited (`SCRAPE_STOP`). `ScraperStopView`.
+- `GET /scrapers/<source>/pending` → runs of this source left **mid-processing** (RUNNING/PROCESSING, or STOPPED with `processed_items < total_items`) with a dataset, for the frontend's "Reanudar" banner. Returns `{pending:[{scrape_run_id, dataset_id, apify_run_id, status, processed_items, total_items, records_saved, query, params, started_at}]}`. `ScraperPendingView`.
+- `POST /scrapers/<source>/finalize` — the legacy one-shot save `{"dataset_id": "…", "urls": [...], "competitor_name": "…"}` → `{saved, results: [...]}` (kept for compatibility; the UI now uses `/process-chunk`).
 - `GET /scrapers/<source>/data` — **historical** read of stored `CompetitorMarketData` for that source (the frontend's always-on "Datos recolectados" table). Query params: `page` (default 1), `page_size` (default 10, max 50), `min_price`, `max_price`, `state`, `municipality` (the last two filter on the linked `Competitor`, case-insensitive exact), `search` (icontains over product/competitor/category/promotions). Returns `{count, page, page_size, num_pages, results, available_states, available_municipalities}` — the two `available_*` lists feed the filter dropdowns. Each result also carries `price_usd`, `matched_product` and `is_in_stock`. `ScraperDataView`, `SOURCE_TAGS` maps the URL `source` → the `CompetitorMarketData.source` tag.
 - `PATCH/DELETE /scrapers/<source>/data/<pk>` — **manual edit/delete** of a stored row by the admin (`ScraperDataDetailView`). PATCH accepts the editable attribute fields only (`product_name`, `category`, `price`, `currency`, `promotions`, `is_in_stock` — the competitor is an entity, not edited here) and **re-stamps `price_usd`** with the latest rate when price/currency change. The row must belong to `<source>`.
 - `GET /scrapers/<source>/rejected` — lists the **discarded** rows (`RejectedMarketData`) for that source with their `rejection_reason` (`ScraperRejectedView`, paginated, `search`). These are the rows the quality gate rejected — kept out of the clean table but surfaced here so the admin can see what was dropped and why. `DELETE /scrapers/<source>/rejected/<pk>` removes one.
@@ -225,7 +234,7 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 /api/analytics/stats/         → descriptive statistics: dashboard (IsViewer — home panel; role-aware: Manager/Admin & Viewer get the company exec panel, SELLER gets a personal scope, WAREHOUSE gets stats.warehouse_dashboard — inventory/products only, no sales/clients/revenue), {customers,products,sales,quotes} (Manager+). Live ORM aggregations in apps/analytics/stats.py
 /api/settings/                → configuración global (SystemSettings, apps/core/settings_api.py): GET (Manager+) / PATCH (Admin); acciones exchange-rate (carga manual), exchange-rate/fetch (API), llm-test (Admin); company (IsViewer, branding de los PDFs). Ver "System settings" abajo
 /api/audit/                   → bitácora de auditoría (ADMIN, apps/audit): logs (listado paginado/filtrable), meta (facetas de filtro), logs/export (CSV), logs/purge (POST, borra por antigüedad). Ver "System logs (auditoría)" abajo
-/scrapers/                    → <source>/start, <source>/status, <source>/finalize (ADMIN only)
+/scrapers/                    → <source>/start, <source>/status, <source>/process-chunk (procesamiento reanudable por lotes), <source>/stop (detener con guardado), <source>/pending (reanudar), <source>/finalize (legacy) (ADMIN only)
 ```
 
 All `/api/` list endpoints are paginated by DRF (`apps/core/pagination.StandardResultsSetPagination`,
@@ -440,7 +449,8 @@ change), `action` (`ActionChoices`), `category` (`CategoryChoices`, derived from
   sales create/void/**invoice** + quote create/**convert** + **dispatch-order create/status** (`apps/sales/views`;
   actions `SALE_INVOICE`/`QUOTE_CONVERT`/`DISPATCH_CREATE`/`DISPATCH_UPDATE`, all category `VENTAS`), manual inventory movements
   (`apps/inventory/views` — sale-driven `SAL` movements are **not** double-logged, they go through
-  `inventory.services.apply_movement`), scrape start (`apps/competitor_market_data/views`), report
+  `inventory.services.apply_movement`), scrape start + **stop** (`apps/competitor_market_data/views`;
+  `SCRAPE_START`/`SCRAPE_STOP`, category `SCRAPERS`), report
   generation (`analytics/views.ReportNarrativeView`), predictive-model retraining
   (`analytics/views.RetrainModelsView`, `MODELS_RETRAIN`/`ANALITICA`), settings PATCH + exchange-rate set/fetch
   (`core/settings_api`), product & customer create/update (`perform_create`/`perform_update`),

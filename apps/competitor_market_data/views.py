@@ -1,3 +1,4 @@
+import logging
 import os
 from decimal import Decimal, InvalidOperation
 
@@ -13,8 +14,11 @@ from apps.audit import services as audit
 from apps.audit.models import ActionChoices
 from apps.benchmarking.models import CompetitorMarketData, RejectedMarketData, ScrapeRun
 from apps.competitor_market_data.enrichment import deepseek
-from apps.competitor_market_data.scrapers import get_run_progress
+from apps.competitor_market_data.scrapers import get_client, get_run_progress
+from apps.competitor_market_data.scrapers.persistence import finalize_run, persist_batch
 from apps.competitor_market_data.scrapers.validation import get_latest_rate, stamp_price_usd
+
+logger = logging.getLogger(__name__)
 
 # Interruptor para abrir el endpoint de prueba del LLM (/scrapers/llm/test) sin
 # autenticación, útil para probarlo desde Postman en desarrollo. Por defecto está
@@ -23,45 +27,75 @@ from apps.competitor_market_data.scrapers.validation import get_latest_rate, sta
 LLM_TEST_PUBLIC = os.environ.get("LLM_TEST_PUBLIC", "False").lower() in ("1", "true", "yes")
 from apps.competitor_market_data.scrapers.facebook_marketplace_scraper import (
     finalize_facebook,
+    process_facebook_items,
+    read_facebook_units,
     start_facebook_run,
 )
 from apps.competitor_market_data.scrapers.instagram_scraper import (
     finalize_instagram,
+    process_instagram_items,
+    read_instagram_units,
     start_instagram_run,
 )
 from apps.competitor_market_data.scrapers.mercadolibre_scraper import (
     finalize_mercadolibre,
+    process_mercadolibre_items,
+    read_mercadolibre_units,
     start_mercadolibre_run,
 )
 from apps.competitor_market_data.scrapers.website_scraper import (
     finalize_website,
+    process_website_items,
+    read_website_units,
     start_website_run,
 )
 
 # Registro de scrapers disponibles, indexado por el segmento de URL `source`.
-# `needs_competitor` indica que el scraper usa `competitor_name`/`urls` al finalizar.
+# `needs_competitor` indica que el scraper usa `competitor_name`/`urls`.
+# `read_units`/`process_items` habilitan el PROCESAMIENTO POR LOTES (checkpoints
+# reanudables): `read_units(dataset_id, urls=…)` devuelve la lista de unidades del
+# dataset (barato) y `process_items(chunk, urls=…, competitor_name=…)` mapea+enriquece
+# un trozo (caro). `uses_llm` marca las fuentes cuyo `enriched_by` refleja el LLM.
 SCRAPERS = {
     "instagram": {
         "start": start_instagram_run,
         "finalize": finalize_instagram,
+        "read_units": read_instagram_units,
+        "process_items": process_instagram_items,
         "needs_competitor": False,
+        "uses_llm": True,
     },
     "facebook": {
         "start": start_facebook_run,
         "finalize": finalize_facebook,
+        "read_units": read_facebook_units,
+        "process_items": process_facebook_items,
         "needs_competitor": False,
+        "uses_llm": True,
     },
     "website": {
         "start": start_website_run,
         "finalize": finalize_website,
+        "read_units": read_website_units,
+        "process_items": process_website_items,
         "needs_competitor": True,
+        "uses_llm": False,
     },
     "mercadolibre": {
         "start": start_mercadolibre_run,
         "finalize": finalize_mercadolibre,
+        "read_units": read_mercadolibre_units,
+        "process_items": process_mercadolibre_items,
         "needs_competitor": False,
+        "uses_llm": True,
     },
 }
+
+# Tamaño de lote por defecto del procesamiento (checkpoint cada N unidades). Se
+# mantiene bajo para las fuentes con LLM/OCR (checkpoints frecuentes, muy por debajo
+# de los 10 min pedidos); el frontend puede enviar su propio `chunk_size`.
+DEFAULT_CHUNK_SIZE = 5
+MAX_CHUNK_SIZE = 50
 
 # Mapea el `source` de la URL al tag almacenado en CompetitorMarketData.source.
 SOURCE_TAGS = {
@@ -293,6 +327,344 @@ class ScraperFinalizeView(APIView):
             {"saved": len(records), "results": _serialize_records(records)},
             status=status.HTTP_201_CREATED,
         )
+
+
+def _parse_nonneg_int(value, default: int) -> int:
+    """Convierte un parámetro a entero ≥ 0; cae al default si es inválido."""
+    try:
+        parsed = int(value)
+        return parsed if parsed >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_run(request: Request):
+    """Ubica el ScrapeRun por `scrape_run_id` (preferido) o por `run_id` de Apify."""
+    scrape_run_id = request.data.get("scrape_run_id")
+    if scrape_run_id:
+        run = ScrapeRun.objects.filter(id=scrape_run_id).first()
+        if run is not None:
+            return run
+    run_id = request.data.get("run_id")
+    if run_id:
+        return ScrapeRun.objects.filter(apify_run_id=run_id).order_by("-id").first()
+    return None
+
+
+def _run_progress_payload(scrape_run) -> dict:
+    """Progreso del procesamiento reanudable, para las respuestas de stop/chunk."""
+    terminal = scrape_run.status in (
+        ScrapeRun.StatusChoices.SUCCEEDED,
+        ScrapeRun.StatusChoices.STOPPED,
+        ScrapeRun.StatusChoices.FAILED,
+    )
+    return {
+        "scrape_run_id": scrape_run.id,
+        "status": scrape_run.status,
+        "stop_requested": scrape_run.stop_requested,
+        "processed_items": scrape_run.processed_items,
+        "total_items": scrape_run.total_items,
+        "total_saved": scrape_run.records_saved,
+        "total_discarded": scrape_run.records_discarded,
+        "done": terminal,
+        "stopped": scrape_run.status == ScrapeRun.StatusChoices.STOPPED,
+    }
+
+
+class ScraperStopView(APIView):
+    """
+    POST /scrapers/<source>/stop   {"scrape_run_id": N, "run_id": "..."}
+
+    Detiene el run. El efecto depende de la fase:
+
+    - **Recolectando** (Apify aún corriendo): aborta la recolección en Apify de forma
+      elegante (conserva lo ya recolectado). NO frena el procesamiento: el frontend
+      procesará luego lo recolectado hasta ahí.
+    - **Procesando** (guardando por lotes): marca la señal de parada y cierra el run
+      como DETENIDO. Lo ya procesado quedó guardado (checkpoints); lo pendiente se
+      puede reanudar después. Un lote en vuelo termina de guardarse igual.
+
+    Acceso: ADMIN.
+    """
+
+    permission_classes = [IsAdmin]
+
+    def post(self, request: Request, source: str) -> Response:
+        if _validate_source(source) is None:
+            return Response(
+                {"error": f"Fuente de datos desconocida: '{source}'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        scrape_run = _resolve_run(request)
+        if scrape_run is None:
+            return Response(
+                {"error": "No se encontró el run a detener."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        run_id = request.data.get("run_id") or scrape_run.apify_run_id
+        aborted = False
+
+        if scrape_run.status == ScrapeRun.StatusChoices.RUNNING:
+            # Fase de recolección: abortar en Apify (mejor esfuerzo, elegante para que
+            # el dataset conserve lo recolectado). El procesamiento sigue después.
+            if run_id:
+                try:
+                    get_client().run(run_id).abort(gracefully=True)
+                    aborted = True
+                except Exception as exc:
+                    logger.warning("No se pudo abortar el run de Apify %s: %s", run_id, exc)
+            scrape_run.stop_requested = True
+            scrape_run.notes = "Recolección detenida por el usuario; se procesa lo recolectado."
+            scrape_run.save(update_fields=["stop_requested", "notes"])
+        elif scrape_run.status == ScrapeRun.StatusChoices.PROCESSING:
+            # Fase de procesamiento: cerrar como DETENIDO conservando lo guardado.
+            scrape_run.stop_requested = True
+            scrape_run.save(update_fields=["stop_requested"])
+            finalize_run(
+                scrape_run,
+                status=ScrapeRun.StatusChoices.STOPPED,
+                notes="Procesamiento detenido por el usuario; se guardó lo procesado.",
+            )
+
+        audit.log(
+            request=request,
+            action=ActionChoices.SCRAPE_STOP,
+            description=f"Detuvo el scraping de «{source}» (guardando lo procesado).",
+            target=scrape_run,
+            target_model="ScrapeRun",
+            metadata={
+                "source": source,
+                "aborted_apify": aborted,
+                "processed_items": scrape_run.processed_items,
+                "total_items": scrape_run.total_items,
+            },
+        )
+
+        payload = _run_progress_payload(scrape_run)
+        payload["aborted"] = aborted
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class ScraperProcessChunkView(APIView):
+    """
+    POST /scrapers/<source>/process-chunk
+
+    Procesa UN LOTE del dataset (mapea + enriquece con LLM/OCR + valida + guarda) y
+    lo confía a la base de datos como **checkpoint reanudable**. El frontend lo llama
+    en bucle (offset creciente) hasta `done`, de modo que:
+
+      - lo procesado se va guardando por lotes (si se corta la luz o se cierra la
+        pestaña, no se pierde el trabajo ya hecho — se reanuda desde `processed_items`);
+      - una parada a mitad guarda lo procesado hasta ese punto.
+
+    Cuerpo:
+    {
+        "dataset_id": "...",         (requerido)
+        "scrape_run_id": N,          (requerido)
+        "offset": 0,                 (unidades ya procesadas; default 0)
+        "chunk_size": 5,             (opcional)
+        "urls": [...],               (solo `website`, para resolver el competidor)
+        "competitor_name": "..."     (opcional, solo `website`)
+    }
+
+    Respuesta: progreso + los registros guardados en ESTE lote. Acceso: ADMIN.
+    """
+
+    permission_classes = [IsAdmin]
+
+    def post(self, request: Request, source: str) -> Response:
+        config = _validate_source(source)
+        if config is None:
+            return Response(
+                {"error": f"Fuente de datos desconocida: '{source}'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        dataset_id = request.data.get("dataset_id")
+        if not dataset_id:
+            return Response(
+                {"error": "El campo 'dataset_id' es requerido."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        scrape_run = _resolve_run(request)
+        if scrape_run is None:
+            return Response(
+                {"error": "No se encontró el run a procesar."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Un run ya cerrado con éxito no se reprocesa (evita duplicar observaciones).
+        if scrape_run.status == ScrapeRun.StatusChoices.SUCCEEDED:
+            return Response(_run_progress_payload(scrape_run), status=status.HTTP_200_OK)
+
+        # Reanudar es EXPLÍCITO (`resume=true`). Un run ya DETENIDO no se reprocesa sin
+        # esa señal: así un lote en vuelo que llega justo después de un /stop no
+        # "des-detiene" el run por accidente (respeta la parada).
+        resume = bool(request.data.get("resume"))
+        if scrape_run.status == ScrapeRun.StatusChoices.STOPPED and not resume:
+            return Response(_run_progress_payload(scrape_run), status=status.HTTP_200_OK)
+
+        offset = _parse_nonneg_int(request.data.get("offset"), scrape_run.processed_items or 0)
+        chunk_size = request.data.get("chunk_size", DEFAULT_CHUNK_SIZE)
+        chunk_size = max(1, min(_parse_nonneg_int(chunk_size, DEFAULT_CHUNK_SIZE) or DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE))
+
+        urls = request.data.get("urls") or scrape_run.query or []
+        competitor_name = request.data.get("competitor_name")
+        if competitor_name is None:
+            competitor_name = (scrape_run.params or {}).get("competitor_name")
+
+        # Lee las unidades del dataset (barato). El trabajo caro (LLM/OCR) se hace solo
+        # sobre el trozo. Re-leer el dataset por lote es aceptable a esta escala.
+        try:
+            units = config["read_units"](dataset_id, urls=urls)
+        except Exception as exc:
+            _mark_run_failed(scrape_run, f"Error al leer el dataset: {exc}")
+            return Response(
+                {"error": f"No se pudo leer el dataset de Apify: {exc}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        total = len(units)
+        llm_used = bool(config.get("uses_llm")) and deepseek.is_enabled()
+
+        # Nada que procesar en este trozo (offset al final o dataset vacío): cierra el run.
+        if offset >= total:
+            final_status = (
+                ScrapeRun.StatusChoices.STOPPED
+                if scrape_run.stop_requested
+                else ScrapeRun.StatusChoices.SUCCEEDED
+            )
+            persist_batch(
+                [], scrape_run=scrape_run,
+                processed_items=min(offset, total), total_items=total,
+            )
+            if scrape_run.status not in (
+                ScrapeRun.StatusChoices.SUCCEEDED, ScrapeRun.StatusChoices.STOPPED,
+            ):
+                finalize_run(scrape_run, status=final_status)
+            scrape_run.refresh_from_db()
+            return Response(
+                {**_run_progress_payload(scrape_run), "saved_in_chunk": 0, "results": []},
+                status=status.HTTP_200_OK,
+            )
+
+        # Reanudación EXPLÍCITA de un run detenido: vuelve a marcarlo procesando y
+        # limpia la señal de parada antes de seguir con lo pendiente.
+        if scrape_run.status == ScrapeRun.StatusChoices.STOPPED and resume:
+            ScrapeRun.objects.filter(pk=scrape_run.pk).update(
+                stop_requested=False, status=ScrapeRun.StatusChoices.PROCESSING
+            )
+            scrape_run.refresh_from_db()
+
+        chunk = units[offset:offset + chunk_size]
+        new_offset = offset + len(chunk)
+
+        proc_kwargs = {"urls": urls, "competitor_name": competitor_name}
+        try:
+            instances = config["process_items"](chunk, **proc_kwargs)
+        except Exception as exc:
+            logger.error("Error al procesar el lote (%s, offset=%s): %s", source, offset, exc, exc_info=True)
+            return Response(
+                {"error": f"Error al procesar el lote: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        created, discarded = persist_batch(
+            instances,
+            scrape_run=scrape_run,
+            llm_used=llm_used,
+            processed_items=new_offset,
+            total_items=total,
+        )
+
+        # Re-lee el estado para respetar una parada que llegó durante este lote.
+        scrape_run.refresh_from_db()
+        done = new_offset >= total
+        if done and scrape_run.status not in (
+            ScrapeRun.StatusChoices.SUCCEEDED, ScrapeRun.StatusChoices.STOPPED,
+        ):
+            final_status = (
+                ScrapeRun.StatusChoices.STOPPED
+                if scrape_run.stop_requested
+                else ScrapeRun.StatusChoices.SUCCEEDED
+            )
+            finalize_run(scrape_run, status=final_status)
+            scrape_run.refresh_from_db()
+        elif scrape_run.stop_requested and not done and scrape_run.status == ScrapeRun.StatusChoices.PROCESSING:
+            # El usuario pidió detener durante este lote: cierra como DETENIDO
+            # (lo guardado queda; lo pendiente es reanudable).
+            finalize_run(
+                scrape_run,
+                status=ScrapeRun.StatusChoices.STOPPED,
+                notes="Procesamiento detenido por el usuario; se guardó lo procesado.",
+            )
+            scrape_run.refresh_from_db()
+
+        return Response(
+            {
+                **_run_progress_payload(scrape_run),
+                "saved_in_chunk": len(created),
+                "discarded_in_chunk": discarded,
+                "results": _serialize_records(created),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class ScraperPendingView(APIView):
+    """
+    GET /scrapers/<source>/pending
+
+    Lista los runs de esta fuente que quedaron **a medio procesar** (recolección o
+    procesamiento sin terminar, con dataset) para poder REANUDARLOS tras un cierre de
+    pestaña o corte de energía. Devuelve el offset del checkpoint y los parámetros del
+    run. Acceso: ADMIN.
+    """
+
+    permission_classes = [IsAdmin]
+
+    def get(self, request: Request, source: str) -> Response:
+        tag = SOURCE_TAGS.get(source)
+        if tag is None:
+            return Response(
+                {"error": f"Fuente de datos desconocida: '{source}'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        runs = (
+            ScrapeRun.objects.filter(
+                source=tag,
+                status__in=[
+                    ScrapeRun.StatusChoices.RUNNING,
+                    ScrapeRun.StatusChoices.PROCESSING,
+                    ScrapeRun.StatusChoices.STOPPED,
+                ],
+            )
+            .exclude(dataset_id="")
+            .order_by("-started_at")[:10]
+        )
+
+        pending = [
+            {
+                "scrape_run_id": r.id,
+                "apify_run_id": r.apify_run_id,
+                "dataset_id": r.dataset_id,
+                "status": r.status,
+                "processed_items": r.processed_items,
+                "total_items": r.total_items,
+                "records_saved": r.records_saved,
+                "query": r.query,
+                "params": r.params,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+            }
+            for r in runs
+            # Solo los realmente reanudables: aún colectando, o con pendientes por procesar.
+            if r.status != ScrapeRun.StatusChoices.STOPPED or r.processed_items < r.total_items
+        ]
+        return Response({"pending": pending}, status=status.HTTP_200_OK)
 
 
 class LLMConnectionTestView(APIView):

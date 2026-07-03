@@ -19,6 +19,8 @@ import logging
 from decimal import Decimal
 from typing import Optional
 
+from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 
 from .matching import apply_llm_product_matches, build_product_index, match_product
@@ -66,17 +68,31 @@ def ensure_scrape_run(scrape_run, source: str, dataset_id: str = "", *, query=No
     )
 
 
-def persist_records(instances: list, *, scrape_run=None, llm_used: bool = False) -> list:
-    """Enriquece, valida, guarda y archiva descartes. Retorna las filas creadas.
+def persist_batch(
+    instances: list,
+    *,
+    scrape_run=None,
+    llm_used: bool = False,
+    processed_items: Optional[int] = None,
+    total_items: Optional[int] = None,
+) -> tuple[list, int]:
+    """Enriquece, valida, guarda y archiva descartes de UN LOTE. **Checkpoint atómico.**
 
-    `instances` son `CompetitorMarketData` ya mapeados (con su `raw_metadata`). Si
-    se da `scrape_run`, se enlazan las filas y se actualizan sus conteos/estado.
+    A diferencia de `persist_records`, NO cierra el run: **acumula** sus conteos y
+    (si se dan) fija el avance del procesamiento (`processed_items`/`total_items`).
+    Todo el lote —filas guardadas, descartes archivados y avance— se escribe dentro
+    de una única transacción, de modo que un corte a mitad de camino no deja un
+    checkpoint parcial (no se re-procesa un lote ya contado).
+
+    Retorna `(created, discarded_count)`.
     """
-    from apps.benchmarking.models import CompetitorMarketData, RejectedMarketData
+    from apps.benchmarking.models import CompetitorMarketData, RejectedMarketData, ScrapeRun
 
     if not instances:
-        _finish_run(scrape_run, collected=0, saved=0, discarded=0)
-        return []
+        # Lote vacío: solo actualiza el avance/estado si corresponde.
+        if scrape_run is not None and (processed_items is not None or total_items is not None):
+            _checkpoint_progress(scrape_run, processed_items, total_items)
+        return [], 0
 
     # Tasa de cambio una sola vez para todo el lote (snapshot reproducible).
     rate = get_latest_rate()
@@ -107,46 +123,96 @@ def persist_records(instances: list, *, scrape_run=None, llm_used: bool = False)
 
     valid, discarded = partition_valid(instances, usd_rate=usd_rate)
 
-    created = CompetitorMarketData.objects.bulk_create(valid)
+    with transaction.atomic():
+        created = CompetitorMarketData.objects.bulk_create(valid)
 
-    # Archiva los descartes (no se pierden: auditables) — item 3.
-    if discarded:
-        rejected = [
-            RejectedMarketData(
-                scrape_run=scrape_run,
-                source=inst.source,
-                competitor_name=(inst.competitor_name or "")[:150],
-                product_name=(inst.product_name or "")[:255],
-                category=(inst.category or "")[:100],
-                price=inst.price,
-                currency=(inst.currency or "")[:3],
-                url=(inst.url or "")[:500],
-                rejection_reason=reason[:255],
-                raw_metadata=inst.raw_metadata,
-            )
-            for inst, reason in discarded
-        ]
-        RejectedMarketData.objects.bulk_create(rejected)
+        # Archiva los descartes (no se pierden: auditables) — item 3.
+        if discarded:
+            rejected = [
+                RejectedMarketData(
+                    scrape_run=scrape_run,
+                    source=inst.source,
+                    competitor_name=(inst.competitor_name or "")[:150],
+                    product_name=(inst.product_name or "")[:255],
+                    category=(inst.category or "")[:100],
+                    price=inst.price,
+                    currency=(inst.currency or "")[:3],
+                    url=(inst.url or "")[:500],
+                    rejection_reason=reason[:255],
+                    raw_metadata=inst.raw_metadata,
+                )
+                for inst, reason in discarded
+            ]
+            RejectedMarketData.objects.bulk_create(rejected)
 
-    _finish_run(scrape_run, collected=len(instances), saved=len(created), discarded=len(discarded))
+        # Acumula los conteos del run y fija el avance del checkpoint en el MISMO
+        # commit que las filas, para que el checkpoint sea todo-o-nada.
+        if scrape_run is not None:
+            updates = {
+                "records_collected": F("records_collected") + len(instances),
+                "records_saved": F("records_saved") + len(created),
+                "records_discarded": F("records_discarded") + len(discarded),
+            }
+            if processed_items is not None:
+                updates["processed_items"] = processed_items
+            if total_items is not None:
+                updates["total_items"] = total_items
+            # Al empezar a procesar, marca el run como PROCESANDO (no pisa un terminal).
+            if scrape_run.status == ScrapeRun.StatusChoices.RUNNING:
+                updates["status"] = ScrapeRun.StatusChoices.PROCESSING
+            ScrapeRun.objects.filter(pk=scrape_run.pk).update(**updates)
+            scrape_run.refresh_from_db()
+
     logger.info(
-        "Persistencia: %d guardados, %d descartados (de %d mapeados).",
+        "Persistencia (lote): %d guardados, %d descartados (de %d mapeados).",
         len(created), len(discarded), len(instances),
     )
-    return created
+    return created, len(discarded)
 
 
-def _finish_run(scrape_run, *, collected: int, saved: int, discarded: int) -> None:
-    """Marca el run como completado y guarda sus conteos (si hay run)."""
+def _checkpoint_progress(scrape_run, processed_items, total_items) -> None:
+    """Fija el avance del procesamiento sin tocar los conteos (lote vacío)."""
+    from apps.benchmarking.models import ScrapeRun
+
+    updates = {}
+    if processed_items is not None:
+        updates["processed_items"] = processed_items
+    if total_items is not None:
+        updates["total_items"] = total_items
+    if scrape_run.status == ScrapeRun.StatusChoices.RUNNING:
+        updates["status"] = ScrapeRun.StatusChoices.PROCESSING
+    if updates:
+        ScrapeRun.objects.filter(pk=scrape_run.pk).update(**updates)
+        scrape_run.refresh_from_db()
+
+
+def finalize_run(scrape_run, *, status=None, notes: str = "") -> None:
+    """Cierra el run: fija su estado terminal y la hora de fin (si hay run)."""
     if scrape_run is None:
         return
     from apps.benchmarking.models import ScrapeRun
 
-    scrape_run.records_collected = collected
-    scrape_run.records_saved = saved
-    scrape_run.records_discarded = discarded
-    scrape_run.status = ScrapeRun.StatusChoices.SUCCEEDED
+    scrape_run.status = status or ScrapeRun.StatusChoices.SUCCEEDED
     scrape_run.finished_at = timezone.now()
-    scrape_run.save(update_fields=[
-        "records_collected", "records_saved", "records_discarded", "status", "finished_at",
-    ])
+    fields = ["status", "finished_at"]
+    if notes:
+        scrape_run.notes = notes[:2000]
+        fields.append("notes")
+    scrape_run.save(update_fields=fields)
+
+
+def persist_records(instances: list, *, scrape_run=None, llm_used: bool = False) -> list:
+    """Enriquece, valida, guarda y archiva descartes de TODO de una vez (ruta CLI/bloqueante).
+
+    Envuelve `persist_batch` (un solo lote) + `finalize_run(SUCCEEDED)`, conservando
+    el contrato histórico que usan los comandos de management y `finalize_*`.
+    """
+    created, _ = persist_batch(
+        instances,
+        scrape_run=scrape_run,
+        llm_used=llm_used,
+        processed_items=len(instances),
+        total_items=len(instances),
+    )
+    finalize_run(scrape_run, status=None)  # SUCCEEDED
+    return created

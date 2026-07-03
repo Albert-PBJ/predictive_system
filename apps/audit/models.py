@@ -18,6 +18,7 @@ class ActionChoices(models.TextChoices):
     DISPATCH_UPDATE = "DISPATCH_UPDATE", _("Orden de despacho actualizada")
     INVENTORY_MOVEMENT = "INVENTORY_MOVEMENT", _("Movimiento de inventario")
     SCRAPE_START = "SCRAPE_START", _("Scraping iniciado")
+    SCRAPE_STOP = "SCRAPE_STOP", _("Scraping detenido")
     REPORT_GENERATE = "REPORT_GENERATE", _("Reporte ejecutivo generado")
     MODELS_RETRAIN = "MODELS_RETRAIN", _("Modelos predictivos reentrenados")
     USER_CREATE = "USER_CREATE", _("Usuario creado")
@@ -61,6 +62,7 @@ ACTION_CATEGORY = {
     ActionChoices.DISPATCH_UPDATE: CategoryChoices.VENTAS,
     ActionChoices.INVENTORY_MOVEMENT: CategoryChoices.INVENTARIO,
     ActionChoices.SCRAPE_START: CategoryChoices.SCRAPERS,
+    ActionChoices.SCRAPE_STOP: CategoryChoices.SCRAPERS,
     ActionChoices.REPORT_GENERATE: CategoryChoices.REPORTES,
     ActionChoices.MODELS_RETRAIN: CategoryChoices.ANALITICA,
     ActionChoices.USER_CREATE: CategoryChoices.USUARIOS,

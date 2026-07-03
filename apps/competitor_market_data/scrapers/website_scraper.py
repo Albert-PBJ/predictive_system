@@ -311,40 +311,25 @@ def start_website_run(urls: list[str], results_limit: int = 50) -> dict:
         raise ValueError(f"Apify actor falló: {exc}") from exc
 
 
-def finalize_website(
-    dataset_id: str,
-    urls: list[str],
-    competitor_name: Optional[str] = None,
-    scrape_run=None,
-) -> list[CompetitorMarketData]:
-    """
-    Lee el dataset de un run finalizado, normaliza la estructura del AI scraper,
-    resuelve el FK a Competitor (dedupe difuso por nombre) y guarda los registros.
+def read_website_units(dataset_id: str, *, urls: Optional[list[str]] = None, **_) -> list[dict]:
+    """Lee el dataset del AI scraper y devuelve la lista PLANA de productos (unidades).
 
-    A diferencia de Instagram y Facebook, este scraper resuelve el FK a Competitor
-    en lugar de dejar competitor=None. El guardado (snapshot USD, match al catálogo,
-    validación, archivo de descartes y enlace al run) lo centraliza `persist_records`.
+    Normaliza la estructura del actor (que puede venir anidada) a una lista de dicts de
+    producto; cada uno es una unidad procesable. El mapeo/resolución de competidor lo
+    hace `process_website_items` por lotes.
     """
-    scrape_run = ensure_scrape_run(
-        scrape_run, CompetitorMarketData.SourceChoices.WEBSITE, dataset_id, query=urls or [],
-    )
     client = get_client()
-
     try:
         raw_items = list(client.dataset(dataset_id).iterate_items())
     except Exception as exc:
         logger.error("Error al obtener items del dataset '%s': %s", dataset_id, exc, exc_info=True)
         raise ValueError(f"No se pudieron leer los items del dataset de Apify: {exc}") from exc
 
-    logger.info(
-        "Dataset '%s': %d item(s) crudos recibidos de Apify.", dataset_id, len(raw_items)
-    )
-
+    logger.info("Dataset '%s': %d item(s) crudos recibidos de Apify.", dataset_id, len(raw_items))
     if not raw_items:
         logger.warning("El dataset de Apify está vacío. No se guardarán registros.")
         return []
 
-    # Log the raw structure of the first item to help debug format issues
     first = raw_items[0]
     logger.info(
         "Estructura del primer item: tipo=%s, claves=%s",
@@ -354,17 +339,29 @@ def finalize_website(
 
     product_dicts = _flatten_dataset_items(raw_items)
     logger.info("%d producto(s) encontrados tras normalizar la estructura.", len(product_dicts))
-
     if not product_dicts:
         logger.warning(
             "No se encontraron productos válidos en el dataset. "
             "Revisa la estructura del output del actor con dataset_id='%s'.",
             dataset_id,
         )
-        return []
+    return product_dicts
 
-    # Cache competitors per key to avoid redundant DB hits
-    competitor_cache: dict[str, Competitor] = {}
+
+def process_website_items(
+    product_dicts: list[dict],
+    *,
+    urls: Optional[list[str]] = None,
+    competitor_name: Optional[str] = None,
+    **_,
+) -> list[CompetitorMarketData]:
+    """Mapea un lote de productos → instancias, resolviendo el FK a Competitor (sin persistir).
+
+    A diferencia de Instagram y Facebook, este scraper resuelve el FK a Competitor
+    (dedupe difuso por nombre) en lugar de dejar competitor=None.
+    """
+    urls = urls or []
+    competitor_cache: dict[str, Competitor] = {}   # evita hits de DB redundantes
     instances: list[CompetitorMarketData] = []
 
     for product in product_dicts:
@@ -393,12 +390,33 @@ def finalize_website(
                 exc_info=True,
             )
 
+    return instances
+
+
+def finalize_website(
+    dataset_id: str,
+    urls: list[str],
+    competitor_name: Optional[str] = None,
+    scrape_run=None,
+) -> list[CompetitorMarketData]:
+    """Lee, normaliza, mapea y guarda todo de una vez (CLI/bloqueante).
+
+    El guardado (snapshot USD, match al catálogo, validación, archivo de descartes y
+    enlace al run) lo centraliza `persist_records`.
+    """
+    scrape_run = ensure_scrape_run(
+        scrape_run, CompetitorMarketData.SourceChoices.WEBSITE, dataset_id, query=urls or [],
+    )
+
+    product_dicts = read_website_units(dataset_id, urls=urls)
+    if not product_dicts:
+        return []
+
+    instances = process_website_items(product_dicts, urls=urls, competitor_name=competitor_name)
     if not instances:
         logger.error("Ningún producto pudo ser mapeado. No se guardarán registros.")
         return []
 
-    # Snapshot USD + match al catálogo + validación de calidad (descarta lo no
-    # plausible y archiva los descartes) + enlace al run, todo en persist_records.
     try:
         created = persist_records(instances, scrape_run=scrape_run, llm_used=False)
     except Exception as exc:
