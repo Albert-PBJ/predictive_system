@@ -84,6 +84,13 @@ class Sale(models.Model):
     status = models.CharField(max_length=4, choices=StatusChoices.choices, default=StatusChoices.COMPLETED)
     notes = models.TextField(blank=True)
 
+    # Continuidad operativa: referencia de la operación registrada offline (en Excel)
+    # e importada luego. Sirve para evitar duplicados al reimportar el mismo archivo.
+    import_ref = models.CharField(
+        max_length=60, null=True, blank=True, db_index=True,
+        help_text=_("Referencia de la operación importada desde Excel (continuidad operativa); evita duplicados al reimportar"),
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -198,6 +205,12 @@ class Quote(models.Model):
         null=True, blank=True,
         related_name="source_quote",
         help_text=_("Venta generada a partir de este presupuesto"),
+    )
+
+    # Continuidad operativa: referencia del presupuesto registrado offline e importado.
+    import_ref = models.CharField(
+        max_length=60, null=True, blank=True, db_index=True,
+        help_text=_("Referencia del presupuesto importado desde Excel (continuidad operativa); evita duplicados al reimportar"),
     )
 
     created_at = models.DateTimeField(auto_now_add=True)

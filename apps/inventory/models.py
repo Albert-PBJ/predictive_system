@@ -23,6 +23,14 @@ class InventoryMovement(models.Model):
     quantity = models.IntegerField(
         help_text=_("Cantidad movida (positivo=entrada, negativo=salida)"),
     )
+    unit_cost_usd = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text=_(
+            "Costo unitario en USD del movimiento: precio de compra en las entradas "
+            "(insumo del costo promedio ponderado) y costo promedio aplicado en las "
+            "salidas por venta (trazabilidad del CMV)."
+        ),
+    )
     sale = models.ForeignKey(
         "sales.Sale",
         on_delete=models.SET_NULL,
@@ -43,6 +51,13 @@ class InventoryMovement(models.Model):
     )
     movement_date = models.DateField(help_text=_("Fecha del movimiento"))
     notes = models.TextField(blank=True)
+
+    # Continuidad operativa: referencia del movimiento registrado offline (Excel) e
+    # importado luego. Evita duplicados al reimportar el mismo archivo.
+    import_ref = models.CharField(
+        max_length=60, null=True, blank=True, db_index=True,
+        help_text=_("Referencia del movimiento importado desde Excel (continuidad operativa); evita duplicados al reimportar"),
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
 

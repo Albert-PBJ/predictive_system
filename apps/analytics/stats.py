@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from django.db.models import Avg, Count, F, Max, Min, Q, Sum
-from django.db.models.functions import TruncDay, TruncMonth
+from django.db.models.functions import Coalesce, TruncDay, TruncMonth
 
 from apps.core.models import SERVICE_SKU_PREFIX, Customer, ExchangeRate, Product
 from apps.sales.models import Quote, Sale, SaleItem
@@ -404,7 +404,10 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool, personal: bo
                 "retail_value": _f(p.stock * (p.sale_price_usd or 0)),
             }
             if sensitive:
-                row["cost_value"] = _f(p.stock * (p.purchase_price_usd or 0))
+                # Valorado al costo promedio ponderado (CMV) vigente; cae al precio de
+                # compra si el promedio aún no se ha calculado.
+                cost_basis = p.average_cost_usd if p.average_cost_usd is not None else (p.purchase_price_usd or 0)
+                row["cost_value"] = _f(p.stock * cost_basis)
             no_demand.append(row)
         no_demand_count = no_demand_qs.count()
 
@@ -440,7 +443,7 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool, personal: bo
     # (sin stock) se excluyen: no son existencias físicas.
     phys = Product.objects.filter(is_active=True).exclude(sku__startswith=SERVICE_SKU_PREFIX)
     inv = phys.aggregate(
-        cost=Sum(F("stock") * F("purchase_price_usd")),
+        cost=Sum(F("stock") * Coalesce(F("average_cost_usd"), F("purchase_price_usd"))),
         retail=Sum(F("stock") * F("sale_price_usd")),
         units=Sum("stock"),
     )
@@ -959,7 +962,7 @@ def products(start: date, end: date) -> dict:
 
     # Valor del inventario (a costo y a precio de venta).
     val = phys.aggregate(
-        cost=Sum(F("stock") * F("purchase_price_usd")),
+        cost=Sum(F("stock") * Coalesce(F("average_cost_usd"), F("purchase_price_usd"))),
         retail=Sum(F("stock") * F("sale_price_usd")),
         units=Sum("stock"),
     )

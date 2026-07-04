@@ -61,6 +61,7 @@ INSTALLED_APPS = [
     "apps.benchmarking",
     "apps.analytics",
     "apps.audit",
+    "apps.data_exchange",
 ]
 
 MIDDLEWARE = [

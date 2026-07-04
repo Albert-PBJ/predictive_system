@@ -28,6 +28,7 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
             "movement_type",
             "movement_type_display",
             "quantity",
+            "unit_cost_usd",
             "sale",
             "reference",
             "responsible",
@@ -71,6 +72,12 @@ class MovementCreateSerializer(serializers.Serializer):
         choices=InventoryMovement.MovementTypeChoices.choices
     )
     quantity = serializers.IntegerField()
+    # Costo unitario de compra (USD): en una ENTRADA recalcula el costo promedio
+    # ponderado del producto. Opcional; en ajustes/devoluciones se ignora salvo que
+    # se quiera fijar un costo explícito.
+    unit_cost = serializers.DecimalField(
+        max_digits=10, decimal_places=2, required=False, allow_null=True, min_value=0
+    )
     reference = serializers.CharField(required=False, allow_blank=True, default="")
     notes = serializers.CharField(required=False, allow_blank=True, default="")
     movement_date = serializers.DateField(required=False, allow_null=True)
@@ -119,6 +126,7 @@ class ProductStockSerializer(serializers.ModelSerializer):
             "low_stock",
             "sale_price_usd",
             "purchase_price_usd",
+            "average_cost_usd",
             "is_active",
         )
 

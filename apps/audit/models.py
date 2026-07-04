@@ -34,6 +34,8 @@ class ActionChoices(models.TextChoices):
     PASSWORD_RESET = "PASSWORD_RESET", _("Contraseña restablecida")
     DB_BACKUP = "DB_BACKUP", _("Respaldo de base de datos generado")
     LOG_PURGE = "LOG_PURGE", _("Registros de auditoría purgados")
+    DATA_IMPORT = "DATA_IMPORT", _("Datos importados desde Excel")
+    DATA_EXPORT = "DATA_EXPORT", _("Datos exportados a Excel")
 
 
 class CategoryChoices(models.TextChoices):
@@ -78,6 +80,8 @@ ACTION_CATEGORY = {
     ActionChoices.PASSWORD_RESET: CategoryChoices.AUTH,
     ActionChoices.DB_BACKUP: CategoryChoices.CONFIG,
     ActionChoices.LOG_PURGE: CategoryChoices.CONFIG,
+    ActionChoices.DATA_IMPORT: CategoryChoices.CONFIG,
+    ActionChoices.DATA_EXPORT: CategoryChoices.CONFIG,
 }
 
 

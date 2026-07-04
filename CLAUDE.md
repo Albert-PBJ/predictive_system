@@ -143,6 +143,7 @@ This API has all of its comments as well as API responses in Spanish. Functions,
 | `apps/products` | REST API (ModelViewSet) for Product CRUD — thin layer over `apps/core` models. **`stock` is read-only** in the serializer (it only moves via `InventoryMovement`), so editing a product can't bypass the audit trail. Read = operativo, write = Manager+ |
 | `apps/customers` | REST API (ModelViewSet) for Customer CRUD — thin layer over `apps/core` (no models of its own), same pattern as `apps/products` |
 | `apps/audit` | System logs / **bitácora de auditoría**: AuditLog model + `services.log()` (the single, non-throwing write helper) + the `/api/audit/` read-only API (ADMIN). Every relevant action writes here (who/what/when). See **System logs (auditoría)** below |
+| `apps/data_exchange` | **Continuidad operativa**: import/export Excel of sales, inventory movements, customers & quotes. Schema-driven engine (`schema`→`handlers`→`excel_io`→`services`→`views`, openpyxl) reusing the business services; idempotent via `import_ref`. `/api/data-exchange/`. See **Operational Excel import/export** below |
 
 ### Scraper Flow
 
@@ -241,6 +242,7 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 /api/analytics/stats/         → descriptive statistics: dashboard (IsViewer — home panel; role-aware: Manager/Admin & Viewer get the company exec panel, SELLER gets a personal scope, WAREHOUSE gets stats.warehouse_dashboard — inventory/products only, no sales/clients/revenue), {customers,products,sales,quotes} (Manager+). Live ORM aggregations in apps/analytics/stats.py
 /api/settings/                → configuración global (SystemSettings, apps/core/settings_api.py): GET (Manager+) / PATCH (Admin); acciones exchange-rate (carga manual), exchange-rate/fetch (API), llm-test (Admin); company (IsViewer, branding de los PDFs). Ver "System settings" abajo
 /api/audit/                   → bitácora de auditoría (ADMIN, apps/audit): logs (listado paginado/filtrable), meta (facetas de filtro), logs/export (CSV), logs/purge (POST, borra por antigüedad). Ver "System logs (auditoría)" abajo
+/api/data-exchange/           → import/export Excel de continuidad operativa (apps/data_exchange): <entity>/{template,export,preview,import} con entity ∈ sales|inventory|customers|quotes. template/export = operativo; import = permiso de escritura de la operación (IsSeller ventas/clientes/presupuestos, IsWarehouse inventario). Ver "Operational Excel import/export" abajo
 /scrapers/                    → <source>/start, <source>/status, <source>/process-chunk (procesamiento reanudable por lotes), <source>/stop (detener con guardado), <source>/pending (reanudar), <source>/finalize (legacy); schedules[/due|/<id>[/ran]] (programación automática) (ADMIN only)
 ```
 
@@ -256,7 +258,9 @@ and both run inside a single `transaction.atomic` so a sale/movement never lands
 
 - **`apps/sales/services.create_sale`** — validates stock per line (locks the product rows with
   `select_for_update()`, stripping the model's default ordering via `.order_by()` so PostgreSQL allows
-  `FOR UPDATE`), snapshots the unit cost from the product and the BCV/parallel rates from the latest
+  `FOR UPDATE`), snapshots the **weighted-average unit cost** (`Product.average_cost_usd`, falling back to
+  `purchase_price_usd` when no average has been computed yet — see *Weighted-average costing* below) and the
+  BCV/parallel rates from the latest
   `ExchangeRate`, computes subtotals/profit/`commission` (seller's `commission_rate` × profit) and
   `total_sale_ves` (parallel rate preferred), then decrements stock by writing one `InventoryMovement`
   (type `SAL`, negative qty) per line. The seller is resolved from the authenticated user's `Seller`
@@ -285,8 +289,11 @@ and both run inside a single `transaction.atomic` so a sale/movement never lands
 - **`apps/inventory/services.apply_movement`** — the single chokepoint for stock mutation (append-only):
   locks the product, refuses to drive stock negative (`InsufficientStockError`), writes the
   `InventoryMovement` and updates `Product.stock`. Used by both the sales service and the manual
-  movement endpoint. Manual movements only allow `ENT`/`AJU`/`DEV` (`SAL` is reserved for sales). It
-  also **persists a low-stock `Alert`** (`STOCK_BREAK`, deduped per product, resolved when stock
+  movement endpoint. Manual movements only allow `ENT`/`AJU`/`DEV` (`SAL` is reserved for sales). Takes
+  an optional `unit_cost`: on an **entry** with a known cost it **recomputes the product's moving
+  weighted-average cost** (`_recompute_average_cost`) and stamps it on the movement; on an **exit** it
+  records the average cost applied (COGS) without changing the average — see *Weighted-average costing*
+  below. It also **persists a low-stock `Alert`** (`STOCK_BREAK`, deduped per product, resolved when stock
   recovers) via `_sync_low_stock_alert` — best-effort, wrapped in try/except so it never breaks the movement.
 
 **Permissions (separation of duties):** the model is **not a single linear ladder** —
@@ -471,6 +478,45 @@ change), `action` (`ActionChoices`), `category` (`CategoryChoices`, derived from
   purge itself logs a `LOG_PURGE` entry). The log is **read-only**: no per-row edit/delete endpoint.
   Admin-registered read-only (`has_add_permission`/`has_change_permission` → False; delete kept).
 
+### Operational Excel import/export (`apps/data_exchange`)
+
+**Continuidad operativa:** si el sistema no está disponible, las operaciones se registran offline en
+Excel y se importan al volver. Cubre cuatro operaciones (`entity` ∈ `sales|inventory|customers|quotes`)
+con un **motor dirigido por esquema**, de modo que agregar/ajustar una operación es declarar columnas:
+
+- **`schema.py`** — `Column` (clave/cabecera/tipo/obligatoria/línea/choices/dropdown) + `coerce()` que
+  convierte cada celda (texto/número/fecha/booleano) al tipo de negocio con mensajes de error en español
+  (maneja decimal con coma, varios formatos de fecha, SI/NO, etc.).
+- **`handlers.py`** — un `Handler` por operación: columnas, si es **agrupada** (ventas/presupuestos: varias
+  filas con la misma «Referencia» = una operación, una fila por línea) o plana (inventario/clientes),
+  `build_records` (agrupa + coerce), `existing_refs` (dedup), `create()` (**reutiliza el servicio real**:
+  `create_sale`/`apply_movement`/`create_quote`/`Customer.objects.create`, y sella `import_ref`), y
+  `export_rows`. Registro `HANDLERS` + `reference_sheet_rows` (catálogos de apoyo para la plantilla).
+- **`excel_io.py`** — lee la hoja (empareja cabeceras ignorando mayúsculas/acentos, exige las obligatorias),
+  y construye la **plantilla** (hoja Instrucciones + hoja de datos con listas desplegables para los enums +
+  hojas de referencia Productos/Clientes/Vendedores) y el **export** (mismos encabezados = sirve de respaldo).
+- **`services.py`** — `run_import(entity, file, user, *, commit)`: por cada registro, en su **propia
+  transacción**, intenta crear con el servicio; con `commit=False` (**preview**) ejecuta la misma creación
+  y hace **rollback** (valida stock/cliente/producto de verdad sin persistir). Los duplicados (referencia ya
+  en BD o repetida en el archivo) se **omiten** → reimportar es idempotente. Una fila con error no tumba a
+  las demás. Audita `DATA_IMPORT`/`DATA_EXPORT` con la categoría de la operación.
+- **`views.py`/`urls.py`** — `TemplateView`/`ExportView` (permiso `export`, operativo) y
+  `ImportPreviewView`/`ImportCommitView` (permiso `import` = escritura de la operación: `IsSeller` para
+  ventas/clientes/presupuestos, `IsWarehouse` para inventario). Devuelven el .xlsx (blob) o el JSON de
+  resultados (`summary` + `records[]` con estado por fila).
+
+**Idempotencia/dedup:** `import_ref` (indexado, nulable) en `Sale`/`Quote`/`InventoryMovement`; los clientes
+deduplican por `rif` (único). Requiere `migrate` (migraciones `sales/0005`, `inventory/0003`, `audit/0007`).
+Usa `openpyxl` (ya en `requirements.txt`).
+
+**Guarda anti-reimportación del export** (`handler.reserved_refs`): el export emite una «Referencia»
+**reservada** con prefijo `RESERVED_REF_PREFIX = "SYS-"` (`SYS-VENTA-<id>`, `SYS-MOV-<id>`, `SYS-PRES-<id>`)
+para los registros que **no** provienen de una importación; la importación **rechaza** (estado `error`)
+cualquier ref que empiece con `SYS-` o que coincida con un identificador ya generado por el sistema
+(nº de factura en ventas, nº de presupuesto en presupuestos — `_natural_collisions`). Así reimportar un
+export nunca re-crea registros (los que sí tenían `import_ref` se omiten como duplicados; el resto se
+rechazan). No hay falsos positivos con referencias propias del usuario mientras no usen el prefijo `SYS-`.
+
 ### Key Design Decisions
 
 **Dual-currency everywhere:** Venezuela's economy requires tracking both official BCV rate and parallel market rate. Sale, Quote, ProductPriceHistory, and ExchangeRate all carry both `bcv_rate` and `parallel_rate`. All prices are stored in USD; VES values are derived or stored alongside.
@@ -480,6 +526,8 @@ change), `action` (`ActionChoices`), `category` (`CategoryChoices`, derived from
 **Quote-to-sale conversion:** `Quote` has a nullable FK to `Sale`; status `CONVERTED` tracks the pipeline.
 
 **Inventory is append-only:** Never mutate stock directly — always create an `InventoryMovement` with type `ENT/SAL/AJU/DEV`. `Product.stock` is the current value; movements are the audit trail.
+
+**Weighted-average costing (promedio ponderado móvil):** The inventory valuation method is a **perpetual moving weighted average**, the standard fit for a dollarized Venezuelan furniture PYME (FIFO/specific-ID are overkill for fungible catalog items; LIFO is banned under VEN-NIF/IFRS). `Product.average_cost_usd` holds the running average; it's **initialized from `purchase_price_usd`** on first save (`Product.save()`) and **recomputed on every entry with a known unit cost** by `apply_movement` (`_recompute_average_cost`: `new_avg = (prev_stock·prev_avg + qty·entry_cost) / new_stock`). Sales cost at the current average (`create_sale` reads `average_cost_usd`, falls back to `purchase_price_usd`) and **don't move it**; each `InventoryMovement` carries `unit_cost_usd` (purchase cost on entries, COGS applied on exits) for a full cost audit trail. `average_cost_usd` is **read-only in the product/stock APIs** — like `stock`, it's maintained only through movements, so editing the reference `purchase_price_usd` in the catalog never rewrites the average (only real receipts do). Warehouse/manager enter the purchase unit cost when registering an `ENT` movement (the manual-movement endpoint accepts `unit_cost`). Migration `core/0006` backfills existing rows (`average_cost_usd = purchase_price_usd`); the change is **metric-neutral** for the seeded history (seeded sales/movements are bulk-created with their own inline cost, bypassing these services, and every product's average starts equal to its old `purchase_price_usd`), so the ML profit/utilidad series are unchanged. The **inventory-on-hand valuation** in the dashboards (`analytics/stats.py`: exec inventory-health, warehouse dashboard, and the no-demand immobilized-capital rows) values stock at `Coalesce(average_cost_usd, purchase_price_usd)` for consistency with the CPP method — identical today, diverging only after real purchases move the average. The sales profit aggregates read persisted `Sale.total_profit_usd` (unaffected).
 
 **Service products (stockless, flexible price):** A product whose SKU starts with `SERVICE_SKU_PREFIX` (`"MSC-SERV-"`, in `apps/core/models.py`) is a **service** — no inventory, price set at sale time. Check it with `Product.is_service` (instance) or `sku__startswith=SERVICE_SKU_PREFIX` (queryset). Services: skip stock validation + write no `InventoryMovement` in `sales.services.create_sale`/`void_sale`; are excluded from the stock-control view (`inventory.StockListView`), the inventory-health/stock-status/no-demand aggregates (`analytics.stats`), and the inventory/restock forecasts (`analytics.ml.forecasters.forecast_inventory`, `OverviewView` restock). They are **kept in** the demand/sales/profit/price ML datasets and the catalog/sales stats. The seeded **"Mantenimiento"** product (`MSC-SERV-001`, category "Servicios") is the first one; its synthetic history is generated *smooth* (same trend/seasonality/Jan-2026 shock, low noise) so it doesn't degrade the ML metrics — verified by re-running `train_models` after `seed_company_data`. Frontend mirrors this via `isService()` in `services/productsService.ts`. (`seed_company_data` also sets realistic customer `created_at` so the dashboard's new-vs-old customer metrics work; this feeds no model.)
 

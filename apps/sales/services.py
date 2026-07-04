@@ -71,8 +71,9 @@ def create_sale(
 
     `items` es una lista de dicts: ``{"product": <id>, "quantity": <int>,
     "unit_sale_price_usd": <Decimal|None>}``. Si no se indica el precio unitario,
-    se toma el precio de venta actual del producto. El costo unitario siempre se
-    fija (snapshot) desde el precio de compra del producto al momento de la venta.
+    se toma el precio de venta actual del producto. El costo unitario (CMV) se fija
+    (snapshot) desde el **costo promedio ponderado móvil** vigente del producto
+    (`average_cost_usd`); si aún no hay promedio calculado, cae al precio de compra.
 
     Lanza `SaleValidationError` ante datos de negocio inválidos (sin líneas, stock
     insuficiente, producto inexistente), revirtiendo cualquier cambio parcial.
@@ -166,7 +167,10 @@ def create_sale(
             unit_sale = list_price
             disc_pct = Decimal("0")
         disc_pct = max(Decimal("0"), disc_pct).quantize(CENTS, rounding=ROUND_HALF_UP)
-        unit_cost = _money(product.purchase_price_usd or 0)
+        # Costo de venta (CMV) por costo promedio ponderado móvil: se toma el promedio
+        # vigente del producto; si aún no se ha calculado, cae al precio de compra.
+        cost_basis = product.average_cost_usd if product.average_cost_usd is not None else product.purchase_price_usd
+        unit_cost = _money(cost_basis or 0)
         subtotal_sale = _money(unit_sale * qty)
         subtotal_cost = _money(unit_cost * qty)
         line_profit = subtotal_sale - subtotal_cost
@@ -200,6 +204,7 @@ def create_sale(
                 sale=sale,
                 reference=f"Venta #{sale.pk}",
                 movement_date=sale_date,
+                unit_cost=unit_cost,  # CMV aplicado (no altera el promedio, solo deja rastro)
             )
 
     total_profit = total_sale - total_cost

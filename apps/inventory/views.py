@@ -83,6 +83,7 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
                 reference=data.get("reference", ""),
                 notes=data.get("notes", ""),
                 movement_date=data.get("movement_date"),
+                unit_cost=data.get("unit_cost"),
             )
         except InsufficientStockError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -100,6 +101,12 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
                 "quantity": movement.quantity,
                 "product": movement.product.name,
                 "product_id": movement.product_id,
+                "unit_cost_usd": str(movement.unit_cost_usd) if movement.unit_cost_usd is not None else None,
+                "average_cost_usd": (
+                    str(movement.product.average_cost_usd)
+                    if movement.product.average_cost_usd is not None
+                    else None
+                ),
             },
         )
         return Response(

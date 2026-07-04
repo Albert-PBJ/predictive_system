@@ -14,8 +14,10 @@ class ProductSerializer(serializers.ModelSerializer):
         fields = "__all__"
         # El stock es de solo lectura aquí a propósito: el inventario es
         # append-only (se ajusta vía InventoryMovement en el módulo de Inventario),
-        # así que editar un producto nunca puede mover el stock sin dejar rastro.
-        read_only_fields = ("stock", "created_at", "updated_at")
+        # así que editar un producto nunca puede mover el stock sin dejar rastro. El
+        # costo promedio ponderado (`average_cost_usd`) también es de solo lectura: lo
+        # mantiene el inventario en cada entrada, no se edita a mano desde el catálogo.
+        read_only_fields = ("stock", "average_cost_usd", "created_at", "updated_at")
 
     def get_low_stock(self, obj):
         return obj.stock <= obj.min_stock

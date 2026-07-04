@@ -78,7 +78,16 @@ class Product(models.Model):
     # Precios actuales
     purchase_price_usd = models.DecimalField(
         max_digits=10, decimal_places=2, null=True, blank=True,
-        help_text=_("Precio de compra actual en USD"),
+        help_text=_("Precio de compra actual en USD (referencia / última compra)"),
+    )
+    # Costo promedio ponderado móvil (CPP): base del costo de venta (CMV). Lo mantiene
+    # el módulo de inventario, recalculándolo en cada ENTRADA con costo conocido
+    # (`inventory.services.apply_movement`); las salidas/ajustes conservan el promedio.
+    # Se inicializa con `purchase_price_usd` la primera vez (ver `save`). Si queda en
+    # null, los cálculos de costo caen al `purchase_price_usd`.
+    average_cost_usd = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text=_("Costo promedio ponderado móvil en USD (base del CMV; lo recalcula el inventario en cada entrada)"),
     )
     sale_price_usd = models.DecimalField(
         max_digits=10, decimal_places=2,
@@ -111,6 +120,19 @@ class Product(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.sku})" if self.sku else self.name
+
+    def save(self, *args, **kwargs):
+        # Inicializa el costo promedio ponderado con el precio de compra la primera
+        # vez (mientras aún no hay entradas que lo hayan calculado). A partir de ahí
+        # lo mantiene el inventario en cada entrada; editar el producto (p. ej. cambiar
+        # el precio de compra de referencia) NO recalcula el promedio, que solo se
+        # mueve con recepciones reales de mercancía.
+        if self.average_cost_usd is None and self.purchase_price_usd is not None:
+            self.average_cost_usd = self.purchase_price_usd
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None and "average_cost_usd" not in update_fields:
+                kwargs["update_fields"] = list(update_fields) + ["average_cost_usd"]
+        super().save(*args, **kwargs)
 
     @property
     def is_service(self) -> bool:
