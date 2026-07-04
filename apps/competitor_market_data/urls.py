@@ -1,5 +1,11 @@
 from django.urls import path
 
+from apps.competitor_market_data.schedule_views import (
+    ScraperScheduleDetailView,
+    ScraperScheduleDueView,
+    ScraperScheduleListCreateView,
+    ScraperScheduleRanView,
+)
 from apps.competitor_market_data.views import (
     LLMConnectionTestView,
     ScraperDataDetailView,
@@ -16,9 +22,14 @@ from apps.competitor_market_data.views import (
 
 # `source` ∈ {instagram, facebook, website, mercadolibre}. Las rutas existentes
 # (/scrapers/instagram/start, etc.) siguen resolviendo aquí.
-# La ruta literal `llm/test` va primero para que no la capture `<str:source>`.
+# Las rutas literales (`llm/test`, `schedules…`) van primero para que no las capture
+# el patrón genérico `<str:source>`.
 urlpatterns = [
     path("llm/test", LLMConnectionTestView.as_view(), name="llm-connection-test"),
+    path("schedules", ScraperScheduleListCreateView.as_view(), name="scraper-schedules"),
+    path("schedules/due", ScraperScheduleDueView.as_view(), name="scraper-schedules-due"),
+    path("schedules/<int:pk>", ScraperScheduleDetailView.as_view(), name="scraper-schedule-detail"),
+    path("schedules/<int:pk>/ran", ScraperScheduleRanView.as_view(), name="scraper-schedule-ran"),
     path("<str:source>/start", ScraperStartView.as_view(), name="scraper-start"),
     path("<str:source>/status", ScraperStatusView.as_view(), name="scraper-status"),
     path("<str:source>/stop", ScraperStopView.as_view(), name="scraper-stop"),

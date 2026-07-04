@@ -210,13 +210,27 @@ class ScraperStartView(APIView):
             status=ScrapeRun.StatusChoices.RUNNING,
         )
 
+        # Marca si la corrida la disparó una programación automática (auditoría).
+        schedule_id = request.data.get("scheduled_schedule_id")
+        auto = schedule_id is not None
+        description = (
+            f"Inició un scraping AUTOMÁTICO de «{source}» (programación #{schedule_id}) con límite {limit}."
+            if auto
+            else f"Inició un scraping de «{source}» con límite {limit}."
+        )
         audit.log(
             request=request,
             action=ActionChoices.SCRAPE_START,
-            description=f"Inició un scraping de «{source}» con límite {limit}.",
+            description=description,
             target=scrape_run,
             target_model="ScrapeRun",
-            metadata={"source": source, "limit": limit, "query": urls},
+            metadata={
+                "source": source,
+                "limit": limit,
+                "query": urls,
+                "scheduled": auto,
+                "schedule_id": schedule_id,
+            },
         )
 
         return Response(
