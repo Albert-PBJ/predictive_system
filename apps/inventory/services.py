@@ -154,9 +154,10 @@ def _sync_low_stock_alert(product):
         if getattr(product, "is_service", False) or not product.min_stock:
             return
 
+        from apps.analytics.alerts import resolve_alert, upsert_alert
         from apps.analytics.models import Alert
 
-        title = f"Stock bajo: {product.name}"
+        dedupe_key = f"stock_break:{product.id}"
         if product.stock <= product.min_stock:
             severity = (
                 Alert.SeverityChoices.CRITICAL
@@ -168,23 +169,16 @@ def _sync_low_stock_alert(product):
                 f"El producto '{product.name}' (SKU {product.sku or '—'}) tiene {estado}, "
                 f"en o por debajo de su mínimo de {product.min_stock}. Conviene reabastecer."
             )
-            alert, created = Alert.objects.get_or_create(
+            upsert_alert(
                 alert_type=Alert.TypeChoices.STOCK_BREAK,
-                title=title,
-                is_resolved=False,
-                defaults={"severity": severity, "message": message},
+                dedupe_key=dedupe_key,
+                title=f"Stock bajo: {product.name}",
+                message=message,
+                severity=severity,
             )
-            if not created and (alert.severity != severity or alert.message != message):
-                alert.severity = severity
-                alert.message = message
-                alert.save(update_fields=["severity", "message"])
         else:
             # Recuperó nivel: resuelve las alertas abiertas de ese producto.
-            Alert.objects.filter(
-                alert_type=Alert.TypeChoices.STOCK_BREAK,
-                title=title,
-                is_resolved=False,
-            ).update(is_resolved=True)
+            resolve_alert(dedupe_key)
     except Exception:  # noqa: BLE001 — auditar/alertar nunca debe romper la operación
         import logging
 

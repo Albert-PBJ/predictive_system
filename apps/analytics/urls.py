@@ -2,6 +2,11 @@
 
 from django.urls import path
 
+from .notifications_views import (
+    NotificationListView,
+    NotificationReadView,
+    NotificationScanView,
+)
 from .stats_views import (
     CustomerStatsView,
     DashboardStatsView,
@@ -42,6 +47,10 @@ urlpatterns = [
     path("forecast/quote-conversion", QuoteConversionForecastView.as_view(), name="analytics-quote"),
     path("forecast/advice", ForecastAdviceView.as_view(), name="analytics-forecast-advice"),
     path("benchmark/competitors", CompetitorAnalysisView.as_view(), name="analytics-competitors"),
+    # Notificaciones (bandeja del usuario sobre el sistema de alertas).
+    path("notifications", NotificationListView.as_view(), name="analytics-notifications"),
+    path("notifications/read", NotificationReadView.as_view(), name="analytics-notifications-read"),
+    path("notifications/scan", NotificationScanView.as_view(), name="analytics-notifications-scan"),
     # Benchmarking Competitivo (módulo dedicado con rango de fechas).
     path("benchmarking/comparison", BenchmarkingComparisonView.as_view(), name="analytics-benchmarking-comparison"),
     path("benchmarking/forecast", BenchmarkingForecastView.as_view(), name="analytics-benchmarking-forecast"),

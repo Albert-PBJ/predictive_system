@@ -238,6 +238,7 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 /api/inventory/movements/     → InventoryMovementViewSet: history (ver = operativo) + register ENT/AJU/DEV (Inventario+)
 /api/exchange-rate/latest     → latest BCV/parallel rate, read-only (Seller+)
 /api/analytics/               → predictive module (Manager+): overview, retrain (POST — reentrena todo = `train_models` desde la UI, reescribe PredictionLog + limpia caché, audita MODELS_RETRAIN), forecast/{demand,sales,profit,exchange-rate,product-price,inventory,quote-conversion}, benchmark/competitors, forecastable-products. Plus report-narrative (IsViewer, ?from=&to=) — LLM-written prose for the home "Generar reporte PDF" (apps/analytics/report_narrative.py, reuses the DeepSeek creds, degrades safely)
+/api/analytics/notifications  → bandeja de notificaciones del usuario sobre el sistema de alertas (IsAuthenticated, filtrada por la audiencia de rol): GET (feed + unread_count), POST /read (marcar leídas), POST /scan (dispara el barrido predictivo, throttled). Ver "Notifications & alerts" abajo
 /api/analytics/benchmarking/  → módulo "Benchmarking Competitivo" (Manager+): comparison (descriptivo, ?from=&to=&competitor=), forecast (gap por categoría + matched_products + competitors, ?from=&to=&horizon=&competitor=), product-forecast (competidor vs. interno por producto, ?product=&competitor=&horizon=&from=&to=). El parámetro opcional ?competitor= acota todo a un competidor (default: todos). Excluye source="FB" en todas las lecturas.
 /api/analytics/stats/         → descriptive statistics: dashboard (IsViewer — home panel; role-aware: Manager/Admin & Viewer get the company exec panel, SELLER gets a personal scope, WAREHOUSE gets stats.warehouse_dashboard — inventory/products only, no sales/clients/revenue), {customers,products,sales,quotes} (Manager+). Live ORM aggregations in apps/analytics/stats.py
 /api/settings/                → configuración global (SystemSettings, apps/core/settings_api.py): GET (Manager+) / PATCH (Admin); acciones exchange-rate (carga manual), exchange-rate/fetch (API), llm-test (Admin); company (IsViewer, branding de los PDFs). Ver "System settings" abajo
@@ -477,6 +478,35 @@ change), `action` (`ActionChoices`), `category` (`CategoryChoices`, derived from
   filtered set, UTF-8 BOM for Excel), `POST logs/purge` (`{before}` → bulk-delete older rows; the
   purge itself logs a `LOG_PURGE` entry). The log is **read-only**: no per-row edit/delete endpoint.
   Admin-registered read-only (`has_add_permission`/`has_change_permission` → False; delete kept).
+
+### Notifications & alerts (`apps/analytics/alerts.py` + `notifications_views.py`)
+
+The **sistema de alerta temprana** persists `analytics.Alert` rows and serves them as a per-user,
+role-routed notification feed (the header bell + the `/notificaciones` page).
+
+- **`Alert` fields added:** `audience` (JSON list of `Role` codes that should receive it),
+  `dedupe_key` (stable key for upsert, e.g. `stock_pred:42`), `updated_at`, and a new type
+  `STOCK_PRED` (*quiebre previsto*). New model **`AlertRead(alert, user)`** = per-user read state
+  (absence = unread). Migration `analytics/0005`.
+- **`alerts.py`** centralizes: `AUDIENCE_BY_TYPE`/`audience_for` (inventory alerts →
+  ADMIN/MANAGER/WAREHOUSE; strategy alerts `PRICE_CHANGE`/`RATE_STALE` → ADMIN/MANAGER),
+  `upsert_alert`/`resolve_alert`/`resolve_missing` (deduped by `dedupe_key`; on **escalation** —
+  severity up or message change — it deletes the alert's `AlertRead`s to re-notify), and
+  **`scan_and_generate_alerts()`** — the throttled (≥20 min via `django.core.cache`), best-effort
+  barrido that raises: **predicted stockout** (next month's `forecast_demand` exceeds current stock),
+  **overstock** (months-of-cover ≥ 8), **demand-drop** (next month < 60% of recent avg), **competitor
+  price-change** (a listing's last two observations dropped ≥15%), and refreshes **rate-stale**
+  (`check_rate_freshness`). It auto-resolves conditions that no longer hold and normalizes legacy rows'
+  empty `audience` by type. **Note:** the `.values_list(...).distinct()` calls use `.order_by()` first
+  to strip the model's default ordering (otherwise Django injects it into the SELECT and DISTINCT
+  returns duplicates). The real-time `inventory.services._sync_low_stock_alert` (STOCK_BREAK, on every
+  movement incl. sales) now routes through `upsert_alert`/`resolve_alert` too.
+- **API** (`notifications_views.py`, all `IsAuthenticated`, audience-filtered per user, capped feed):
+  `GET notifications` (feed + `unread_count`), `POST notifications/read` (mark all visible, or `{ids}`),
+  `POST notifications/scan` (trigger the barrido). Visibility derives the audience from the alert
+  **type** when a row's stored `audience` is empty, so routing is correct even for pre-existing rows.
+- **No cron:** the scan is login-triggered by the frontend `AlertScanRunner` (ADMIN/MANAGER/WAREHOUSE,
+  on session start + hourly), same pattern as the scraper `ScraperScheduleRunner`.
 
 ### Operational Excel import/export (`apps/data_exchange`)
 

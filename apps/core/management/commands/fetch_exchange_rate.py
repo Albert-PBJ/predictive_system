@@ -189,11 +189,15 @@ def check_rate_freshness(max_age_days: int = DEFAULT_MAX_AGE_DAYS) -> dict:
                 else Alert.SeverityChoices.WARNING
             )
         if open_alert is None:
+            from apps.analytics.alerts import audience_for
+
             Alert.objects.create(
                 alert_type=Alert.TypeChoices.RATE_STALE,
                 severity=severity,
                 title=title,
                 message=message,
+                dedupe_key="rate_stale",
+                audience=audience_for(Alert.TypeChoices.RATE_STALE),
             )
             created_alert = True
         else:

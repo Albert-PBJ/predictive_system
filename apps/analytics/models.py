@@ -86,6 +86,7 @@ class KPI(models.Model):
 class Alert(models.Model):
     class TypeChoices(models.TextChoices):
         STOCK_BREAK = "STOCK_B", _("Quiebre de Stock")
+        STOCK_PRED = "STOCK_P", _("Quiebre de Stock Previsto")
         OVERSTOCK = "STOCK_O", _("Sobrestock")
         PRICE_CHANGE = "PRICE", _("Cambio de Precio Competidor")
         DEMAND_DROP = "DEMAND", _("Caída de Demanda")
@@ -101,10 +102,17 @@ class Alert(models.Model):
     severity = models.CharField(max_length=4, choices=SeverityChoices.choices, default=SeverityChoices.INFO)
     title = models.CharField(max_length=200)
     message = models.TextField()
+    # Roles que deben recibir esta alerta (códigos de ``accounts.Role``). El feed de
+    # notificaciones filtra por el rol del usuario; vacío = visible para todos.
+    audience = models.JSONField(default=list, blank=True)
+    # Clave estable para deduplicar/actualizar una misma condición en el tiempo
+    # (p. ej. ``stock_pred:42``), de modo que una alerta recurrente no se multiplique.
+    dedupe_key = models.CharField(max_length=120, blank=True, db_index=True)
     is_read = models.BooleanField(default=False)
     is_resolved = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "alerts"
@@ -118,3 +126,28 @@ class Alert(models.Model):
 
     def __str__(self):
         return f"[{self.severity}] {self.title}"
+
+
+class AlertRead(models.Model):
+    """Estado de lectura **por usuario** de una alerta.
+
+    Las alertas son hechos de empresa (un quiebre de stock lo es para todos los que
+    lo ven), pero cada usuario tiene su propio "leído/no leído". La ausencia de fila
+    para un usuario significa "no leída". Se crea al abrir/marcar las notificaciones.
+    """
+
+    alert = models.ForeignKey(Alert, on_delete=models.CASCADE, related_name="reads")
+    user = models.ForeignKey("auth.User", on_delete=models.CASCADE, related_name="alert_reads")
+    read_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "alert_reads"
+        verbose_name = "Lectura de Alerta"
+        verbose_name_plural = "Lecturas de Alertas"
+        unique_together = ("alert", "user")
+        indexes = [
+            models.Index(fields=["user", "alert"], name="alertread_user_alert_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id} leyó alerta {self.alert_id}"
