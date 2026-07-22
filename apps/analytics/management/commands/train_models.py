@@ -34,6 +34,10 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--product", type=int, default=None,
                             help="ID de producto base para demanda/precio (por defecto el más vendido).")
+        parser.add_argument("--trigger", default="CMD", choices=["CMD", "UI"],
+                            help="Origen del reentrenamiento a registrar en el historial (CMD/UI).")
+        parser.add_argument("--triggered-by", dest="triggered_by", default="",
+                            help="Usuario que disparó el reentrenamiento (para el historial).")
 
     def handle(self, *args, **opts):
         warnings.filterwarnings("ignore")
@@ -131,7 +135,17 @@ class Command(BaseCommand):
 
         registry.clear_cache()
         n = PredictionLog.objects.count()
+
+        # Historial: registra un punto de la evolución de la precisión para esta corrida.
+        run = registry.record_training_run(
+            trigger=opts.get("trigger") or "CMD",
+            triggered_by=opts.get("triggered_by") or "",
+        )
         self.stdout.write(self.style.SUCCESS(f"\nListo. {n} filas escritas en PredictionLog."))
+        if run is not None:
+            self.stdout.write(self.style.SUCCESS(
+                f"Historial: reentrenamiento #{run.id} registrado ({len(run.models_metrics)} modelos)."
+            ))
 
     @staticmethod
     def _top_product():

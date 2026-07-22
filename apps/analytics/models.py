@@ -49,6 +49,49 @@ class PredictionLog(models.Model):
         return f"{self.name} (R²={self.r2_score})"
 
 
+class TrainingRun(models.Model):
+    """Instantánea *append-only* de las métricas de los modelos tras cada reentrenamiento.
+
+    A diferencia de :class:`PredictionLog` —que ``train_models`` **reescribe por completo**
+    en cada corrida—, esta tabla es un HISTORIAL: una fila por evento de reentrenamiento,
+    con las métricas de cada modelo activo en ese momento. Permite graficar la **evolución
+    de la precisión** (R²/exactitud) de los modelos a lo largo de los reentrenamientos.
+    """
+
+    class TriggerChoices(models.TextChoices):
+        COMMAND = "CMD", _("Comando (train_models)")
+        UI = "UI", _("Panel (botón Reentrenar)")
+
+    trained_at = models.DateTimeField(help_text=_("Momento del reentrenamiento"))
+    trigger = models.CharField(
+        max_length=3,
+        choices=TriggerChoices.choices,
+        default=TriggerChoices.COMMAND,
+        help_text=_("Origen del reentrenamiento: comando o botón del panel"),
+    )
+    triggered_by = models.CharField(
+        max_length=150,
+        blank=True,
+        help_text=_("Usuario que disparó el reentrenamiento (vacío para el comando/sistema)"),
+    )
+    # Métricas por objetivo, congeladas en este reentrenamiento. Lista de dicts:
+    # [{model_type, model_type_display, name, technique, r2, rmse, mae, accuracy, precision, recall}, ...]
+    models_metrics = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "training_runs"
+        verbose_name = "Reentrenamiento"
+        verbose_name_plural = "Reentrenamientos"
+        ordering = ["trained_at"]
+        indexes = [
+            models.Index(fields=["trained_at"], name="trainrun_trained_idx"),
+        ]
+
+    def __str__(self):
+        return f"Reentrenamiento {self.trained_at:%Y-%m-%d %H:%M} ({self.get_trigger_display()})"
+
+
 class KPI(models.Model):
     class CategoryChoices(models.TextChoices):
         FINANCIAL = "FIN", _("Financiero")

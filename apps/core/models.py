@@ -417,9 +417,22 @@ class SystemSettings(models.Model):
         help_text=_("Razón social, usada en el encabezado de presupuestos y reportes."),
     )
     company_rif = models.CharField(max_length=30, blank=True, help_text=_("RIF de la empresa."))
-    company_address = models.TextField(blank=True, help_text=_("Dirección fiscal."))
-    company_phone = models.CharField(max_length=50, blank=True, help_text=_("Teléfono de contacto."))
-    company_email = models.EmailField(blank=True, help_text=_("Correo de contacto."))
+    company_address = models.TextField(
+        blank=True,
+        default=(
+            "Av. Principal de Paraparal, Centro Comercial Paraparal Plaza, "
+            "Local Apb-05, Municipio Los Guayos, Valencia, Edo. Carabobo"
+        ),
+        help_text=_("Dirección fiscal (aparece en presupuestos y órdenes de despacho)."),
+    )
+    company_phone = models.CharField(
+        max_length=50, blank=True, default="0414-434.44.52 / 0414-4704347",
+        help_text=_("Teléfono(s) de contacto."),
+    )
+    company_email = models.EmailField(
+        max_length=254, blank=True, default="inversiones.maescar@gmail.com",
+        help_text=_("Correo de contacto."),
+    )
     company_website = models.CharField(max_length=150, blank=True, help_text=_("Sitio web."))
     company_logo_url = models.URLField(max_length=500, blank=True, help_text=_("URL del logo (PNG/JPG) para los documentos."))
 

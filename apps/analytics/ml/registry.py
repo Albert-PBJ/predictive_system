@@ -16,7 +16,7 @@ import joblib
 from django.conf import settings
 from django.utils import timezone
 
-from ..models import PredictionLog
+from ..models import PredictionLog, TrainingRun
 
 # Caché simple en proceso: key -> (fingerprint, value)
 _CACHE: dict[str, tuple[str, object]] = {}
@@ -115,3 +115,57 @@ def upsert_prediction_log(
         dataset_description=dataset_description,
         is_active=make_active,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Historial de reentrenamientos (TrainingRun) — evolución de la precisión
+# --------------------------------------------------------------------------- #
+def _snapshot_active_metrics() -> list[dict]:
+    """Congela las métricas de los modelos **activos** de ``PredictionLog`` en una lista
+    de dicts serializable, para guardarla como instantánea de un reentrenamiento."""
+    snapshot = []
+    for pl in PredictionLog.objects.filter(is_active=True).order_by("model_type"):
+        m = pl.metrics or {}
+        # La técnica es el sufijo del nombre (p. ej. ``sales_linear`` → ``linear``).
+        technique = pl.name.rsplit("_", 1)[-1] if pl.name and "_" in pl.name else None
+        snapshot.append({
+            "model_type": pl.model_type,
+            "model_type_display": pl.get_model_type_display(),
+            "name": pl.name,
+            "technique": technique,
+            "r2": pl.r2_score,
+            "rmse": pl.rmse,
+            "mae": pl.mae,
+            "accuracy": m.get("accuracy"),
+            "precision": m.get("precision"),
+            "recall": m.get("recall"),
+        })
+    return snapshot
+
+
+def record_training_run(*, trigger: str = "CMD", triggered_by: str = "") -> TrainingRun | None:
+    """Registra una fila de ``TrainingRun`` con la instantánea de las métricas activas.
+
+    Se llama al final de cada reentrenamiento (comando ``train_models`` y botón del panel),
+    de modo que el historial acumule un punto por corrida y se pueda graficar la evolución
+    de la precisión. Si no hay modelos activos (nada que capturar) no crea la fila."""
+    if trigger not in {c.value for c in TrainingRun.TriggerChoices}:
+        trigger = TrainingRun.TriggerChoices.COMMAND
+    snapshot = _snapshot_active_metrics()
+    if not snapshot:
+        return None
+    return TrainingRun.objects.create(
+        trained_at=timezone.now(),
+        trigger=trigger,
+        triggered_by=(triggered_by or "")[:150],
+        models_metrics=snapshot,
+    )
+
+
+def ensure_baseline_run() -> TrainingRun | None:
+    """Si aún no hay historial pero sí modelos entrenados, registra un punto **base** con
+    el estado actual, para que la gráfica de evolución no arranque vacía. Idempotente en la
+    práctica: solo actúa cuando ``TrainingRun`` está vacío."""
+    if TrainingRun.objects.exists():
+        return None
+    return record_training_run(trigger="CMD", triggered_by="inicial")

@@ -34,9 +34,11 @@ class LatestExchangeRateView(APIView):
     GET /api/exchange-rate/latest
 
     Devuelve la tasa de cambio más reciente cargada (BCV y paralela), para que el
-    frontend pueda previsualizar montos en Bolívares al registrar una venta. La
-    venta fija su propia tasa en el servidor al guardarse; este endpoint es solo
-    informativo.
+    frontend pueda previsualizar montos en Bolívares al registrar una venta. Incluye
+    además el **IVA por defecto** configurado en la Configuración del Sistema, para que
+    el formulario de venta muestre el desglose de impuesto y el total a pagar antes de
+    guardar (obligatorio: no puede ofrecerse un precio sin IVA). La venta fija su propia
+    tasa e IVA en el servidor al guardarse; este endpoint es solo informativo.
 
     Acceso: Vendedor o superior.
     """
@@ -44,13 +46,18 @@ class LatestExchangeRateView(APIView):
     permission_classes = [IsSeller]
 
     def get(self, request):
+        from apps.core import system_settings
+
+        # El IVA por defecto vive en la Configuración del Sistema y no depende de que
+        # haya una tasa cargada; se devuelve siempre.
+        iva_rate = str(system_settings.default_iva_pct())
+
         rate = ExchangeRate.objects.order_by("-date").first()
         if rate is None:
             return Response(
-                {"detail": "No hay tasas de cambio cargadas."},
+                {"detail": "No hay tasas de cambio cargadas.", "iva_rate": iva_rate},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        from apps.core import system_settings
 
         eff = system_settings.effective_rate(rate)
         return Response(
@@ -63,6 +70,8 @@ class LatestExchangeRateView(APIView):
                 "effective_rate": str(eff) if eff is not None else None,
                 "rate_basis": system_settings.rate_basis(),
                 "source": rate.source,
+                # IVA por defecto (%) configurado, para el desglose en el formulario.
+                "iva_rate": iva_rate,
             },
             status=status.HTTP_200_OK,
         )

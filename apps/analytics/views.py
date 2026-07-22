@@ -30,7 +30,7 @@ from apps.sales.models import SaleItem
 from . import benchmarking, forecast_advice, report_narrative, stats
 from .ml import forecasters as F
 from .ml import registry
-from .models import PredictionLog
+from .models import PredictionLog, TrainingRun
 
 logger = logging.getLogger(__name__)
 
@@ -364,8 +364,9 @@ class RetrainModelsView(_BaseForecastView):
 
     def post(self, request):
         buf = io.StringIO()
+        username = getattr(request.user, "username", "") or ""
         try:
-            call_command("train_models", stdout=buf, stderr=buf)
+            call_command("train_models", stdout=buf, stderr=buf, trigger="UI", triggered_by=username)
         except Exception as exc:  # pragma: no cover - depende del entorno ML
             logger.exception("Fallo al reentrenar los modelos")
             return Response(
@@ -388,6 +389,83 @@ class RetrainModelsView(_BaseForecastView):
             "total_rows": total,
             "trained_at": trained_at.isoformat() if trained_at else None,
         })
+
+
+class TrainingHistoryView(_BaseForecastView):
+    """GET /api/analytics/training-history — historial de reentrenamientos y evolución de
+    la **precisión** de cada modelo (R²/exactitud) a lo largo del tiempo.
+
+    Cada vez que se reentrena (comando o botón del panel) se registra un ``TrainingRun`` con
+    la instantánea de las métricas activas. Esta vista los devuelve en orden cronológico
+    (``runs``) y también pivotados por tipo de modelo (``models``) para graficar una línea de
+    evolución por modelo. Gerente/Administrador (``IsManager``)."""
+
+    # Métrica de "precisión" por tipo de modelo y su etiqueta (el resto usa R²).
+    _PRIMARY = {"QUOTE": ("accuracy", "Exactitud")}
+    _ORDER = ["SALES", "PROFIT", "DEMAND", "PRICE", "RATE", "QUOTE", "INVENT", "BENCH"]
+
+    def get(self, request):
+        # Si aún no hay historial pero sí modelos entrenados, siembra un punto base para que
+        # la gráfica no arranque vacía (la evolución empieza en el estado actual).
+        registry.ensure_baseline_run()
+
+        runs = list(TrainingRun.objects.order_by("trained_at"))
+        if len(runs) > 100:  # cap defensivo: los 100 reentrenamientos más recientes
+            runs = runs[-100:]
+
+        runs_out = []
+        pivot: dict[str, list] = {}
+        display_map: dict[str, str] = {}
+
+        for idx, run in enumerate(runs, start=1):
+            models = run.models_metrics or []
+            runs_out.append({
+                "id": run.id,
+                "index": idx,
+                "trained_at": run.trained_at.isoformat() if run.trained_at else None,
+                "trigger": run.trigger,
+                "trigger_display": run.get_trigger_display(),
+                "triggered_by": run.triggered_by,
+                "models": models,
+            })
+            for m in models:
+                mt = m.get("model_type")
+                if not mt:
+                    continue
+                display_map[mt] = m.get("model_type_display") or mt
+                metric_key = self._PRIMARY.get(mt, ("r2", "R²"))[0]
+                pivot.setdefault(mt, []).append({
+                    "run_id": run.id,
+                    "index": idx,
+                    "trained_at": run.trained_at.isoformat() if run.trained_at else None,
+                    "value": m.get(metric_key),
+                    "r2": m.get("r2"),
+                    "rmse": m.get("rmse"),
+                    "mae": m.get("mae"),
+                    "accuracy": m.get("accuracy"),
+                    "technique": m.get("technique"),
+                })
+
+        def sort_key(mt: str) -> int:
+            return self._ORDER.index(mt) if mt in self._ORDER else len(self._ORDER)
+
+        models_out = []
+        for mt in sorted(pivot.keys(), key=sort_key):
+            points = pivot[mt]
+            # Solo modelos con una métrica de precisión real (excluye BENCH, que solo
+            # registra la pendiente de la tendencia y no tiene R²/exactitud).
+            if not any(p["value"] is not None for p in points):
+                continue
+            metric_key, metric_label = self._PRIMARY.get(mt, ("r2", "R²"))
+            models_out.append({
+                "model_type": mt,
+                "display": display_map.get(mt, mt),
+                "metric": metric_key,
+                "metric_label": metric_label,
+                "points": points,
+            })
+
+        return Response({"runs": runs_out, "models": models_out})
 
 
 class ReportNarrativeView(APIView):
