@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
@@ -51,6 +53,15 @@ class Sale(models.Model):
     # la analítica); `total_with_iva_ves` es el total a pagar en bolívares (base+IVA).
     total_sale_ves = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True, help_text=_("Base imponible de la venta en Bolívares (sin IVA)"))
     total_with_iva_ves = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True, help_text=_("Total a pagar en Bolívares (base + IVA)"))
+
+    # Cobranza / pagos parciales. `amount_paid_usd` es la suma de los abonos (ver
+    # `SalePayment`) sobre el total a pagar (`total_with_iva_usd`). El saldo pendiente
+    # es la diferencia. Cuando el saldo llega a 0, la venta pasa a "Completada"
+    # automáticamente (el estado depende del pago: con saldo > 0 queda "Pendiente").
+    amount_paid_usd = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        help_text=_("Monto abonado/cobrado en USD (suma de abonos). Saldo = total con IVA − abonado"),
+    )
 
     # Facturación fiscal. Los números y el adjunto son OPCIONALES: una venta se
     # registra sin factura y se factura después con la acción "Facturar". En
@@ -114,6 +125,19 @@ class Sale(models.Model):
         """True si la venta ya tiene una factura fiscal asociada."""
         return bool(self.invoice_number)
 
+    @property
+    def balance_usd(self) -> Decimal:
+        """Saldo pendiente por cobrar en USD (total con IVA − abonado), nunca negativo."""
+        total = self.total_with_iva_usd or Decimal("0")
+        paid = self.amount_paid_usd or Decimal("0")
+        bal = total - paid
+        return bal if bal > Decimal("0") else Decimal("0")
+
+    @property
+    def is_fully_paid(self) -> bool:
+        """True si la venta ya está totalmente cobrada (sin saldo pendiente)."""
+        return self.balance_usd <= Decimal("0")
+
 
 class SaleItem(models.Model):
     sale = models.ForeignKey(
@@ -154,6 +178,67 @@ class SaleItem(models.Model):
 
     def __str__(self):
         return f"{self.quantity}x {self.product.name} (Venta #{self.sale_id})"
+
+
+class SalePayment(models.Model):
+    """Abono (pago) aplicado a una venta.
+
+    Modela la cobranza real de una PYME venezolana: el cliente puede pagar en
+    varias parcialidades (p. ej. 50% al reservar y el resto al despachar), en
+    distintos medios (efectivo Bs/divisas, pago móvil, transferencia, punto,
+    Zelle). La suma de los abonos se cachea en ``Sale.amount_paid_usd`` y el saldo
+    pendiente = total con IVA − abonado; al saldarse el total, la venta pasa a
+    "Completada" automáticamente. Los abonos son un libro append-only: se agregan,
+    no se editan.
+    """
+
+    class MethodChoices(models.TextChoices):
+        CASH_VES = "EFE", _("Efectivo (Bs)")
+        CASH_USD = "DIV", _("Efectivo (divisas)")
+        MOBILE = "PMO", _("Pago móvil")
+        TRANSFER = "TRA", _("Transferencia")
+        CARD = "PDV", _("Punto de venta")
+        ZELLE = "ZEL", _("Zelle")
+        OTHER = "OTR", _("Otro")
+
+    sale = models.ForeignKey(
+        "Sale",
+        on_delete=models.CASCADE,
+        related_name="payments",
+        help_text=_("Venta a la que se aplica el abono"),
+    )
+    amount_usd = models.DecimalField(max_digits=12, decimal_places=2, help_text=_("Monto del abono en USD"))
+    amount_ves = models.DecimalField(
+        max_digits=18, decimal_places=2, null=True, blank=True,
+        help_text=_("Monto del abono en Bolívares (referencia a la tasa del día)"),
+    )
+    method = models.CharField(
+        max_length=3, choices=MethodChoices.choices, default=MethodChoices.OTHER,
+        help_text=_("Medio de pago"),
+    )
+    payment_date = models.DateField(help_text=_("Fecha del abono"))
+    reference = models.CharField(max_length=100, blank=True, help_text=_("Referencia / nº de transacción"))
+    notes = models.TextField(blank=True)
+    recorded_by = models.ForeignKey(
+        "auth.User",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="sale_payments",
+        help_text=_("Usuario que registró el abono"),
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "sale_payments"
+        verbose_name = "Abono"
+        verbose_name_plural = "Abonos"
+        ordering = ["payment_date", "id"]
+        indexes = [
+            models.Index(fields=["sale"], name="sale_payments_sale_idx"),
+        ]
+
+    def __str__(self):
+        return f"Abono {self.amount_usd} USD (Venta #{self.sale_id})"
 
 
 class Quote(models.Model):

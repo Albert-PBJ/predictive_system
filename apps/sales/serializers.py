@@ -11,6 +11,7 @@ from .models import (
     QuoteItem,
     Sale,
     SaleItem,
+    SalePayment,
 )
 
 
@@ -53,10 +54,39 @@ class SaleItemSerializer(serializers.ModelSerializer):
         )
 
 
+class SalePaymentSerializer(serializers.ModelSerializer):
+    """Abono de una venta (lectura)."""
+
+    method_display = serializers.CharField(source="get_method_display", read_only=True)
+    recorded_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SalePayment
+        fields = (
+            "id",
+            "amount_usd",
+            "amount_ves",
+            "method",
+            "method_display",
+            "payment_date",
+            "reference",
+            "notes",
+            "recorded_by_name",
+            "created_at",
+        )
+
+    def get_recorded_by_name(self, obj):
+        return obj.recorded_by.username if obj.recorded_by else "—"
+
+
 class SaleSerializer(serializers.ModelSerializer):
     """Venta completa (lectura) con sus líneas y etiquetas legibles."""
 
     items = SaleItemSerializer(many=True, read_only=True)
+    payments = SalePaymentSerializer(many=True, read_only=True)
+    # Cobranza: saldo pendiente y si está totalmente pagada (derivados del modelo).
+    balance_usd = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    is_fully_paid = serializers.BooleanField(read_only=True)
     customer_name = serializers.CharField(source="customer.company_name", read_only=True)
     customer_rif = serializers.CharField(source="customer.rif", read_only=True)
     customer_address = serializers.CharField(source="customer.fiscal_address", read_only=True, default="")
@@ -94,6 +124,9 @@ class SaleSerializer(serializers.ModelSerializer):
             "total_with_iva_usd",
             "total_with_iva_ves",
             "commission_usd",
+            "amount_paid_usd",
+            "balance_usd",
+            "is_fully_paid",
             "bcv_rate",
             "parallel_rate",
             "invoice_number",
@@ -105,6 +138,7 @@ class SaleSerializer(serializers.ModelSerializer):
             "dispatch_orders",
             "notes",
             "items",
+            "payments",
             "created_at",
         )
 
@@ -176,10 +210,16 @@ class SaleCreateSerializer(serializers.Serializer):
     sale_type = serializers.ChoiceField(
         choices=Sale.TypeChoices.choices, required=False, default=Sale.TypeChoices.RETAIL
     )
-    status = serializers.ChoiceField(
-        choices=[Sale.StatusChoices.COMPLETED, Sale.StatusChoices.PENDING],
-        required=False,
-        default=Sale.StatusChoices.COMPLETED,
+    # Cobranza. El estado (Pendiente/Completada) se **deriva del pago**, no se elige
+    # a mano: `fully_paid=True` (por defecto) = venta cobrada completa; si es False, se
+    # registra `amount_paid` como abono inicial (0 = venta a crédito) y la venta queda
+    # Pendiente hasta saldarse. `payment_method` es el medio del abono inicial.
+    fully_paid = serializers.BooleanField(required=False, default=True)
+    amount_paid = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True, min_value=0
+    )
+    payment_method = serializers.ChoiceField(
+        choices=SalePayment.MethodChoices.choices, required=False, allow_null=True
     )
     notes = serializers.CharField(required=False, allow_blank=True, default="")
     # IVA opcional: si se omite, el servicio usa el default de la Configuración (16%).
@@ -220,6 +260,24 @@ class InvoiceInputSerializer(serializers.Serializer):
         if value.size and value.size > 10 * 1024 * 1024:
             raise serializers.ValidationError("El archivo no puede superar los 10 MB.")
         return value
+
+
+class SalePaymentInputSerializer(serializers.Serializer):
+    """Carga útil para registrar un abono a una venta."""
+
+    amount_usd = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0)
+    method = serializers.ChoiceField(
+        choices=SalePayment.MethodChoices.choices, required=False, allow_null=True
+    )
+    payment_date = serializers.DateField(required=False, allow_null=True)
+    reference = serializers.CharField(max_length=100, required=False, allow_blank=True, default="")
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class SaleNoteInputSerializer(serializers.Serializer):
+    """Carga útil para editar las notas de una venta."""
+
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
 
 
 # ─────────────────────────── Presupuestos ───────────────────────────

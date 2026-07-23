@@ -7,6 +7,7 @@ from .models import (
     QuoteItem,
     Sale,
     SaleItem,
+    SalePayment,
 )
 
 
@@ -15,13 +16,18 @@ class SaleItemInline(admin.TabularInline):
     extra = 0
 
 
+class SalePaymentInline(admin.TabularInline):
+    model = SalePayment
+    extra = 0
+
+
 @admin.register(Sale)
 class SaleAdmin(admin.ModelAdmin):
-    list_display = ("pk", "customer", "seller", "sale_date", "total_sale_usd", "total_profit_usd", "invoice_number", "status")
+    list_display = ("pk", "customer", "seller", "sale_date", "total_sale_usd", "total_profit_usd", "amount_paid_usd", "invoice_number", "status")
     list_filter = ("status", "sale_type", "sale_date")
     search_fields = ("customer__company_name", "seller__first_name", "seller__last_name", "invoice_number", "control_number")
     date_hierarchy = "sale_date"
-    inlines = [SaleItemInline]
+    inlines = [SaleItemInline, SalePaymentInline]
 
 
 class DispatchOrderItemInline(admin.TabularInline):

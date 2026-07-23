@@ -23,6 +23,7 @@ from .models import (
     QuoteItem,
     Sale,
     SaleItem,
+    SalePayment,
 )
 
 CENTS = Decimal("0.01")
@@ -66,6 +67,8 @@ def create_sale(
     notes="",
     iva_rate=None,
     quote=None,
+    amount_paid=None,
+    payment_method=None,
 ):
     """Crea una venta con sus líneas y descuenta el inventario, todo atómicamente.
 
@@ -74,6 +77,18 @@ def create_sale(
     se toma el precio de venta actual del producto. El costo unitario (CMV) se fija
     (snapshot) desde el **costo promedio ponderado móvil** vigente del producto
     (`average_cost_usd`); si aún no hay promedio calculado, cae al precio de compra.
+
+    **Cobranza / pago inicial.** `amount_paid` controla el estado:
+
+    - ``None`` (por defecto): la venta se considera **pagada por completo** si
+      ``status`` es COMP (lo habitual), o **sin abonar** si se pasó PEN. Esto
+      preserva el comportamiento previo para quienes no manejan cobranza (conversión
+      de presupuesto, importación de Excel).
+    - un monto: se registra ese abono inicial; el estado se **deriva** del saldo —
+      COMP si cubre el total con IVA, PEN si queda saldo. El monto se acota al total.
+
+    Si el monto abonado es > 0 se crea un ``SalePayment`` inicial (para que el libro
+    de abonos quede completo desde el registro).
 
     Lanza `SaleValidationError` ante datos de negocio inválidos (sin líneas, stock
     insuficiente, producto inexistente), revirtiendo cualquier cambio parcial.
@@ -216,6 +231,19 @@ def create_sale(
     iva_amount = _money(total_sale * iva_rate / Decimal("100"))
     total_with_iva = total_sale + iva_amount
 
+    # Cobranza: determina el monto abonado y el estado según el pago. Sin `amount_paid`
+    # se respeta el `status` recibido (COMP = pagada; PEN = sin abonar) por
+    # compatibilidad; con un monto, el estado se deriva del saldo.
+    if amount_paid is None:
+        paid = Decimal("0") if status == Sale.StatusChoices.PENDING else total_with_iva
+    else:
+        paid = _money(max(Decimal("0"), min(Decimal(str(amount_paid)), total_with_iva)))
+        status = (
+            Sale.StatusChoices.COMPLETED if paid >= total_with_iva else Sale.StatusChoices.PENDING
+        )
+
+    sale.status = status
+    sale.amount_paid_usd = paid
     sale.total_sale_usd = total_sale
     sale.total_cost_usd = total_cost
     sale.total_profit_usd = total_profit
@@ -227,6 +255,8 @@ def create_sale(
     sale.total_with_iva_ves = _money(total_with_iva * eff_rate) if eff_rate else None
     sale.save(
         update_fields=[
+            "status",
+            "amount_paid_usd",
             "total_sale_usd",
             "total_cost_usd",
             "total_profit_usd",
@@ -239,6 +269,19 @@ def create_sale(
             "updated_at",
         ]
     )
+
+    # Abono inicial: si se cobró algo al registrar, queda asentado en el libro de
+    # abonos (para que la suma de `SalePayment` coincida con `amount_paid_usd`).
+    if paid > 0:
+        SalePayment.objects.create(
+            sale=sale,
+            amount_usd=paid,
+            amount_ves=_money(paid * eff_rate) if eff_rate else None,
+            method=payment_method or SalePayment.MethodChoices.OTHER,
+            payment_date=sale_date,
+            notes="Pago completo" if paid >= total_with_iva else "Pago inicial",
+            recorded_by=user,
+        )
 
     # Si la venta se registró a partir de un presupuesto, se cierra la relación
     # cotización→venta (mismo enlace que la acción "Convertir a venta").
@@ -373,6 +416,70 @@ def invoice_sale(*, sale, invoice_number, control_number, user, invoice_date=Non
     if invoice_file is not None:
         sale.invoice_file = invoice_file
     sale.save(update_fields=["invoice_number", "control_number", "invoice_date", "invoice_file", "updated_at"])
+    return sale
+
+
+# --------------------------------------------------------------------------- #
+# Cobranza / abonos (pagos parciales)
+# --------------------------------------------------------------------------- #
+# Una venta puede cobrarse en varias parcialidades. Cada abono se asienta en el libro
+# `SalePayment` y suma a `Sale.amount_paid_usd`; el saldo pendiente = total con IVA −
+# abonado. Al saldarse el total, la venta pasa a "Completada" automáticamente.
+
+
+@transaction.atomic
+def add_sale_payment(*, sale, amount, user, method=None, payment_date=None, reference="", notes=""):
+    """Registra un abono a una venta y actualiza su cobranza.
+
+    Valida que la venta no esté anulada, que el monto sea positivo y que no supere el
+    saldo pendiente. Asienta el ``SalePayment``, incrementa ``amount_paid_usd`` y, si
+    el abono salda el total, marca la venta como **Completada** (autocompletado).
+    Devuelve ``(sale, payment)``. Lanza ``SaleValidationError`` ante datos inválidos.
+    """
+    if sale.status == Sale.StatusChoices.CANCELLED:
+        raise SaleValidationError("No se puede registrar un abono en una venta anulada.")
+
+    amount = _money(amount)
+    if amount <= 0:
+        raise SaleValidationError("El monto del abono debe ser mayor que cero.")
+
+    total = sale.total_with_iva_usd or Decimal("0")
+    balance = _money(total - (sale.amount_paid_usd or Decimal("0")))
+    if balance <= 0:
+        raise SaleValidationError("La venta ya está totalmente pagada.")
+    if amount > balance:
+        raise SaleValidationError(
+            f"El abono ({amount} USD) supera el saldo pendiente ({balance} USD)."
+        )
+
+    rate = _latest_rate()
+    eff_rate = _effective_rate(rate)
+
+    payment = SalePayment.objects.create(
+        sale=sale,
+        amount_usd=amount,
+        amount_ves=_money(amount * eff_rate) if eff_rate else None,
+        method=method or SalePayment.MethodChoices.OTHER,
+        payment_date=payment_date or date.today(),
+        reference=reference or "",
+        notes=notes or "",
+        recorded_by=user,
+    )
+
+    sale.amount_paid_usd = _money((sale.amount_paid_usd or Decimal("0")) + amount)
+    update_fields = ["amount_paid_usd", "updated_at"]
+    # Autocompletar al saldar el total (solo desde "Pendiente").
+    if sale.amount_paid_usd >= total and sale.status == Sale.StatusChoices.PENDING:
+        sale.status = Sale.StatusChoices.COMPLETED
+        update_fields.append("status")
+    sale.save(update_fields=update_fields)
+    return sale, payment
+
+
+def update_sale_notes(*, sale, notes):
+    """Actualiza las notas/observaciones de una venta (edición puntual)."""
+    sale.notes = notes or ""
+    sale.save(update_fields=["notes", "updated_at"])
     return sale
 
 

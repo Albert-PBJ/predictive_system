@@ -12,6 +12,8 @@ class ActionChoices(models.TextChoices):
     SALE_CREATE = "SALE_CREATE", _("Venta registrada")
     SALE_VOID = "SALE_VOID", _("Venta anulada")
     SALE_INVOICE = "SALE_INVOICE", _("Venta facturada")
+    SALE_PAYMENT = "SALE_PAYMENT", _("Abono de venta registrado")
+    SALE_UPDATE = "SALE_UPDATE", _("Venta actualizada")
     QUOTE_CREATE = "QUOTE_CREATE", _("Presupuesto creado")
     QUOTE_CONVERT = "QUOTE_CONVERT", _("Presupuesto convertido a venta")
     DISPATCH_CREATE = "DISPATCH_CREATE", _("Orden de despacho generada")
@@ -58,6 +60,8 @@ ACTION_CATEGORY = {
     ActionChoices.SALE_CREATE: CategoryChoices.VENTAS,
     ActionChoices.SALE_VOID: CategoryChoices.VENTAS,
     ActionChoices.SALE_INVOICE: CategoryChoices.VENTAS,
+    ActionChoices.SALE_PAYMENT: CategoryChoices.VENTAS,
+    ActionChoices.SALE_UPDATE: CategoryChoices.VENTAS,
     ActionChoices.QUOTE_CREATE: CategoryChoices.VENTAS,
     ActionChoices.QUOTE_CONVERT: CategoryChoices.VENTAS,
     ActionChoices.DISPATCH_CREATE: CategoryChoices.VENTAS,

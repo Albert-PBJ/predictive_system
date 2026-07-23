@@ -1,4 +1,5 @@
 from datetime import date
+from decimal import Decimal
 
 from django.db.models import Q
 from rest_framework import status, viewsets
@@ -23,12 +24,15 @@ from .serializers import (
     QuoteCreateSerializer,
     QuoteSerializer,
     SaleCreateSerializer,
+    SaleNoteInputSerializer,
+    SalePaymentInputSerializer,
     SaleSerializer,
 )
 from .services import (
     DispatchValidationError,
     QuoteValidationError,
     SaleValidationError,
+    add_sale_payment,
     convert_quote_to_sale,
     create_dispatch_order,
     create_quote,
@@ -36,6 +40,7 @@ from .services import (
     invoice_sale,
     suggest_invoice_numbers,
     update_dispatch_order,
+    update_sale_notes,
     void_sale,
 )
 
@@ -66,9 +71,9 @@ class SaleViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "head", "options"]
 
     def get_permissions(self):
-        # Registrar/facturar requieren capacidad de vender; anular, ser gerente;
-        # consultar, cualquier rol operativo (incluido el encargado de inventario).
-        if self.action in ("create", "facturar", "siguiente_factura"):
+        # Registrar/facturar/abonar/editar nota requieren capacidad de vender; anular,
+        # ser gerente; consultar, cualquier rol operativo (incl. encargado de inventario).
+        if self.action in ("create", "facturar", "siguiente_factura", "pagos", "nota"):
             return [IsSeller()]
         if self.action == "anular":
             return [IsManager()]
@@ -86,7 +91,7 @@ class SaleViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = (
             Sale.objects.select_related("customer", "seller", "seller__user__profile")
-            .prefetch_related("items__product", "source_quote", "dispatch_orders")
+            .prefetch_related("items__product", "payments", "source_quote", "dispatch_orders")
             .order_by("-sale_date", "-created_at")
         )
         params = self.request.query_params
@@ -143,6 +148,10 @@ class SaleViewSet(viewsets.ModelViewSet):
             )
 
         quote = data.get("quote")
+        # Cobranza: si el pago no es completo, se pasa el abono inicial (0 = a crédito)
+        # y el servicio deriva el estado (Pendiente/Completada) del saldo.
+        fully_paid = data.get("fully_paid", True)
+        amount_paid = None if fully_paid else (data.get("amount_paid") or Decimal("0"))
         try:
             sale = create_sale(
                 seller=seller,
@@ -151,10 +160,11 @@ class SaleViewSet(viewsets.ModelViewSet):
                 user=request.user,
                 sale_date=data.get("sale_date"),
                 sale_type=data.get("sale_type") or Sale.TypeChoices.RETAIL,
-                status=data.get("status") or Sale.StatusChoices.COMPLETED,
                 notes=data.get("notes", ""),
                 iva_rate=data.get("iva_rate"),
                 quote=quote,
+                amount_paid=amount_paid,
+                payment_method=data.get("payment_method"),
             )
         except (SaleValidationError, InsufficientStockError) as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -242,6 +252,64 @@ class SaleViewSet(viewsets.ModelViewSet):
                 "control_number": sale.control_number,
                 "has_file": bool(sale.invoice_file),
             },
+        )
+        return Response(
+            SaleSerializer(sale, context=self.get_serializer_context()).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="pagos")  # permiso en get_permissions
+    def pagos(self, request, pk=None):
+        """Registra un abono a la venta y actualiza su cobranza (autocompleta al saldar)."""
+        sale = self.get_object()
+        serializer = SalePaymentInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            sale, payment = add_sale_payment(
+                sale=sale,
+                amount=data["amount_usd"],
+                user=request.user,
+                method=data.get("method"),
+                payment_date=data.get("payment_date"),
+                reference=data.get("reference", ""),
+                notes=data.get("notes", ""),
+            )
+        except SaleValidationError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        audit.log(
+            request=request,
+            action=ActionChoices.SALE_PAYMENT,
+            description=(
+                f"Registró un abono de {payment.amount_usd} USD a la venta #{sale.pk} "
+                f"de {sale.customer.company_name} (saldo: {sale.balance_usd} USD)."
+            ),
+            target=sale,
+            metadata={
+                "amount_usd": str(payment.amount_usd),
+                "method": payment.method,
+                "balance_usd": str(sale.balance_usd),
+                "status": sale.status,
+            },
+        )
+        return Response(
+            SaleSerializer(sale, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"], url_path="nota")  # permiso en get_permissions
+    def nota(self, request, pk=None):
+        """Edita las notas/observaciones de la venta."""
+        sale = self.get_object()
+        serializer = SaleNoteInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        update_sale_notes(sale=sale, notes=serializer.validated_data.get("notes", ""))
+        audit.log(
+            request=request,
+            action=ActionChoices.SALE_UPDATE,
+            description=f"Editó las notas de la venta #{sale.pk} de {sale.customer.company_name}.",
+            target=sale,
         )
         return Response(
             SaleSerializer(sale, context=self.get_serializer_context()).data,

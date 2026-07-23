@@ -135,7 +135,7 @@ This API has all of its comments as well as API responses in Spanish. Functions,
 |-----|---------|
 | `apps/accounts` | Auth & RBAC: UserProfile (role), JWT login/logout/refresh/me, role-based permissions |
 | `apps/core` | Master data: Product, Category, Customer, Seller, ExchangeRate, ProductPriceHistory. Also exposes a read-only `GET /api/exchange-rate/latest` and the `seed_demo_data` command |
-| `apps/sales` | Transactions: Sale (con desglose de IVA + facturación fiscal), SaleItem, Quote, QuoteItem, DispatchOrder, DispatchOrderItem. **REST API** for registering/invoicing sales (`SaleViewSet`), creating/converting quotes (`QuoteViewSet`) and dispatch orders (`DispatchOrderViewSet`), all over `services.py` (`create_sale`/`void_sale`/`invoice_sale`/`create_quote`/`convert_quote_to_sale`/`create_dispatch_order`) |
+| `apps/sales` | Transactions: Sale (con desglose de IVA + facturación fiscal + cobranza/abonos), SaleItem, **SalePayment** (abono/pago parcial), Quote, QuoteItem, DispatchOrder, DispatchOrderItem. **REST API** for registering/invoicing/collecting sales (`SaleViewSet`), creating/converting quotes (`QuoteViewSet`) and dispatch orders (`DispatchOrderViewSet`), all over `services.py` (`create_sale`/`void_sale`/`invoice_sale`/`add_sale_payment`/`update_sale_notes`/`create_quote`/`convert_quote_to_sale`/`create_dispatch_order`) |
 | `apps/inventory` | Audit trail: InventoryMovement (every stock change logged). **REST API for stock control** (`InventoryMovementViewSet`, `StockListView` + `services.py`) |
 | `apps/benchmarking` | Competitor intelligence: Competitor, CompetitorMarketData (with USD snapshot, `listing_key`, own-`Product` match, provenance), ScrapeRun (run traceability), RejectedMarketData (archived discards). Admin `merge_competitors` action |
 | `apps/analytics` | ML / predictive layer: PredictionLog (model registry), KPI, Alert; the `ml/` package (datasets→features→estimators→forecasters→registry), the `/api/analytics/` forecast API (`IsManager`), and the `train_models` command. See **Predictive / ML module** below |
@@ -231,7 +231,7 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 /api/products/                → ProductViewset CRUD (read = operativo, write = Manager+); `stock` is read-only (append-only inventory)
 /api/categories               → read-only category list for the product form (operativo, unpaginated)
 /api/customers/               → CustomerViewSet (read/create = Seller+, delete = Manager+)
-/api/sales/                   → SaleViewSet (ver = operativo, registrar = Seller+); POST …/{id}/anular/ to void (Manager+); POST …/{id}/facturar/ (Seller+, multipart) fija nº factura + nº control + adjunto (opcional, se factura después); GET …/siguiente-factura/ sugiere el correlativo. La venta lleva desglose de IVA (base = total_sale_usd; + iva_amount_usd/total_with_iva_usd(+ves))
+/api/sales/                   → SaleViewSet (ver = operativo, registrar = Seller+); POST …/{id}/anular/ to void (Manager+); POST …/{id}/facturar/ (Seller+, multipart) fija nº factura + nº control + adjunto (opcional, se factura después); GET …/siguiente-factura/ sugiere el correlativo; POST …/{id}/pagos/ (Seller+) registra un abono (autocompleta al saldar; rechaza sobrepago); POST …/{id}/nota/ (Seller+) edita las notas. La venta lleva desglose de IVA (base = total_sale_usd; + iva_amount_usd/total_with_iva_usd(+ves)) y cobranza (amount_paid_usd, balance_usd, is_fully_paid, payments[]): el estado se deriva del saldo (PEN→COMP al saldar; COMP = totalmente cobrada)
 /api/quotes/                  → QuoteViewSet (ver = operativo, crear = Seller+): presupuestos. create_quote (apps/sales/services) no toca inventario; IVA 16% por defecto, número correlativo DDMMYYYY-N. El PDF se genera en el frontend. POST …/{id}/convertir/ (Seller+) genera la venta desde el presupuesto (convert_quote_to_sale → descuenta stock, marca CONVERTED + converted_to_sale). ?convertible=true filtra los presupuestos vigentes aún convertibles (buscador del formulario de venta). Relacionar un presupuesto **también** se puede al registrar la venta: `POST /api/sales/` acepta `quote` → `create_sale` enlaza vía `_link_quote_to_sale`
 /api/dispatch-orders/         → DispatchOrderViewSet (ver/crear/estado = operativo): órdenes de despacho (nota de entrega, OD-DDMMYYYY-N, estado PEN→PREP→DESP→ENT/ANU). Se generan desde una venta y NO mueven inventario; POST …/{id}/estado/ actualiza estado/datos de entrega. El PDF (con firmas) se genera en el frontend
 /api/inventory/stock          → current stock summary per product (ver = operativo)
@@ -281,6 +281,17 @@ and both run inside a single `transaction.atomic` so a sale/movement never lands
 - **`apps/sales/services.invoice_sale`** — asocia los datos fiscales (nº factura, nº control,
   `invoice_date`, adjunto opcional) a una venta ya registrada, validando unicidad; `suggest_invoice_numbers`
   sugiere el siguiente correlativo. Facturar es opcional y posterior al registro.
+- **Cobranza / abonos.** `create_sale` acepta `amount_paid` (+ `payment_method`): sin él la venta se
+  considera pagada completa (COMP) — **backward-compatible** para conversión de presupuesto e importación
+  de Excel, que no pasan pago; con un monto, se registra un `SalePayment` inicial y el **estado se deriva
+  del saldo** (COMP si cubre `total_with_iva_usd`, si no PEN). **`apps/sales/services.add_sale_payment`**
+  asienta un abono (medio EFE/DIV/PMO/TRA/PDV/ZEL/OTR), suma a `Sale.amount_paid_usd`, valida que no
+  supere el saldo y **autocompleta** la venta (PEN→COMP) al saldar el total; el saldo/estado están
+  disponibles como `Sale.balance_usd`/`Sale.is_fully_paid`. **`apps/sales/services.update_sale_notes`**
+  edita las notas. Migración `sales/0006` (campo `amount_paid_usd` + modelo `SalePayment`, tabla
+  `sale_payments`) con **backfill** `amount_paid_usd = total_with_iva_usd` para las ventas COMP existentes,
+  así el histórico queda "totalmente cobrado" y **la analítica/ML no cambia** (los estados/ingresos/utilidad
+  no se tocan; la analítica sigue leyendo sólo `status="COMP"`). Auditado `SALE_PAYMENT`/`SALE_UPDATE`.
 - **`apps/sales/services.convert_quote_to_sale`** — crea una venta desde un presupuesto (reutiliza
   `create_sale`, así que valida/descuenta stock), enlaza `Quote.converted_to_sale` y marca `CONVERTED`.
 - **`apps/sales/services.create_dispatch_order` / `update_dispatch_order`** — orden de despacho
