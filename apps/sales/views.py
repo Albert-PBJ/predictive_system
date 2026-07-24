@@ -162,6 +162,8 @@ class SaleViewSet(viewsets.ModelViewSet):
                 sale_type=data.get("sale_type") or Sale.TypeChoices.RETAIL,
                 notes=data.get("notes", ""),
                 iva_rate=data.get("iva_rate"),
+                installation_cost=data.get("installation_cost_usd"),
+                delivery_cost=data.get("delivery_cost_usd"),
                 quote=quote,
                 amount_paid=amount_paid,
                 payment_method=data.get("payment_method"),
@@ -405,8 +407,8 @@ class QuoteViewSet(viewsets.ModelViewSet):
                 # Si no se envía IVA, lo resuelve el servicio con el default de la
                 # Configuración del Sistema (default_iva_pct).
                 iva_rate=data.get("iva_rate"),
-                includes_installation=data.get("includes_installation", False),
-                includes_delivery=data.get("includes_delivery", False),
+                installation_cost=data.get("installation_cost_usd"),
+                delivery_cost=data.get("delivery_cost_usd"),
                 status=data.get("status") or Quote.StatusChoices.DRAFT,
             )
         except QuoteValidationError as exc:

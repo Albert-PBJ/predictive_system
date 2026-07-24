@@ -271,9 +271,13 @@ and both run inside a single `transaction.atomic` so a sale/movement never lands
   if a net price is sent instead, back-computes the %), and totals the saving into
   `Sale.total_discount_usd`. The serializer exposes the list price + % on read and accepts
   `discount_pct` on write. It also computes the **IVA breakdown** (`iva_rate` default from
-  `system_settings.default_iva_pct()`; `iva_amount_usd`/`total_with_iva_usd`(+ves)) on top of the base
-  imponible — `total_sale_usd` stays the base (what the analytics reads), so revenue is unchanged.
-  Optionally takes a `quote`: when the sale is registered from a related presupuesto, it links it and
+  `system_settings.default_iva_pct()`; `iva_amount_usd`/`total_with_iva_usd`(+ves)): the **taxable base
+  = productos + `installation_cost`/`delivery_cost`** (optional priced instalación/despacho charges, set
+  on the form and carried through `convert_quote_to_sale` from the quote), IVA on that base, total = base
+  + IVA. `total_sale_usd` stays **products-only** (what the analytics reads) and the charges are excluded
+  from utilidad/costo/comisión — so revenue/profit series and commissions are unchanged (historical rows
+  default to 0). `create_quote` mirrors this (`subtotal_usd` products-only; `includes_*` booleans derived
+  from cost > 0). Optionally takes a `quote`: when the sale is registered from a related presupuesto, it links it and
   marks it CONVERTED via `_link_quote_to_sale` (the shared helper `convert_quote_to_sale` also uses) —
   same-customer + not-already-converted enforced.
 - **`apps/sales/services.void_sale`** — reverses a sale: writes a `DEV` movement per line (returns the

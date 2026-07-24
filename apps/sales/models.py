@@ -40,8 +40,22 @@ class Sale(models.Model):
         help_text=_("Descuento total otorgado en USD (precio de lista − precio de venta)"),
     )
 
+    # Cargos adicionales opcionales (servicios facturados junto con los productos):
+    # instalación y despacho/flete. Se fijan al registrar la venta y se **suman a la
+    # base imponible** (por tanto llevan IVA) y al total a pagar, PERO no forman parte
+    # de `total_sale_usd`/utilidad/comisión — así la analítica de ingresos y utilidad
+    # (que lee `total_sale_usd`) no cambia; solo suben lo que el cliente paga.
+    installation_cost_usd = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        help_text=_("Cargo por instalación en USD (opcional; se suma a la base imponible)"),
+    )
+    delivery_cost_usd = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        help_text=_("Cargo por despacho/flete en USD (opcional; se suma a la base imponible)"),
+    )
+
     # Desglose de IVA (impuesto al valor agregado, 16% por defecto). Se calcula sobre
-    # la base imponible al registrar la venta; `total_with_iva_usd` = base + IVA.
+    # la base imponible (productos + instalación + despacho); `total_with_iva_usd` = base + IVA.
     iva_rate = models.DecimalField(
         max_digits=5, decimal_places=2, default=16.00,
         help_text=_("Porcentaje de IVA aplicado (por defecto 16%)"),
@@ -272,6 +286,18 @@ class Quote(models.Model):
 
     includes_installation = models.BooleanField(default=False, help_text=_("¿El presupuesto incluye servicio de instalación?"))
     includes_delivery = models.BooleanField(default=False, help_text=_("¿El presupuesto incluye despacho/flete?"))
+
+    # Cargos adicionales opcionales (instalación / despacho-flete). Se suman a la base
+    # imponible (por tanto llevan IVA) y al total. Los booleanos `includes_*` se derivan
+    # de que su costo sea > 0 (para el PDF y la lectura), pero un cargo puede ser 0.
+    installation_cost_usd = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        help_text=_("Cargo por instalación en USD (se suma a la base imponible)"),
+    )
+    delivery_cost_usd = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        help_text=_("Cargo por despacho/flete en USD (se suma a la base imponible)"),
+    )
 
     subtotal_usd = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     subtotal_ves = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)

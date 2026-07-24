@@ -66,6 +66,8 @@ def create_sale(
     status=Sale.StatusChoices.COMPLETED,
     notes="",
     iva_rate=None,
+    installation_cost=None,
+    delivery_cost=None,
     quote=None,
     amount_paid=None,
     payment_method=None,
@@ -147,6 +149,10 @@ def create_sale(
         iva_rate = system_settings.default_iva_pct()
     iva_rate = Decimal(str(iva_rate))
 
+    # Cargos adicionales (instalación / despacho-flete): opcionales, nunca negativos.
+    installation_cost = _money(max(Decimal("0"), Decimal(str(installation_cost or 0))))
+    delivery_cost = _money(max(Decimal("0"), Decimal(str(delivery_cost or 0))))
+
     sale = Sale.objects.create(
         customer=customer,
         seller=seller,
@@ -155,6 +161,8 @@ def create_sale(
         status=status,
         notes=notes,
         iva_rate=iva_rate,
+        installation_cost_usd=installation_cost,
+        delivery_cost_usd=delivery_cost,
         bcv_rate=rate.bcv_rate if rate else None,
         parallel_rate=rate.parallel_rate if rate else None,
     )
@@ -226,10 +234,12 @@ def create_sale(
     commission_rate = seller.commission_rate or Decimal("0")
     commission = _money(total_profit * commission_rate / Decimal("100"))
 
-    # Desglose de IVA sobre la base imponible (total_sale). El total a pagar es
-    # base + IVA; la analítica sigue leyendo `total_sale_usd` (la base), intacta.
-    iva_amount = _money(total_sale * iva_rate / Decimal("100"))
-    total_with_iva = total_sale + iva_amount
+    # Base imponible = productos + cargos de instalación/despacho. El IVA se calcula
+    # sobre esa base y el total a pagar es base + IVA. La analítica sigue leyendo
+    # `total_sale_usd` (solo productos), intacta: los cargos no la tocan.
+    taxable_base = total_sale + installation_cost + delivery_cost
+    iva_amount = _money(taxable_base * iva_rate / Decimal("100"))
+    total_with_iva = taxable_base + iva_amount
 
     # Cobranza: determina el monto abonado y el estado según el pago. Sin `amount_paid`
     # se respeta el `status` recibido (COMP = pagada; PEN = sin abonar) por
@@ -518,8 +528,8 @@ def create_quote(
     issued_date=None,
     expiry_date=None,
     iva_rate=None,
-    includes_installation=False,
-    includes_delivery=False,
+    installation_cost=None,
+    delivery_cost=None,
     status=Quote.StatusChoices.DRAFT,
 ):
     """Crea un presupuesto con sus líneas (sin tocar inventario).
@@ -582,9 +592,15 @@ def create_quote(
         })
         subtotal += line_total
 
+    # Cargos adicionales (instalación / despacho-flete): opcionales, nunca negativos.
+    # Se suman a la base imponible; los booleanos `includes_*` se derivan del costo > 0.
+    installation_cost = _money(max(Decimal("0"), Decimal(str(installation_cost or 0))))
+    delivery_cost = _money(max(Decimal("0"), Decimal(str(delivery_cost or 0))))
+
     iva_rate = Decimal(str(iva_rate))
-    iva_amount = _money(subtotal * iva_rate / Decimal("100"))
-    total = subtotal + iva_amount
+    taxable_base = subtotal + installation_cost + delivery_cost
+    iva_amount = _money(taxable_base * iva_rate / Decimal("100"))
+    total = taxable_base + iva_amount
 
     quote_fields = dict(
         customer=customer,
@@ -593,8 +609,10 @@ def create_quote(
         expiry_date=expiry_date,
         bcv_rate=rate.bcv_rate if rate else None,
         parallel_rate=rate.parallel_rate if rate else None,
-        includes_installation=includes_installation,
-        includes_delivery=includes_delivery,
+        includes_installation=installation_cost > 0,
+        includes_delivery=delivery_cost > 0,
+        installation_cost_usd=installation_cost,
+        delivery_cost_usd=delivery_cost,
         subtotal_usd=subtotal,
         subtotal_ves=_money(subtotal * eff_rate) if eff_rate else None,
         iva_rate=iva_rate,
@@ -680,6 +698,9 @@ def convert_quote_to_sale(
         sale_type=sale_type or Sale.TypeChoices.INSTITUTIONAL,
         status=status,
         iva_rate=quote.iva_rate,
+        # La venta hereda los cargos de instalación/despacho del presupuesto.
+        installation_cost=quote.installation_cost_usd,
+        delivery_cost=quote.delivery_cost_usd,
         notes=f"Generada a partir del presupuesto {quote.quote_number}.",
         quote=quote,  # cierra la relación cotización→venta (vía _link_quote_to_sale)
     )

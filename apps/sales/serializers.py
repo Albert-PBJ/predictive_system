@@ -118,6 +118,8 @@ class SaleSerializer(serializers.ModelSerializer):
             "total_cost_usd",
             "total_profit_usd",
             "total_discount_usd",
+            "installation_cost_usd",
+            "delivery_cost_usd",
             "total_sale_ves",
             "iva_rate",
             "iva_amount_usd",
@@ -226,6 +228,14 @@ class SaleCreateSerializer(serializers.Serializer):
     iva_rate = serializers.DecimalField(
         max_digits=5, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=100
     )
+    # Cargos adicionales opcionales (instalación / despacho-flete): se suman a la base
+    # imponible y al total a pagar (no afectan utilidad/comisión ni la analítica).
+    installation_cost_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True, min_value=0
+    )
+    delivery_cost_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True, min_value=0
+    )
     # Presupuesto relacionado (opcional): al registrar la venta desde un presupuesto,
     # se enlaza y se marca como convertido. Debe ser del mismo cliente (lo valida el servicio).
     quote = serializers.PrimaryKeyRelatedField(
@@ -328,6 +338,8 @@ class QuoteSerializer(serializers.ModelSerializer):
             "parallel_rate",
             "includes_installation",
             "includes_delivery",
+            "installation_cost_usd",
+            "delivery_cost_usd",
             "subtotal_usd",
             "subtotal_ves",
             "iva_rate",
@@ -370,8 +382,14 @@ class QuoteCreateSerializer(serializers.Serializer):
         max_digits=5, decimal_places=2, required=False, default=Decimal("16.00"),
         min_value=0, max_value=100,
     )
-    includes_installation = serializers.BooleanField(required=False, default=False)
-    includes_delivery = serializers.BooleanField(required=False, default=False)
+    # Cargos adicionales opcionales (instalación / despacho-flete): se suman a la base
+    # imponible y al total. Los booleanos `includes_*` se derivan del costo en el servicio.
+    installation_cost_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True, min_value=0
+    )
+    delivery_cost_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True, min_value=0
+    )
     status = serializers.ChoiceField(
         choices=[
             Quote.StatusChoices.DRAFT,
