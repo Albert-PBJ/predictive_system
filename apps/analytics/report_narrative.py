@@ -207,9 +207,9 @@ def _compact_facts(d: dict, ov: dict | None, sensitive: bool) -> str:
     if er:
         lines.append(
             f"\nTIPO DE CAMBIO en el periodo: BCV de {_ves(er.get('start_bcv'))} a {_ves(er.get('end_bcv'))} "
-            f"({_signed_pct(er.get('bcv_change_pct'))}); paralelo de {_ves(er.get('start_parallel'))} a "
+            f"({_signed_pct(er.get('bcv_change_pct'))}); Euro BCV de {_ves(er.get('start_parallel'))} a "
             f"{_ves(er.get('end_parallel'))} ({_signed_pct(er.get('parallel_change_pct'))}). "
-            "Un dólar paralelo al alza encarece los productos y suele frenar la demanda."
+            "Un Euro BCV al alza encarece los productos y suele frenar la demanda."
         )
 
     # --- Competitividad de precio (sensible) ---
@@ -253,7 +253,7 @@ def _compact_facts(d: dict, ov: dict | None, sensitive: bool) -> str:
         if h.get("next_bcv") or h.get("next_parallel"):
             lines.append(
                 f"- Tipo de cambio próximo mes (proyección): BCV {_ves((h.get('next_bcv') or {}).get('value'))}, "
-                f"paralelo {_ves((h.get('next_parallel') or {}).get('value'))}."
+                f"Euro BCV {_ves((h.get('next_parallel') or {}).get('value'))}."
             )
         pipe = h.get("pipeline")
         if pipe:

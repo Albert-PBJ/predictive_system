@@ -256,7 +256,7 @@ class ExchangeRateSetView(APIView):
             action=ActionChoices.RATE_UPDATE,
             description=(
                 f"Cargó manualmente la tasa de cambio del {target_date.isoformat()}: "
-                f"BCV {bcv}" + (f", paralela {parallel}" if parallel is not None else "") + "."
+                f"BCV {bcv}" + (f", Euro BCV {parallel}" if parallel is not None else "") + "."
             ),
             target=rate,
             metadata={
@@ -309,7 +309,7 @@ class ExchangeRateFetchView(APIView):
             action=ActionChoices.RATE_UPDATE,
             description=(
                 f"Actualizó la tasa de cambio desde la fuente «{provider}»: BCV {bcv}"
-                + (f", paralela {parallel}" if parallel is not None else "") + "."
+                + (f", Euro BCV {parallel}" if parallel is not None else "") + "."
             ),
             target=rate,
             metadata={

@@ -342,7 +342,7 @@ def forecast_exchange_rate(rate: str = "bcv", horizon: int = 6, model: str | Non
         return _empty("exchange_rate", "Pronóstico de la tasa de cambio")
     model_key = model or ASSIGNED_MODEL["exchange_rate"]
     col = "bcv_rate" if rate == "bcv" else "parallel_rate"
-    label = "BCV" if rate == "bcv" else "paralela"
+    label = "BCV" if rate == "bcv" else "Euro BCV"
     periods = list(df.index)
     values = [float(v) for v in df[col].tolist()]
     # La tasa crece de forma exponencial -> regresión lineal sobre log, sin estacionalidad.
@@ -353,7 +353,7 @@ def forecast_exchange_rate(rate: str = "bcv", horizon: int = 6, model: str | Non
         recs = datasets.exchange_rate_for_month(p)
         detail[p] = {
             "kind": "history",
-            "columns": ["Fecha", "BCV", "Paralela", "Fuente"],
+            "columns": ["Fecha", "BCV", "Euro BCV", "Fuente"],
             "rows": [[r.date.isoformat(), float(r.bcv_rate),
                       float(r.parallel_rate) if r.parallel_rate is not None else None,
                       r.get_source_display()] for r in recs],

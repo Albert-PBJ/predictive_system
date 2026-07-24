@@ -222,7 +222,7 @@ def _build_narrative(start, end, cur, prev, type_split, no_demand_count, at_risk
             out.append(f"{len(at_risk)} clientes activos llevan más de 6 meses sin comprar (riesgo de fuga).")
     if rate and rate.get("parallel_change_pct") is not None and abs(rate["parallel_change_pct"]) >= 5:
         out.append(
-            f"El dólar paralelo varió {rate['parallel_change_pct']:+.0f}% en el periodo, "
+            f"El Euro BCV varió {rate['parallel_change_pct']:+.0f}% en el periodo, "
             f"presionando la demanda."
         )
     return out[:5]
