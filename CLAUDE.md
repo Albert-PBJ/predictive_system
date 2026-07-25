@@ -231,11 +231,11 @@ REST endpoints (`apps/competitor_market_data/views.py`, generic & dispatched by 
 /api/products/                → ProductViewset CRUD (read = operativo, write = Manager+); `stock` is read-only (append-only inventory)
 /api/categories               → read-only category list for the product form (operativo, unpaginated)
 /api/customers/               → CustomerViewSet (read/create = Seller+, delete = Manager+)
-/api/sales/                   → SaleViewSet (ver = operativo, registrar = Seller+); POST …/{id}/anular/ to void (Manager+); POST …/{id}/facturar/ (Seller+, multipart) fija nº factura + nº control + adjunto (opcional, se factura después); GET …/siguiente-factura/ sugiere el correlativo; POST …/{id}/pagos/ (Seller+) registra un abono (autocompleta al saldar; rechaza sobrepago); POST …/{id}/nota/ (Seller+) edita las notas. La venta lleva desglose de IVA (base = total_sale_usd; + iva_amount_usd/total_with_iva_usd(+ves)) y cobranza (amount_paid_usd, balance_usd, is_fully_paid, payments[]): el estado se deriva del saldo (PEN→COMP al saldar; COMP = totalmente cobrada)
+/api/sales/                   → SaleViewSet (ver = operativo, registrar = Seller+); POST …/{id}/anular/ to void (Manager+); POST …/{id}/facturar/ (Seller+, multipart) fija nº factura + nº control + adjunto (opcional, se factura después); GET …/siguiente-factura/ sugiere el correlativo; GET …/pendientes-despacho/ (operativo) lista las ventas del mes con despacho incluido (delivery_cost_usd>0) sin orden de despacho aún; POST …/{id}/pagos/ (Seller+) registra un abono (autocompleta al saldar; rechaza sobrepago); POST …/{id}/nota/ (Seller+) edita las notas. La venta lleva desglose de IVA (base = total_sale_usd; + iva_amount_usd/total_with_iva_usd(+ves)) y cobranza (amount_paid_usd, balance_usd, is_fully_paid, payments[]): el estado se deriva del saldo (PEN→COMP al saldar; COMP = totalmente cobrada)
 /api/quotes/                  → QuoteViewSet (ver = operativo, crear = Seller+): presupuestos. create_quote (apps/sales/services) no toca inventario; IVA 16% por defecto, número correlativo DDMMYYYY-N. El PDF se genera en el frontend. POST …/{id}/convertir/ (Seller+) genera la venta desde el presupuesto (convert_quote_to_sale → descuenta stock, marca CONVERTED + converted_to_sale). ?convertible=true filtra los presupuestos vigentes aún convertibles (buscador del formulario de venta). Relacionar un presupuesto **también** se puede al registrar la venta: `POST /api/sales/` acepta `quote` → `create_sale` enlaza vía `_link_quote_to_sale`
 /api/dispatch-orders/         → DispatchOrderViewSet (ver/crear/estado = operativo): órdenes de despacho (nota de entrega, OD-DDMMYYYY-N, estado PEN→PREP→DESP→ENT/ANU). Se generan desde una venta y NO mueven inventario; POST …/{id}/estado/ actualiza estado/datos de entrega. El PDF (con firmas) se genera en el frontend
 /api/inventory/stock          → current stock summary per product (ver = operativo)
-/api/inventory/movements/     → InventoryMovementViewSet: history (ver = operativo) + register ENT/AJU/DEV (Inventario+)
+/api/inventory/movements/     → InventoryMovementViewSet: history (ver = operativo) + register ENT/AJU/DEV (Inventario+); POST …/{id}/verificar/ marca/desmarca la verificación de almacén (IsStockVerifier = ADMIN/WAREHOUSE)
 /api/exchange-rate/latest     → latest BCV/parallel rate, read-only (Seller+)
 /api/analytics/               → predictive module (Manager+): overview, retrain (POST — reentrena todo = `train_models` desde la UI, reescribe PredictionLog + limpia caché, audita MODELS_RETRAIN), forecast/{demand,sales,profit,exchange-rate,product-price,inventory,quote-conversion}, benchmark/competitors, forecastable-products. Plus report-narrative (IsViewer, ?from=&to=) — LLM-written prose for the home "Generar reporte PDF" (apps/analytics/report_narrative.py, reuses the DeepSeek creds, degrades safely)
 /api/analytics/notifications  → bandeja de notificaciones del usuario sobre el sistema de alertas (IsAuthenticated, filtrada por la audiencia de rol): GET (feed + unread_count), POST /read (marcar leídas), POST /scan (dispara el barrido predictivo, throttled). Ver "Notifications & alerts" abajo
@@ -311,6 +311,11 @@ and both run inside a single `transaction.atomic` so a sale/movement never lands
   records the average cost applied (COGS) without changing the average — see *Weighted-average costing*
   below. It also **persists a low-stock `Alert`** (`STOCK_BREAK`, deduped per product, resolved when stock
   recovers) via `_sync_low_stock_alert` — best-effort, wrapped in try/except so it never breaks the movement.
+  Every `InventoryMovement` also carries a **verification** flag (`verified`/`verified_by`/`verified_at`) —
+  a control by which warehouse attests the physical change happened — toggled via
+  `POST /api/inventory/movements/{id}/verificar/` (`{verified?}`, default true; the `verificar` action),
+  gated to the new **`IsStockVerifier`** permission (**ADMIN + WAREHOUSE only**; managers excluded on
+  purpose — it's a shop-floor attestation). Audited `INVENTORY_VERIFY`/`INVENTARIO`.
 
 **Permissions (separation of duties):** the model is **not a single linear ladder** —
 `ADMIN > MANAGER > {SELLER, WAREHOUSE} > VIEWER`, where `SELLER` (vendedor) and `WAREHOUSE`
@@ -503,8 +508,11 @@ role-routed notification feed (the header bell + the `/notificaciones` page).
   `dedupe_key` (stable key for upsert, e.g. `stock_pred:42`), `updated_at`, and a new type
   `STOCK_PRED` (*quiebre previsto*). New model **`AlertRead(alert, user)`** = per-user read state
   (absence = unread). Migration `analytics/0005`.
-- **`alerts.py`** centralizes: `AUDIENCE_BY_TYPE`/`audience_for` (inventory alerts →
-  ADMIN/MANAGER/WAREHOUSE; strategy alerts `PRICE_CHANGE`/`RATE_STALE` → ADMIN/MANAGER),
+- **`alerts.py`** centralizes: `AUDIENCE_BY_TYPE`/`audience_for` (inventory alerts, incl. the new
+  `DISPATCH` "despacho pendiente" type → ADMIN/MANAGER/WAREHOUSE; strategy alerts `PRICE_CHANGE`/`RATE_STALE` → ADMIN/MANAGER),
+  the operational helper **`notify_dispatch_needed(sale)`/`resolve_dispatch_needed(sale_id)`** (a sale
+  created with `delivery_cost_usd > 0` alerts warehouse to generate its dispatch order — deduped
+  `dispatch_needed:<id>`, resolved on dispatch-order create / sale void),
   `upsert_alert`/`resolve_alert`/`resolve_missing` (deduped by `dedupe_key`; on **escalation** —
   severity up or message change — it deletes the alert's `AlertRead`s to re-notify), and
   **`scan_and_generate_alerts()`** — the throttled (≥20 min via `django.core.cache`), best-effort
@@ -584,7 +592,7 @@ JWT auth via `djangorestframework-simplejwt`. DRF defaults to `JWTAuthentication
 
 **Roles & profile:** `apps/accounts/models.py` defines `Role` (ADMIN, MANAGER, SELLER, **WAREHOUSE**, VIEWER) on a `UserProfile` (OneToOne to `auth.User`). The roles are **not a strict linear hierarchy**: `WAREHOUSE` (encargado de inventario) is a sibling of `SELLER`, not a tier above/below it — see the separation-of-duties note above (sellers sell, warehouse manages stock, managers do both). **`UserProfile` is the source of truth for user data** — it holds `role`, `first_name`, `last_name`, `email`, `phone`; `auth_user` is kept for authentication only (username/password/permissions/dates). Django's `User` still physically has empty `first_name`/`last_name`/`email` columns (they can't be dropped without a custom user model), but they are intentionally unused — read/write personal data via the profile. A `post_save` signal (`signals.py`) auto-creates the profile (superusers → ADMIN, else VIEWER) and copies any personal data Django collected at creation (e.g. `createsuperuser`) into it. The Django admin hides the personal-info fieldset on the User form and edits those fields through the `UserProfile` inline. The role is embedded as a JWT claim and returned in the login response; `UserSerializer` sources name/email/phone from the profile.
 
-**Permission classes** (`apps/accounts/permissions.py`, superusers always pass): `IsAdmin` and `IsManager` are cumulative tiers; the rest are **capability-based** to model the non-linear roles — `IsSeller` (ADMIN/MANAGER/SELLER = "can register sales", excludes warehouse), `IsWarehouse` (ADMIN/MANAGER/WAREHOUSE = "can modify stock", excludes sellers), `IsOperational` (ADMIN/MANAGER/SELLER/WAREHOUSE = shared read access), and `IsViewer` (any valid role, read-only). Apply per-viewset with `permission_classes`, or per-action via `get_permissions()`.
+**Permission classes** (`apps/accounts/permissions.py`, superusers always pass): `IsAdmin` and `IsManager` are cumulative tiers; the rest are **capability-based** to model the non-linear roles — `IsSeller` (ADMIN/MANAGER/SELLER = "can register sales", excludes warehouse), `IsWarehouse` (ADMIN/MANAGER/WAREHOUSE = "can modify stock", excludes sellers), `IsStockVerifier` (**ADMIN/WAREHOUSE only** = "can verify a movement physically happened" — note this **excludes MANAGER**, unlike `IsWarehouse`, since it's a shop-floor attestation), `IsOperational` (ADMIN/MANAGER/SELLER/WAREHOUSE = shared read access), and `IsViewer` (any valid role, read-only). Apply per-viewset with `permission_classes`, or per-action via `get_permissions()`.
 
 **Endpoints** (`/api/auth/`): `login`, `refresh`, `logout` (blacklists refresh token), `me`. Public sign-up is intentionally **not** implemented — only admins create users.
 

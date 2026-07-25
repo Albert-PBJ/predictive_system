@@ -773,6 +773,50 @@ def warehouse_dashboard(start: date, end: date) -> dict:
         for a in alert_rows[:8]
     ]
 
+    # Últimos movimientos de inventario (con su estado de verificación de almacén).
+    from apps.inventory.models import InventoryMovement
+
+    def _user_name(user):
+        if not user:
+            return None
+        profile = getattr(user, "profile", None)
+        if profile:
+            nm = f"{profile.first_name} {profile.last_name}".strip()
+            if nm:
+                return nm
+        return user.username
+
+    recent_movements = [
+        {
+            "id": m.id,
+            "movement_date": m.movement_date.isoformat(),
+            "product_name": m.product.name,
+            "product_sku": m.product.sku,
+            "movement_type": m.movement_type,
+            "movement_type_display": m.get_movement_type_display(),
+            "quantity": m.quantity,
+            "reference": m.reference,
+            "responsible_name": _user_name(m.responsible),
+            "verified": m.verified,
+            "verified_by_name": _user_name(m.verified_by),
+            "verified_at": m.verified_at.isoformat() if m.verified_at else None,
+        }
+        for m in (
+            InventoryMovement.objects.select_related(
+                "product", "responsible__profile", "verified_by__profile"
+            ).order_by("-movement_date", "-created_at")[:8]
+        )
+    ]
+
+    # Ventas del mes actual con despacho incluido y aún sin orden de despacho: el aviso
+    # operativo para que almacén genere la orden. Independiente del rango (siempre mes
+    # actual), igual que la tabla de la pantalla de órdenes de despacho.
+    from apps.sales.services import pending_dispatch_rows, sales_pending_dispatch
+
+    pending_dispatch_qs = sales_pending_dispatch()
+    pending_dispatch = pending_dispatch_rows(pending_dispatch_qs, limit=10)
+    pending_dispatch_count = pending_dispatch_qs.count()
+
     # Resumen automatizado (data storytelling) enfocado en inventario.
     narrative = [
         f"El catálogo activo tiene {active_products} producto(s) con {inventory_health['units_in_stock']} unidad(es) en stock."
@@ -791,6 +835,10 @@ def warehouse_dashboard(start: date, end: date) -> dict:
         narrative.append(
             f"{no_demand_count} producto(s) no registraron salidas en el período (baja rotación)."
         )
+    if pending_dispatch_count:
+        narrative.append(
+            f"{pending_dispatch_count} venta(s) del mes con despacho incluido esperan su orden de despacho."
+        )
 
     return {
         "range": _range_block(start, end),
@@ -802,6 +850,9 @@ def warehouse_dashboard(start: date, end: date) -> dict:
         "restock_count": restock_count,
         "no_demand": no_demand,
         "no_demand_count": no_demand_count,
+        "recent_movements": recent_movements,
+        "pending_dispatch": pending_dispatch,
+        "pending_dispatch_count": pending_dispatch_count,
         "alerts": alerts,
     }
 

@@ -46,6 +46,7 @@ AUDIENCE_BY_TYPE: dict[str, list[str]] = {
     T.STOCK_PRED: _INVENTORY_AUDIENCE,
     T.OVERSTOCK: _INVENTORY_AUDIENCE,
     T.DEMAND_DROP: _INVENTORY_AUDIENCE,
+    T.DISPATCH: _INVENTORY_AUDIENCE,
     T.PRICE_CHANGE: _STRATEGY_AUDIENCE,
     T.RATE_STALE: _STRATEGY_AUDIENCE,
     T.GOAL_MET: _STRATEGY_AUDIENCE,
@@ -113,6 +114,41 @@ def resolve_alert(dedupe_key) -> int:
     return Alert.objects.filter(dedupe_key=dedupe_key, is_resolved=False).update(
         is_resolved=True
     )
+
+
+# --------------------------------------------------------------------------- #
+# Notificación operativa: venta con despacho → generar orden de despacho.
+# --------------------------------------------------------------------------- #
+def notify_dispatch_needed(sale) -> None:
+    """Avisa a almacén que una venta con despacho necesita una orden de despacho.
+
+    Se dispara al crear una venta cuyo cargo de despacho/flete es > 0. Deduplicada por
+    venta (``dispatch_needed:<id>``) y dirigida a la audiencia de inventario. Es
+    *best-effort*: registrar la alerta jamás debe romper la venta que la origina.
+    Se resuelve al crearse la primera orden de despacho de la venta (o al anularla).
+    """
+    try:
+        cliente = getattr(getattr(sale, "customer", None), "company_name", "") or "un cliente"
+        upsert_alert(
+            alert_type=T.DISPATCH,
+            dedupe_key=f"dispatch_needed:{sale.pk}",
+            severity=S.WARNING,
+            title=f"Despacho pendiente: venta #{sale.pk}",
+            message=(
+                f"Se registró la venta #{sale.pk} de {cliente} con despacho incluido. "
+                f"Genera su orden de despacho para preparar la entrega."
+            ),
+        )
+    except Exception:  # noqa: BLE001 — alertar nunca debe romper la operación
+        logger.warning("No se pudo generar la alerta de despacho pendiente", exc_info=True)
+
+
+def resolve_dispatch_needed(sale_id) -> None:
+    """Resuelve la alerta de despacho pendiente de una venta (best-effort)."""
+    try:
+        resolve_alert(f"dispatch_needed:{sale_id}")
+    except Exception:  # noqa: BLE001
+        logger.warning("No se pudo resolver la alerta de despacho pendiente", exc_info=True)
 
 
 def resolve_missing(*, alert_types, keep_keys) -> int:

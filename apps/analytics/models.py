@@ -135,6 +135,7 @@ class Alert(models.Model):
         DEMAND_DROP = "DEMAND", _("Caída de Demanda")
         GOAL_MET = "GOAL", _("Meta Cumplida")
         RATE_STALE = "RATE", _("Tasa de Cambio Desactualizada")
+        DISPATCH = "DISP", _("Despacho Pendiente")
 
     class SeverityChoices(models.TextChoices):
         INFO = "INFO", _("Información")

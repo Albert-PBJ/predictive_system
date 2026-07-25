@@ -52,6 +52,17 @@ class IsWarehouse(HasRole):
     allowed_roles = (Role.ADMIN, Role.MANAGER, Role.WAREHOUSE)
 
 
+class IsStockVerifier(HasRole):
+    """Puede **verificar** movimientos de inventario (confirmar que el cambio de
+    existencias ocurrió físicamente): solo el encargado de inventario y el admin.
+
+    Es una atestación de quien está en el almacén: a diferencia de `IsWarehouse`,
+    **excluye al gerente** a propósito (no está físicamente en el almacén). El admin
+    se incluye para poder corregir."""
+
+    allowed_roles = (Role.ADMIN, Role.WAREHOUSE)
+
+
 class IsOperational(HasRole):
     """Personal operativo: vendedores y encargados de inventario (más gerente/admin).
 

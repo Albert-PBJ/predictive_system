@@ -17,6 +17,7 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
         source="responsible.username", read_only=True, default=None
     )
     responsible_name = serializers.SerializerMethodField()
+    verified_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = InventoryMovement
@@ -36,8 +37,24 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
             "responsible_name",
             "movement_date",
             "notes",
+            "verified",
+            "verified_by",
+            "verified_by_name",
+            "verified_at",
             "created_at",
         )
+
+    def get_verified_by_name(self, obj):
+        # Nombre real de quien verificó (desde su UserProfile); cae al username.
+        user = obj.verified_by
+        if not user:
+            return None
+        profile = getattr(user, "profile", None)
+        if profile:
+            name = f"{profile.first_name} {profile.last_name}".strip()
+            if name:
+                return name
+        return user.username
 
     def get_responsible_name(self, obj):
         # Nombre real del responsable desde su UserProfile (fuente de verdad);

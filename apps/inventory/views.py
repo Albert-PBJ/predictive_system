@@ -1,8 +1,10 @@
+from django.utils import timezone
 from rest_framework import status, viewsets
+from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.permissions import IsOperational, IsWarehouse
+from apps.accounts.permissions import IsOperational, IsStockVerifier, IsWarehouse
 from apps.audit import services as audit
 from apps.audit.models import ActionChoices
 from apps.core.models import SERVICE_SKU_PREFIX, Product
@@ -35,9 +37,12 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         # Ver el historial: operativo (incluye vendedores). Registrar movimientos:
-        # solo quien gestiona el inventario.
+        # solo quien gestiona el inventario. **Verificar** un movimiento: solo almacén
+        # o admin (atestación de que el cambio físico ocurrió; el gerente queda fuera).
         if self.action == "create":
             return [IsWarehouse()]
+        if self.action == "verificar":
+            return [IsStockVerifier()]
         return super().get_permissions()
 
     def get_queryset(self):
@@ -112,6 +117,49 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
         return Response(
             InventoryMovementSerializer(movement).data,
             status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"])  # permiso IsStockVerifier (ver get_permissions)
+    def verificar(self, request, pk=None):
+        """Marca (o desmarca) un movimiento como verificado por almacén.
+
+        Deja constancia de que el cambio de existencias ocurrió físicamente. Acepta un
+        cuerpo opcional ``{"verified": true|false}`` (por defecto true) para poder
+        corregir una verificación. Solo almacén o admin (ver ``IsStockVerifier``).
+        """
+        movement = self.get_object()
+        verified = request.data.get("verified", True)
+        if isinstance(verified, str):
+            verified = verified.strip().lower() in ("1", "true", "yes", "si", "sí")
+
+        movement.verified = bool(verified)
+        if movement.verified:
+            movement.verified_by = request.user
+            movement.verified_at = timezone.now()
+        else:
+            movement.verified_by = None
+            movement.verified_at = None
+        movement.save(update_fields=["verified", "verified_by", "verified_at"])
+
+        audit.log(
+            request=request,
+            action=ActionChoices.INVENTORY_VERIFY,
+            description=(
+                f"{'Verificó' if movement.verified else 'Quitó la verificación de'} el movimiento "
+                f"«{movement.get_movement_type_display()}» de {movement.quantity:+d} sobre "
+                f"«{movement.product.name}»."
+            ),
+            target=movement,
+            metadata={
+                "movement_type": movement.movement_type,
+                "quantity": movement.quantity,
+                "product": movement.product.name,
+                "verified": movement.verified,
+            },
+        )
+        return Response(
+            InventoryMovementSerializer(movement).data,
+            status=status.HTTP_200_OK,
         )
 
 

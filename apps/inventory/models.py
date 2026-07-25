@@ -52,6 +52,23 @@ class InventoryMovement(models.Model):
     movement_date = models.DateField(help_text=_("Fecha del movimiento"))
     notes = models.TextField(blank=True)
 
+    # Verificación por almacén: confirma que el cambio de existencias ocurrió de verdad
+    # (la mercancía entró/salió físicamente). Solo el encargado de inventario o el admin
+    # pueden marcarla (ver `IsStockVerifier`). Sirve de control sobre movimientos manuales
+    # y salidas por venta.
+    verified = models.BooleanField(
+        default=False,
+        help_text=_("¿Almacén verificó que este movimiento ocurrió físicamente?"),
+    )
+    verified_by = models.ForeignKey(
+        "auth.User",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="verified_movements",
+        help_text=_("Usuario (almacén/admin) que verificó el movimiento"),
+    )
+    verified_at = models.DateTimeField(null=True, blank=True, help_text=_("Fecha y hora de la verificación"))
+
     # Continuidad operativa: referencia del movimiento registrado offline (Excel) e
     # importado luego. Evita duplicados al reimportar el mismo archivo.
     import_ref = models.CharField(

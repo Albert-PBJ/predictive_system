@@ -297,6 +297,13 @@ def create_sale(
     # cotización→venta (mismo enlace que la acción "Convertir a venta").
     if quote is not None:
         _link_quote_to_sale(quote, sale)
+
+    # Venta con despacho incluido → avisa a almacén que debe generar la orden de
+    # despacho (notificación en la campana del encargado de inventario). Best-effort.
+    if delivery_cost > 0 and status != Sale.StatusChoices.CANCELLED:
+        from apps.analytics.alerts import notify_dispatch_needed
+
+        notify_dispatch_needed(sale)
     return sale
 
 
@@ -350,7 +357,71 @@ def void_sale(*, sale, user):
     stamp = f"[Anulada por {user.username}]"
     sale.notes = f"{sale.notes}\n{stamp}".strip() if sale.notes else stamp
     sale.save(update_fields=["status", "notes", "updated_at"])
+
+    # Ya no hay nada que despachar: resuelve la alerta de despacho pendiente si existía.
+    from apps.analytics.alerts import resolve_dispatch_needed
+
+    resolve_dispatch_needed(sale.pk)
     return sale
+
+
+def sales_pending_dispatch(*, reference_date=None):
+    """Ventas del **mes actual** con despacho incluido y **sin** orden de despacho.
+
+    Una venta "con despacho incluido" es la que lleva un cargo de despacho/flete
+    (`delivery_cost_usd > 0`). Se consideran pendientes las no anuladas que aún no
+    tienen ninguna orden de despacho **activa** (se ignoran las órdenes anuladas).
+    Acotada al mes calendario de ``reference_date`` (por defecto, hoy). Devuelve un
+    queryset ordenado de la más reciente a la más antigua.
+    """
+    from django.db.models import Count, Q
+    from django.utils import timezone
+
+    ref = reference_date or timezone.localdate()
+    first = ref.replace(day=1)
+    nxt = (first.replace(year=first.year + 1, month=1)
+           if first.month == 12 else first.replace(month=first.month + 1))
+
+    return (
+        Sale.objects.filter(
+            delivery_cost_usd__gt=0, sale_date__gte=first, sale_date__lt=nxt
+        )
+        .exclude(status=Sale.StatusChoices.CANCELLED)
+        .annotate(
+            active_dispatch=Count(
+                "dispatch_orders",
+                filter=~Q(dispatch_orders__status=DispatchOrder.StatusChoices.CANCELLED),
+            )
+        )
+        .filter(active_dispatch=0)
+        .select_related("customer", "seller", "seller__user__profile")
+        .prefetch_related("items")
+        .order_by("-sale_date", "-created_at")
+    )
+
+
+def pending_dispatch_rows(queryset, *, limit=None):
+    """Serializa a dicts livianos las ventas pendientes de despacho (para la UI).
+
+    Fuente única de la fila que consumen tanto el panel del encargado de inventario
+    como el endpoint del módulo de despachos, para que ambas tablas coincidan.
+    """
+    from .serializers import _seller_display_name
+
+    rows = queryset[:limit] if limit else queryset
+    return [
+        {
+            "id": s.id,
+            "sale_date": s.sale_date.isoformat(),
+            "customer_name": s.customer.company_name if s.customer_id else "—",
+            "seller_name": _seller_display_name(s.seller),
+            "delivery_cost_usd": str(s.delivery_cost_usd),
+            "installation_cost_usd": str(s.installation_cost_usd),
+            "total_with_iva_usd": str(s.total_with_iva_usd),
+            "items": len(s.items.all()),  # `items` viene prefetch (sin N+1)
+        }
+        for s in rows
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -797,6 +868,10 @@ def create_dispatch_order(
                     )
                     for n in normalized
                 ])
+            # Ya existe una orden de despacho para la venta: resuelve el aviso pendiente.
+            from apps.analytics.alerts import resolve_dispatch_needed
+
+            resolve_dispatch_needed(sale.pk)
             return order
         except IntegrityError:
             continue

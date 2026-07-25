@@ -38,6 +38,8 @@ from .services import (
     create_quote,
     create_sale,
     invoice_sale,
+    pending_dispatch_rows,
+    sales_pending_dispatch,
     suggest_invoice_numbers,
     update_dispatch_order,
     update_sale_notes,
@@ -221,6 +223,26 @@ class SaleViewSet(viewsets.ModelViewSet):
     def siguiente_factura(self, request):
         """Sugiere el siguiente número correlativo de factura y de control."""
         return Response(suggest_invoice_numbers(), status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["get"], url_path="pendientes-despacho")
+    def pendientes_despacho(self, request):
+        """Ventas del mes actual con despacho incluido y aún sin orden de despacho.
+
+        Alimenta la tabla de "despachos pendientes" del panel de inventario y de la
+        pantalla de órdenes de despacho. Solo lectura, personal operativo.
+        """
+        from django.utils import timezone
+
+        qs = sales_pending_dispatch()
+        ref = timezone.localdate()
+        return Response(
+            {
+                "results": pending_dispatch_rows(qs),
+                "count": qs.count(),
+                "month_label": ref.strftime("%m/%Y"),
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["post"])  # permiso resuelto en get_permissions
     def facturar(self, request, pk=None):
