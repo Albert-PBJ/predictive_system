@@ -23,10 +23,16 @@ _CACHE: dict[str, tuple[str, object]] = {}
 
 
 def data_fingerprint() -> str:
-    """Huella barata del estado de los datos (cuenta + última modificación)."""
+    """Huella barata del estado de los datos (cuenta + última modificación).
+
+    Incluye la **fecha de corte del entrenamiento**: cambiarla cambia qué datos ven los
+    modelos, así que debe invalidar la caché igual que si hubieran entrado ventas nuevas.
+    """
     from apps.benchmarking.models import CompetitorMarketData
     from apps.core.models import ExchangeRate, ProductPriceHistory
     from apps.sales.models import Quote, Sale
+
+    from .datasets import training_cutoff
 
     last_sale = Sale.objects.order_by("-updated_at").values_list("updated_at", flat=True).first()
     parts = [
@@ -35,6 +41,7 @@ def data_fingerprint() -> str:
         ProductPriceHistory.objects.count(),
         Quote.objects.count(),
         CompetitorMarketData.objects.count(),
+        str(training_cutoff()),
     ]
     return hashlib.md5("|".join(map(str, parts)).encode()).hexdigest()
 

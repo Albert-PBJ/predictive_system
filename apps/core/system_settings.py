@@ -222,6 +222,29 @@ def default_quote_expiry_days() -> int:
     return int(get_settings().default_quote_expiry_days or 15)
 
 
+def training_cutoff_date():
+    """Fecha de corte del entrenamiento de los modelos (``date``) o ``None``.
+
+    Los datos posteriores a esta fecha se excluyen de las series con las que se entrenan
+    los modelos predictivos, de modo que el pronóstico arranque justo después del corte
+    (ver ``apps.analytics.ml.datasets.training_cutoff``). ``None`` = sin corte (se usa
+    todo el historial), que es el comportamiento por defecto.
+    """
+    return getattr(get_settings(), "training_cutoff_date", None)
+
+
+def set_training_cutoff_date(value):
+    """Fija (o limpia con ``None``) la fecha de corte del entrenamiento en el singleton.
+
+    Escribe la fila y deja que ``save()`` invalide la caché, para que el corte aplique de
+    inmediato a los siguientes pronósticos. Devuelve el valor efectivamente guardado.
+    """
+    obj = get_settings(use_cache=False)
+    obj.training_cutoff_date = value
+    obj.save()  # fuerza pk=1 e invalida la caché
+    return obj.training_cutoff_date
+
+
 def company_info() -> dict:
     s = get_settings()
     return {

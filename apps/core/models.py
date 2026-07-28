@@ -436,6 +436,17 @@ class SystemSettings(models.Model):
     company_website = models.CharField(max_length=150, blank=True, help_text=_("Sitio web."))
     company_logo_url = models.URLField(max_length=500, blank=True, help_text=_("URL del logo (PNG/JPG) para los documentos."))
 
+    # ── Módulo predictivo (ML) ────────────────────────────────────────────────
+    training_cutoff_date = models.DateField(
+        null=True, blank=True,
+        help_text=_(
+            "Fecha de corte del entrenamiento: los datos POSTERIORES a esta fecha se "
+            "excluyen de las series con las que se entrenan los modelos, y el pronóstico "
+            "arranca justo después del corte. Útil cuando se cargaron datos de prueba "
+            "recientes que no deben contaminar los modelos. Vacío = usar todo el historial."
+        ),
+    )
+
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:

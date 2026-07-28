@@ -193,6 +193,22 @@ _TARGET_CONTEXT = {
 # ── Resúmenes de HECHOS para el prompt ────────────────────────────────────────
 
 
+def _cutoff_lines(fc: dict) -> list[str]:
+    """Informa al modelo de la fecha de corte, si hay una.
+
+    Sin esto, el LLM podría hablar de "los últimos meses" como si el histórico llegara
+    hasta hoy, cuando en realidad se cortó a propósito en una fecha anterior.
+    """
+    cut = fc.get("training_cutoff") or {}
+    if not cut.get("active"):
+        return []
+    return [
+        f"CORTE DE DATOS: el modelo se entrenó solo con datos hasta {cut.get('effective_label')} "
+        f"({cut.get('effective')}); los meses posteriores son pronóstico, no historia. No hables de "
+        "datos reales posteriores a esa fecha."
+    ]
+
+
 def _compact_facts(fc: dict, target: str) -> str:
     kind = fc.get("value_kind") or "int"
     lines: list[str] = []
@@ -225,6 +241,8 @@ def _compact_facts(fc: dict, target: str) -> str:
             f"fin del pronóstico {_fmt(t['last_fc'], kind)} ({t['last_fc_label']}), "
             f"variación {_signed_pct(t['change_pct'])} ({t['direction']})."
         )
+
+    lines.extend(_cutoff_lines(fc))
 
     ctx = _TARGET_CONTEXT.get(target)
     if ctx:
@@ -265,6 +283,7 @@ def _quote_facts(qc: dict) -> str:
     if monthly:
         tail = monthly[-6:]
         lines.append("TASA MENSUAL RECIENTE: " + "; ".join(f"{m.get('label')}: {_num(m.get('value'))}%" for m in tail) + ".")
+    lines.extend(_cutoff_lines(qc))
     lines.append(
         "CONTEXTO: la conversión depende del tamaño del presupuesto, de si incluye instalación/despacho, "
         "del tipo de cliente y del shock cambiario al momento de emitirse."

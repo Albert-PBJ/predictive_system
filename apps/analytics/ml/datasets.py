@@ -9,6 +9,10 @@ continua para construir los rezagos.
 
 from __future__ import annotations
 
+import calendar
+import logging
+from datetime import date, timedelta
+
 import pandas as pd
 from django.db.models import Count, Sum
 from django.db.models.functions import Coalesce, TruncMonth
@@ -17,7 +21,9 @@ from apps.benchmarking.models import CompetitorMarketData
 from apps.core.models import ExchangeRate, Product, ProductPriceHistory
 from apps.sales.models import Quote, Sale, SaleItem
 
-from .features import month_range, period_of
+from .features import month_range, period_label, period_of
+
+logger = logging.getLogger(__name__)
 
 COMPLETED = Sale.StatusChoices.COMPLETED
 
@@ -25,6 +31,79 @@ COMPLETED = Sale.StatusChoices.COMPLETED
 # Marketplace se descarta por decisión del proyecto (recomendación del tutor): el
 # scraper se conserva, pero sus datos no se usan en ninguna analítica ni en la UI.
 EXCLUDED_COMPETITOR_SOURCES = ("FB",)
+
+
+# --------------------------------------------------------------------------- #
+# Fecha de corte del entrenamiento ("hasta dónde son datos, desde dónde pronóstico")
+# --------------------------------------------------------------------------- #
+#
+# Problema que resuelve: si en la BD hay registros recientes de PRUEBA (o de un mes
+# todavía incompleto), los modelos los aprenden como si fueran historia real y ensucian
+# el pronóstico. El corte marca la frontera: todo lo posterior se excluye del
+# entrenamiento y el pronóstico arranca justo después.
+#
+# El corte se configura en caliente (``SystemSettings.training_cutoff_date``, editable
+# desde Configuración o al reentrenar) y lo aplican TODAS las series internas de abajo,
+# así que basta con leerlo aquí. Las observaciones de competencia quedan FUERA del corte
+# a propósito: el módulo de benchmarking tiene su propia "máquina del tiempo" (rango
+# ``start``/``end`` explícito) sobre datos externos, no sobre el historial de la empresa.
+
+
+def configured_cutoff():
+    """Fecha de corte tal cual está configurada (``date``) o ``None`` si no hay.
+
+    Nunca lanza: si la configuración/BD no está disponible devuelve ``None``, es decir,
+    el comportamiento histórico (entrenar con todo).
+    """
+    try:
+        from apps.core import system_settings
+
+        return system_settings.training_cutoff_date()
+    except Exception as exc:  # pragma: no cover - configuración/BD no disponible
+        logger.debug("No se pudo leer la fecha de corte de entrenamiento (%s).", exc)
+        return None
+
+
+def snap_cutoff(raw: date | None) -> date | None:
+    """Ajusta el corte al **último día de un mes completo**.
+
+    Los modelos trabajan a granularidad mensual, así que cortar a mitad de mes dejaría
+    un último punto parcial (medio mes de ventas parece un desplome) — exactamente el
+    tipo de dato sucio que el corte pretende evitar. Si la fecha no es el último día de
+    su mes, se descarta ese mes entero y el corte efectivo pasa a ser el último día del
+    mes anterior.
+    """
+    if raw is None:
+        return None
+    last_day = calendar.monthrange(raw.year, raw.month)[1]
+    if raw.day >= last_day:
+        return raw
+    return raw.replace(day=1) - timedelta(days=1)
+
+
+def training_cutoff() -> date | None:
+    """Fecha de corte **efectiva** que aplican las series de entrenamiento."""
+    return snap_cutoff(configured_cutoff())
+
+
+def cutoff_info() -> dict:
+    """Bloque informativo del corte, para exponerlo en la API/UI.
+
+    ``configured`` es lo que eligió el usuario y ``effective`` lo que realmente se aplica
+    (ajustado a mes completo por ``snap_cutoff``); son distintos cuando se eligió una
+    fecha a mitad de mes.
+    """
+    raw = configured_cutoff()
+    eff = snap_cutoff(raw)
+    period = period_of(eff) if eff else None
+    return {
+        "active": eff is not None,
+        "configured": raw.isoformat() if raw else None,
+        "effective": eff.isoformat() if eff else None,
+        "effective_period": period,
+        "effective_label": period_label(period) if period else None,
+        "adjusted": bool(raw and eff and raw != eff),
+    }
 
 
 def effective_obs_date():
@@ -65,10 +144,15 @@ def _reindex_monthly(df: pd.DataFrame, value_cols: dict[str, str]) -> pd.DataFra
 # Ventas / ingresos / utilidad (a nivel empresa)
 # --------------------------------------------------------------------------- #
 def monthly_company() -> pd.DataFrame:
-    """Serie mensual a nivel empresa: ingresos, costo, utilidad, nº de ventas, margen %."""
+    """Serie mensual a nivel empresa: ingresos, costo, utilidad, nº de ventas, margen %.
+
+    Respeta la fecha de corte del entrenamiento (ver ``training_cutoff``)."""
+    qs = Sale.objects.filter(status=COMPLETED)
+    cutoff = training_cutoff()
+    if cutoff:
+        qs = qs.filter(sale_date__lte=cutoff)
     rows = list(
-        Sale.objects.filter(status=COMPLETED)
-        .annotate(m=TruncMonth("sale_date"))
+        qs.annotate(m=TruncMonth("sale_date"))
         .values("m")
         .annotate(
             revenue=Sum("total_sale_usd"),
@@ -98,10 +182,15 @@ def monthly_company() -> pd.DataFrame:
 # Demanda por producto (panel)
 # --------------------------------------------------------------------------- #
 def monthly_demand_panel() -> pd.DataFrame:
-    """Panel mensual por producto: unidades e ingreso (filas largas, sin completar huecos)."""
+    """Panel mensual por producto: unidades e ingreso (filas largas, sin completar huecos).
+
+    Respeta la fecha de corte del entrenamiento (ver ``training_cutoff``)."""
+    qs = SaleItem.objects.filter(sale__status=COMPLETED)
+    cutoff = training_cutoff()
+    if cutoff:
+        qs = qs.filter(sale__sale_date__lte=cutoff)
     rows = list(
-        SaleItem.objects.filter(sale__status=COMPLETED)
-        .annotate(m=TruncMonth("sale__sale_date"))
+        qs.annotate(m=TruncMonth("sale__sale_date"))
         .values("product_id", "product__name", "product__sku", "product__category_id", "m")
         .annotate(units=Sum("quantity"), revenue=Sum("subtotal_sale_usd"))
         .order_by("product_id", "m")
@@ -143,38 +232,42 @@ def demand_series(product_id: int, panel: pd.DataFrame | None = None) -> list[tu
 def sale_items_for_month(product_id: int, period: str):
     """Líneas de venta de un producto en un mes (para el desglose 'Ver datos')."""
     year, month = period.split("-")
-    return list(
-        SaleItem.objects.filter(
-            sale__status=COMPLETED,
-            product_id=product_id,
-            sale__sale_date__year=int(year),
-            sale__sale_date__month=int(month),
-        )
-        .select_related("sale", "sale__customer")
-        .order_by("sale__sale_date")
+    qs = SaleItem.objects.filter(
+        sale__status=COMPLETED,
+        product_id=product_id,
+        sale__sale_date__year=int(year),
+        sale__sale_date__month=int(month),
     )
+    cutoff = training_cutoff()
+    if cutoff:
+        qs = qs.filter(sale__sale_date__lte=cutoff)
+    return list(qs.select_related("sale", "sale__customer").order_by("sale__sale_date"))
 
 
 def sales_for_month(period: str):
     """Ventas completadas de un mes (desglose de ventas/ingresos/utilidad)."""
     year, month = period.split("-")
-    return list(
-        Sale.objects.filter(
-            status=COMPLETED, sale_date__year=int(year), sale_date__month=int(month)
-        )
-        .select_related("customer", "seller")
-        .order_by("sale_date")
+    qs = Sale.objects.filter(
+        status=COMPLETED, sale_date__year=int(year), sale_date__month=int(month)
     )
+    cutoff = training_cutoff()
+    if cutoff:
+        qs = qs.filter(sale_date__lte=cutoff)
+    return list(qs.select_related("customer", "seller").order_by("sale_date"))
 
 
 # --------------------------------------------------------------------------- #
 # Tasa de cambio
 # --------------------------------------------------------------------------- #
 def monthly_exchange_rate() -> pd.DataFrame:
-    """Serie mensual de la tasa BCV y paralela (último valor del mes, arrastrado)."""
-    rows = list(
-        ExchangeRate.objects.values("date", "bcv_rate", "parallel_rate").order_by("date")
-    )
+    """Serie mensual de la tasa BCV y paralela (último valor del mes, arrastrado).
+
+    Respeta la fecha de corte del entrenamiento (ver ``training_cutoff``)."""
+    qs = ExchangeRate.objects.all()
+    cutoff = training_cutoff()
+    if cutoff:
+        qs = qs.filter(date__lte=cutoff)
+    rows = list(qs.values("date", "bcv_rate", "parallel_rate").order_by("date"))
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
@@ -190,29 +283,33 @@ def monthly_exchange_rate() -> pd.DataFrame:
 def exchange_rate_for_month(period: str):
     """Registros de tasa de un mes (desglose)."""
     year, month = period.split("-")
-    return list(
-        ExchangeRate.objects.filter(date__year=int(year), date__month=int(month)).order_by("date")
-    )
+    qs = ExchangeRate.objects.filter(date__year=int(year), date__month=int(month))
+    cutoff = training_cutoff()
+    if cutoff:
+        qs = qs.filter(date__lte=cutoff)
+    return list(qs.order_by("date"))
 
 
 # --------------------------------------------------------------------------- #
 # Precio de producto
 # --------------------------------------------------------------------------- #
 def product_price_series(product_id: int) -> pd.DataFrame:
-    """Serie mensual de precio de venta/compra de un producto (último del mes, arrastrado)."""
+    """Serie mensual de precio de venta/compra de un producto (último del mes, arrastrado).
+
+    Respeta la fecha de corte del entrenamiento (ver ``training_cutoff``)."""
+    qs = ProductPriceHistory.objects.filter(product_id=product_id)
+    cutoff = training_cutoff()
+    if cutoff:
+        qs = qs.filter(changed_at__lte=cutoff)
     rows = list(
-        ProductPriceHistory.objects.filter(product_id=product_id)
-        .values("changed_at", "sale_price_usd", "purchase_price_usd")
-        .order_by("changed_at")
+        qs.values("changed_at", "sale_price_usd", "purchase_price_usd").order_by("changed_at")
     )
     if not rows:
-        # Sin historial: usa el precio actual como punto único.
+        # Sin historial: usa el precio actual como punto único (en el mes del corte si lo hay).
         p = Product.objects.filter(id=product_id).first()
         if not p:
             return pd.DataFrame()
-        from datetime import date
-
-        period = period_of(date.today())
+        period = period_of(cutoff or date.today())
         return pd.DataFrame(
             {
                 "sale_price_usd": [float(p.sale_price_usd or 0)],
@@ -232,18 +329,26 @@ def product_price_series(product_id: int) -> pd.DataFrame:
 def price_changes_for_month(product_id: int, period: str):
     """Cambios de precio registrados de un producto en un mes (desglose)."""
     year, month = period.split("-")
-    return list(
-        ProductPriceHistory.objects.filter(
-            product_id=product_id, changed_at__year=int(year), changed_at__month=int(month)
-        ).order_by("changed_at")
+    qs = ProductPriceHistory.objects.filter(
+        product_id=product_id, changed_at__year=int(year), changed_at__month=int(month)
     )
+    cutoff = training_cutoff()
+    if cutoff:
+        qs = qs.filter(changed_at__lte=cutoff)
+    return list(qs.order_by("changed_at"))
 
 
 # --------------------------------------------------------------------------- #
 # Presupuestos (clasificación de conversión)
 # --------------------------------------------------------------------------- #
 def quotes_dataframe() -> pd.DataFrame:
-    """Presupuestos con variables de entrada + etiqueta ``converted`` (0/1)."""
+    """Presupuestos con variables de entrada + etiqueta ``converted`` (0/1).
+
+    A diferencia de las demás series, aquí el corte **no filtra filas**: añade la columna
+    ``in_training`` (emitido hasta el corte). El clasificador se ajusta y se evalúa solo
+    con las filas ``in_training``, pero el *pipeline* de presupuestos abiertos debe seguir
+    incluyendo los posteriores al corte — son justamente los que se quieren predecir.
+    """
     rows = list(
         Quote.objects.annotate(n_items=Count("items"))
         .values(
@@ -271,6 +376,8 @@ def quotes_dataframe() -> pd.DataFrame:
     df["is_open"] = df["status"].isin(
         [Quote.StatusChoices.DRAFT, Quote.StatusChoices.SENT, Quote.StatusChoices.APPROVED]
     )
+    cutoff = training_cutoff()
+    df["in_training"] = True if cutoff is None else df["issued_date"].map(lambda d: d <= cutoff)
     df = df.rename(columns={"customer__customer_type": "customer_type",
                             "customer__company_name": "customer_name"})
     return df
@@ -296,6 +403,10 @@ def competitor_observations(
     con su última observación *dentro* del rango elegido (la "máquina del tiempo" del
     módulo de benchmarking). Los modelos se entrenan sobre esta fecha efectiva, no
     sobre ``scraped_at``, para no fechar en el mes del scraping un post antiguo.
+
+    La **fecha de corte del entrenamiento** NO aplica aquí: es un límite sobre el
+    historial interno de la empresa, mientras que el benchmarking acota los datos
+    externos con su propio rango explícito (``start``/``end``).
     """
     qs = (
         CompetitorMarketData.objects.filter(price_usd__isnull=False)

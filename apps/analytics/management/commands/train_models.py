@@ -10,22 +10,30 @@ es obligatorio para que la API funcione; sirve para poblar el panel de registro 
 modelos y dejar evidencia reproducible de las métricas.
 
     python manage.py train_models
-    python manage.py train_models --product 133   # producto base para demanda/precio
+    python manage.py train_models --product 133          # producto base para demanda/precio
+    python manage.py train_models --cutoff 2026-05-31    # entrena solo hasta mayo; junio+ = pronóstico
+    python manage.py train_models --cutoff none          # quita el corte (usa todo el historial)
 """
 
 from __future__ import annotations
 
 import warnings
+from datetime import date
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Sum
 
+from apps.analytics.ml import datasets as D
 from apps.analytics.ml import forecasters as F
 from apps.analytics.ml import registry
 from apps.analytics.models import PredictionLog
+from apps.core import system_settings
 from apps.sales.models import SaleItem
 
 ALL_MODELS = ["linear", "tree", "xgboost"]
+
+# Valores de ``--cutoff`` que significan "sin corte".
+NO_CUTOFF = {"none", "ninguna", "ninguno", "off", "clear", ""}
 
 
 class Command(BaseCommand):
@@ -38,10 +46,25 @@ class Command(BaseCommand):
                             help="Origen del reentrenamiento a registrar en el historial (CMD/UI).")
         parser.add_argument("--triggered-by", dest="triggered_by", default="",
                             help="Usuario que disparó el reentrenamiento (para el historial).")
+        parser.add_argument(
+            "--cutoff", default=None,
+            help=(
+                "Fecha de corte del entrenamiento (YYYY-MM-DD): los datos POSTERIORES no se "
+                "usan y el pronóstico arranca justo después. Usa 'none' para quitar el corte. "
+                "Se guarda en la configuración del sistema, de modo que la API sirva los "
+                "pronósticos con el mismo corte. Si se omite, se respeta el corte ya configurado."
+            ),
+        )
 
     def handle(self, *args, **opts):
         warnings.filterwarnings("ignore")
+
+        # 1) Fecha de corte: se persiste ANTES de entrenar (las series la leen de la
+        #    configuración) y se limpia la caché para que nada se sirva con el corte viejo.
+        if opts.get("cutoff") is not None:
+            system_settings.set_training_cutoff_date(self._parse_cutoff(opts["cutoff"]))
         registry.clear_cache()
+        self._report_cutoff()
 
         top_pid = opts["product"] or self._top_product()
         if not top_pid:
@@ -57,6 +80,10 @@ class Command(BaseCommand):
             ("Precio de producto", "PRICE", "product_price", lambda mk: F.forecast_product_price(top_pid, 6, mk)),
             ("Demanda por producto", "DEMAND", "demand", lambda mk: F.forecast_demand(top_pid, 6, mk)),
         ]
+
+        # Deja constancia en el registro de HASTA DÓNDE llegan los datos de entrenamiento.
+        cut = D.cutoff_info()
+        cut_note = f" — datos hasta {cut['effective']}" if cut["active"] else ""
 
         PredictionLog.objects.all().delete()  # idempotente: registro limpio
         self.stdout.write(f"{'Objetivo':24} {'Modelo':10} {'R²':>8} {'RMSE':>10} {'MAE':>10}  activo")
@@ -76,7 +103,7 @@ class Command(BaseCommand):
                 registry.upsert_prediction_log(
                     name=f"{akey}_{mk}", model_type=ptype, metrics=metrics,
                     hyperparameters=model.get("hyperparameters", {}),
-                    dataset_description=f"{label} — n_train={model.get('n_train')}, holdout={model.get('n_holdout')}",
+                    dataset_description=f"{label} — n_train={model.get('n_train')}, holdout={model.get('n_holdout')}{cut_note}",
                     make_active=is_assigned,
                 )
                 self.stdout.write(
@@ -99,7 +126,7 @@ class Command(BaseCommand):
             registry.upsert_prediction_log(
                 name=f"quote_{mk}", model_type="QUOTE", metrics=metrics,
                 hyperparameters=model.get("hyperparameters", {}),
-                dataset_description=f"Conversión de presupuestos — n_train={model.get('n_train')}",
+                dataset_description=f"Conversión de presupuestos — n_train={model.get('n_train')}{cut_note}",
                 make_active=is_assigned,
             )
             self.stdout.write(
@@ -114,7 +141,7 @@ class Command(BaseCommand):
                 name="inventory_xgboost", model_type="INVENT",
                 metrics={k: (inv.get("model") or {}).get(k) for k in ("r2", "rmse", "mae")},
                 hyperparameters=(inv.get("model") or {}).get("hyperparameters", {}),
-                dataset_description="Reabastecimiento derivado del modelo panel de demanda.",
+                dataset_description=f"Reabastecimiento derivado del modelo panel de demanda{cut_note}.",
                 make_active=True,
             )
         except Exception as exc:  # pragma: no cover
@@ -146,6 +173,38 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(
                 f"Historial: reentrenamiento #{run.id} registrado ({len(run.models_metrics)} modelos)."
             ))
+
+    @staticmethod
+    def _parse_cutoff(raw: str):
+        """``'none'`` → ``None`` (sin corte); ``'YYYY-MM-DD'`` → ``date``."""
+        value = (raw or "").strip()
+        if value.lower() in NO_CUTOFF:
+            return None
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            raise CommandError(
+                f"Fecha de corte inválida: «{raw}». Usa el formato YYYY-MM-DD o 'none'."
+            )
+
+    def _report_cutoff(self):
+        """Imprime el corte vigente (y avisa si se ajustó a mes completo)."""
+        info = D.cutoff_info()
+        if not info["active"]:
+            self.stdout.write(self.style.NOTICE(
+                "Fecha de corte: sin corte — se entrena con todo el historial disponible.\n"
+            ))
+            return
+        self.stdout.write(self.style.NOTICE(
+            f"Fecha de corte: {info['effective']} ({info['effective_label']}) — "
+            "los datos posteriores no se usan; el pronóstico arranca en el mes siguiente."
+        ))
+        if info["adjusted"]:
+            self.stdout.write(self.style.WARNING(
+                f"  (se configuró {info['configured']}, un mes incompleto: se ajustó al "
+                "último mes cerrado para no entrenar con un mes a medias)"
+            ))
+        self.stdout.write("")
 
     @staticmethod
     def _top_product():

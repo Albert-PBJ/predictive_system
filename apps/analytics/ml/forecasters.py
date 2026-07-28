@@ -580,6 +580,13 @@ DEFAULT_LEAD_TIME_DAYS = 30
 
 
 def forecast_inventory(product_id: int, horizon: int = 6) -> dict:
+    """Proyecta el stock restante a partir del pronóstico de demanda.
+
+    Nota sobre la fecha de corte: la demanda respeta el corte (como todas las series),
+    pero el **stock de partida es el actual** (``Product.stock``), no el que había en la
+    fecha de corte — es un hecho del presente, no un dato de entrenamiento, y es el que
+    hace accionable la recomendación de reposición.
+    """
     from apps.core.models import Product
 
     product = Product.objects.filter(id=product_id).first()
@@ -657,7 +664,13 @@ def forecast_inventory(product_id: int, horizon: int = 6) -> dict:
 def forecast_quote_conversion(model: str | None = None) -> dict:
     df = datasets.quotes_dataframe()
     title = "Conversión de presupuestos"
-    if df.empty or len(df) < 12 or df["converted"].nunique() < 2:
+    if df.empty:
+        return _empty("quote", title)
+    # El corte separa lo que ENTRENA (presupuestos emitidos hasta la fecha de corte) de lo
+    # que se PREDICE: el pipeline de abiertos sigue incluyendo los posteriores al corte.
+    in_training = df["in_training"].to_numpy(dtype=bool)
+    train_df = df[in_training]
+    if len(train_df) < 12 or train_df["converted"].nunique() < 2:
         return _empty("quote", title)
     model_key = model or ASSIGNED_MODEL["quote"]
 
@@ -674,8 +687,8 @@ def forecast_quote_conversion(model: str | None = None) -> dict:
     names = list(X_all.columns)
     y_all = df["converted"].to_numpy()
 
-    # Train/holdout temporal: presupuestos ya cerrados (no abiertos) para evaluar.
-    closed = ~df["is_open"].to_numpy()
+    # Train/holdout temporal: presupuestos ya cerrados (no abiertos) Y dentro del corte.
+    closed = (~df["is_open"].to_numpy()) & in_training
     Xc, yc = X_all[closed], y_all[closed]
     metrics, n_holdout = None, 0
     if len(yc) >= 16 and pd.Series(yc).nunique() == 2:
@@ -696,7 +709,10 @@ def forecast_quote_conversion(model: str | None = None) -> dict:
             n_holdout = len(yc) - cut
 
     clf = make_classifier(model_key)
-    clf.fit(Xc if len(yc) >= 8 else X_all, yc if len(yc) >= 8 else y_all)
+    if len(yc) >= 8:
+        clf.fit(Xc, yc)
+    else:  # muy pocos cerrados: cae a todos los presupuestos DENTRO del corte
+        clf.fit(X_all[in_training], y_all[in_training])
 
     # Pipeline actual: presupuestos abiertos con su probabilidad de conversión.
     open_df = df[df["is_open"]]
@@ -717,8 +733,10 @@ def forecast_quote_conversion(model: str | None = None) -> dict:
             })
         pipeline_quotes.sort(key=lambda d: d["expected_usd"], reverse=True)
 
-    # Tasa de conversión mensual (línea histórica).
-    monthly = (df.groupby("period")
+    # Tasa de conversión mensual (línea histórica): solo los meses de entrenamiento, para
+    # que el gráfico termine en el corte igual que el resto de los pronósticos.
+    hist_df = df[in_training]
+    monthly = (hist_df.groupby("period")
                .agg(total=("converted", "size"), converted=("converted", "sum")).reset_index())
     monthly_rate = [
         {"period": r["period"], "label": period_label(r["period"]),
@@ -728,8 +746,8 @@ def forecast_quote_conversion(model: str | None = None) -> dict:
     ]
     # Tasa de conversión histórica sobre presupuestos CERRADOS (convertidos vs rechazados),
     # sin contar los abiertos (que aún no se resuelven) como fracasos.
-    closed_df = df[~df["is_open"]]
-    hist_rate = float((closed_df["converted"].mean() if len(closed_df) else df["converted"].mean()) * 100.0)
+    closed_df = hist_df[~hist_df["is_open"]]
+    hist_rate = float((closed_df["converted"].mean() if len(closed_df) else hist_df["converted"].mean()) * 100.0)
 
     meta_block = MODEL_META[model_key]
     model_block = {
@@ -755,6 +773,7 @@ def forecast_quote_conversion(model: str | None = None) -> dict:
             "expected_rate_pct": round(expected_revenue / total_value * 100.0, 1) if total_value else 0.0,
             "quotes": pipeline_quotes,
         },
+        "training_cutoff": datasets.cutoff_info(),
     }
 
 
@@ -1305,6 +1324,9 @@ def _wrap(target, title, subject, unit, kind, res, detail, *, meta=None) -> dict
         "unit": unit, "value_kind": kind,
         "model": res["model"], "history": res["history"], "forecast": res["forecast"],
         "detail": detail, "meta": meta or {}, "sigma": res.get("sigma"),
+        # Hasta dónde llegan los datos de entrenamiento (la UI lo muestra para que quede
+        # claro dónde termina el histórico y empieza el pronóstico).
+        "training_cutoff": datasets.cutoff_info(),
     }
 
 
@@ -1314,4 +1336,5 @@ def _empty(target, title, subject=None) -> dict:
         "unit": "", "value_kind": "int", "model": None,
         "history": [], "forecast": [], "detail": {},
         "meta": {"insufficient_data": True},
+        "training_cutoff": datasets.cutoff_info(),
     }

@@ -24,10 +24,12 @@ from rest_framework.views import APIView
 from apps.accounts.permissions import IsManager, IsViewer
 from apps.audit import services as audit
 from apps.audit.models import ActionChoices
+from apps.core import system_settings
 from apps.core.models import SERVICE_SKU_PREFIX, Product
 from apps.sales.models import SaleItem
 
 from . import benchmarking, forecast_advice, report_narrative, stats
+from .ml import datasets as D
 from .ml import forecasters as F
 from .ml import registry
 from .models import PredictionLog, TrainingRun
@@ -349,6 +351,7 @@ class OverviewView(_BaseForecastView):
             },
             "restock_alerts": restock,
             "registry": registry_rows,
+            "training_cutoff": D.cutoff_info(),
         }
 
 
@@ -360,9 +363,32 @@ class RetrainModelsView(_BaseForecastView):
     reescribe ``PredictionLog`` (marcando activa la técnica asignada) y **limpia la caché
     en memoria**, de modo que los siguientes pronósticos se sirvan con los modelos recién
     entrenados. El entrenamiento es de sub-segundo por modelo con estos datos, así que se
-    ejecuta de forma síncrona. Gerente/Administrador (``IsManager``)."""
+    ejecuta de forma síncrona. Gerente/Administrador (``IsManager``).
+
+    Cuerpo opcional ``{"cutoff": "YYYY-MM-DD" | null}`` — **fecha de corte del
+    entrenamiento**: los datos posteriores se excluyen de las series y el pronóstico
+    arranca justo después del corte (útil cuando hay registros de prueba recientes que
+    no deben contaminar los modelos). ``null`` quita el corte; **omitir la clave**
+    conserva el corte ya configurado. Se guarda en la configuración del sistema, así que
+    también aplica a los pronósticos que se sirven después.
+    """
+
+    _UNSET = object()
 
     def post(self, request):
+        # Distingue "no mandaron corte" (conservar el vigente) de "mandaron null" (quitarlo).
+        raw_cutoff = request.data.get("cutoff", self._UNSET)
+        if raw_cutoff is not self._UNSET:
+            try:
+                cutoff = self._parse_cutoff(raw_cutoff)
+            except ValueError:
+                return Response(
+                    {"detail": "Fecha de corte inválida; usa el formato YYYY-MM-DD."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            system_settings.set_training_cutoff_date(cutoff)
+            registry.clear_cache()
+
         buf = io.StringIO()
         username = getattr(request.user, "username", "") or ""
         try:
@@ -377,18 +403,38 @@ class RetrainModelsView(_BaseForecastView):
         active = list(PredictionLog.objects.filter(is_active=True).order_by("model_type"))
         trained_at = max((pl.trained_at for pl in active if pl.trained_at), default=None)
         total = PredictionLog.objects.count()
+        cutoff_info = D.cutoff_info()
+        cutoff_note = (
+            f" con datos hasta {cutoff_info['effective']}" if cutoff_info["active"]
+            else " con todo el historial"
+        )
         audit.log(
             request=request,
             action=ActionChoices.MODELS_RETRAIN,
-            description=f"Reentrenó los modelos predictivos ({len(active)} modelos activos).",
-            metadata={"active_models": len(active), "total_rows": total},
+            description=(
+                f"Reentrenó los modelos predictivos ({len(active)} modelos activos)"
+                f"{cutoff_note}."
+            ),
+            metadata={
+                "active_models": len(active),
+                "total_rows": total,
+                "training_cutoff": cutoff_info["effective"],
+            },
         )
         return Response({
             "ok": True,
             "active_models": len(active),
             "total_rows": total,
             "trained_at": trained_at.isoformat() if trained_at else None,
+            "training_cutoff": cutoff_info,
         })
+
+    @staticmethod
+    def _parse_cutoff(raw):
+        """``None``/``""`` → sin corte; ``"YYYY-MM-DD"`` → ``date``. Lanza ``ValueError``."""
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None
+        return date.fromisoformat(str(raw).strip())
 
 
 class TrainingHistoryView(_BaseForecastView):

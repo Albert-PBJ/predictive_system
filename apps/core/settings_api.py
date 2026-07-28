@@ -32,7 +32,23 @@ from . import system_settings
 from .models import ExchangeRate, SystemSettings
 
 
+class NullableDateField(serializers.DateField):
+    """``DateField`` que acepta la cadena vacía como «sin fecha».
+
+    Los formularios de la UI envían ``""`` cuando el usuario borra el campo; sin esto,
+    DRF lo rechazaría por formato en lugar de interpretarlo como "limpiar el valor".
+    """
+
+    def to_internal_value(self, value):
+        if value in ("", None):
+            return None
+        return super().to_internal_value(value)
+
+
 class SystemSettingsSerializer(serializers.ModelSerializer):
+    # Fecha de corte del entrenamiento: opcional y borrable desde la UI.
+    training_cutoff_date = NullableDateField(required=False, allow_null=True)
+
     class Meta:
         model = SystemSettings
         fields = (
@@ -60,6 +76,8 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
             # Valores por defecto de negocio
             "default_iva_pct",
             "default_quote_expiry_days",
+            # Módulo predictivo
+            "training_cutoff_date",
             # Empresa
             "company_name",
             "company_rif",
@@ -113,11 +131,32 @@ def _package_available(name: str) -> bool:
         return False
 
 
+def _training_data_block() -> dict:
+    """Hasta dónde llegan los datos y qué corte se aplica realmente al entrenamiento.
+
+    Ayuda al administrador a elegir la fecha de corte: muestra la última venta/tasa
+    cargada y el corte **efectivo** (ajustado a mes completo por el módulo de ML).
+    """
+    from django.db.models import Max
+
+    from apps.analytics.ml.datasets import cutoff_info
+    from apps.sales.models import Sale
+
+    last_sale = Sale.objects.filter(status="COMP").aggregate(d=Max("sale_date"))["d"]
+    last_rate = ExchangeRate.objects.aggregate(d=Max("date"))["d"]
+    return {
+        "last_sale_date": last_sale.isoformat() if last_sale else None,
+        "last_rate_date": last_rate.isoformat() if last_rate else None,
+        "cutoff": cutoff_info(),
+    }
+
+
 def _meta_block() -> dict:
     """Estado de integraciones para la UI (sin exponer secretos)."""
     rate = ExchangeRate.objects.order_by("-date").first()
     eff = system_settings.effective_rate(rate) if rate else None
     return {
+        "training_data": _training_data_block(),
         # Sólo presencia de la clave (secreto): nunca su valor.
         "deepseek_key_present": bool(system_settings.deepseek_api_key()),
         "openai_installed": _package_available("openai"),
