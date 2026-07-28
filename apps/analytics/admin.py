@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Alert, AlertRead, KPI, PredictionLog, TrainingRun
+from .models import Alert, AlertRead, PredictionLog, TrainingRun
 
 
 @admin.register(PredictionLog)
@@ -17,13 +17,6 @@ class TrainingRunAdmin(admin.ModelAdmin):
     list_filter = ("trigger",)
     date_hierarchy = "trained_at"
     readonly_fields = ("trained_at", "trigger", "triggered_by", "models_metrics", "created_at")
-
-
-@admin.register(KPI)
-class KPIAdmin(admin.ModelAdmin):
-    list_display = ("name", "value", "unit", "period_year", "period_month", "category", "calculated_at")
-    list_filter = ("category", "period_year")
-    search_fields = ("name",)
 
 
 @admin.register(Alert)

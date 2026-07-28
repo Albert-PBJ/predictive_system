@@ -92,40 +92,6 @@ class TrainingRun(models.Model):
         return f"Reentrenamiento {self.trained_at:%Y-%m-%d %H:%M} ({self.get_trigger_display()})"
 
 
-class KPI(models.Model):
-    class CategoryChoices(models.TextChoices):
-        FINANCIAL = "FIN", _("Financiero")
-        INVENTORY = "INV", _("Inventario")
-        SALES = "VEN", _("Ventas")
-        COMPETITION = "COM", _("Competencia")
-
-    name = models.CharField(
-        max_length=100,
-        help_text=_("Identificador del KPI (ej: rotacion_inventario_mensual, margen_promedio)"),
-    )
-    value = models.DecimalField(max_digits=18, decimal_places=4, help_text=_("Valor numérico calculado"))
-    unit = models.CharField(max_length=20, blank=True, help_text=_("Unidad del KPI: %, USD, días, índice, etc."))
-    period_month = models.PositiveSmallIntegerField(null=True, blank=True, help_text=_("Mes del período (1–12)"))
-    period_year = models.PositiveSmallIntegerField(null=True, blank=True, help_text=_("Año del período"))
-    category = models.CharField(max_length=3, choices=CategoryChoices.choices)
-    calculated_at = models.DateTimeField(auto_now_add=True, help_text=_("Timestamp en que se calculó el KPI"))
-    metadata = models.JSONField(default=dict, blank=True, help_text=_("Datos adicionales del cálculo (breakdown, fuentes, etc.)"))
-
-    class Meta:
-        db_table = "kpis"
-        verbose_name = "KPI"
-        verbose_name_plural = "KPIs"
-        ordering = ["-calculated_at"]
-        indexes = [
-            models.Index(fields=["name", "period_year", "period_month"], name="kpis_name_period_idx"),
-            models.Index(fields=["category"], name="kpis_category_idx"),
-        ]
-
-    def __str__(self):
-        period = f"{self.period_year}-{self.period_month:02d}" if self.period_month else str(self.period_year)
-        return f"{self.name}: {self.value}{self.unit} ({period})"
-
-
 class Alert(models.Model):
     class TypeChoices(models.TextChoices):
         STOCK_BREAK = "STOCK_B", _("Quiebre de Stock")
