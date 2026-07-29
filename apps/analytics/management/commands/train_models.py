@@ -204,6 +204,11 @@ class Command(BaseCommand):
                 f"  (se configuró {info['configured']}, un mes incompleto: se ajustó al "
                 "último mes cerrado para no entrenar con un mes a medias)"
             ))
+        if D.rates_exempt_from_cutoff():
+            self.stdout.write(self.style.NOTICE(
+                "  Excepción activa: los modelos de TASA DE CAMBIO se entrenan con los "
+                "datos más recientes, ignorando el corte."
+            ))
         self.stdout.write("")
 
     @staticmethod

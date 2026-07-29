@@ -241,6 +241,16 @@ def training_cutoff_date():
     return getattr(get_settings(), "training_cutoff_date", None)
 
 
+def rates_ignore_training_cutoff() -> bool:
+    """¿Los pronósticos de tasa de cambio se saltan la fecha de corte?
+
+    Cuando el corte existe porque hay ventas de prueba recientes, las tasas cargadas
+    suelen ser reales y conviene proyectarlas desde el dato más fresco. Solo afecta a
+    las series de tasa (ver ``apps.analytics.ml.datasets.training_cutoff``).
+    """
+    return bool(getattr(get_settings(), "rates_ignore_training_cutoff", False))
+
+
 def set_training_cutoff_date(value):
     """Fija (o limpia con ``None``) la fecha de corte del entrenamiento en el singleton.
 

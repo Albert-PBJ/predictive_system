@@ -32,7 +32,7 @@ def data_fingerprint() -> str:
     from apps.core.models import ExchangeRate, ProductPriceHistory
     from apps.sales.models import Quote, Sale
 
-    from .datasets import training_cutoff
+    from .datasets import rates_exempt_from_cutoff, training_cutoff
 
     last_sale = Sale.objects.order_by("-updated_at").values_list("updated_at", flat=True).first()
     parts = [
@@ -42,6 +42,8 @@ def data_fingerprint() -> str:
         Quote.objects.count(),
         CompetitorMarketData.objects.count(),
         str(training_cutoff()),
+        # La excepción de las tasas también cambia qué ven los modelos de tasa.
+        str(rates_exempt_from_cutoff()),
     ]
     return hashlib.md5("|".join(map(str, parts)).encode()).hexdigest()
 

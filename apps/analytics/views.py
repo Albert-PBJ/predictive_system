@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 
 VALID_MODELS = {"linear", "tree", "xgboost"}
 
+# Horizonte por defecto del módulo de Benchmarking (el resto del módulo predictivo usa 6):
+# las series de competencia son cortas —a menudo 1-6 meses observados—, así que proyectar
+# más allá extrapola bastante más de lo que sostiene el dato.
+BENCHMARK_HORIZON = 3
+
 
 def _horizon(request, default=6):
     try:
@@ -260,7 +265,7 @@ class BenchmarkingForecastView(_BaseForecastView):
         default_start, default_end = benchmarking.default_range()
         start = _date(request, "from", default_start)
         end = _date(request, "to", default_end)
-        h, category = _horizon(request), (request.query_params.get("category") or None)
+        h, category = _horizon(request, BENCHMARK_HORIZON), (request.query_params.get("category") or None)
         competitor = request.query_params.get("competitor") or None
         key = f"benchmark_fc:{start.isoformat()}:{end.isoformat()}:{h}:{category}:{competitor}"
         return Response(registry.cached(key, lambda: F.competitor_forecast(start, end, h, category, competitor)))
@@ -278,7 +283,7 @@ class BenchmarkingProductForecastView(_BaseForecastView):
         default_start, default_end = benchmarking.default_range()
         start = _date(request, "from", default_start)
         end = _date(request, "to", default_end)
-        h = _horizon(request)
+        h = _horizon(request, BENCHMARK_HORIZON)
         competitor = request.query_params.get("competitor") or None
         key = f"benchmark_pf:{pid}:{competitor}:{start.isoformat()}:{end.isoformat()}:{h}"
         return Response(registry.cached(key, lambda: F.competitor_product_forecast(pid, competitor, h, start, end)))

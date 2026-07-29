@@ -391,10 +391,13 @@ def forecast_exchange_rate(rate: str = "bcv", horizon: int = 6, model: str | Non
             "summary": {"tasa": round(float(df.loc[p, col]), 4)},
         }
     _attach_forecast_detail(detail, res["forecast"])
-    return _wrap("exchange_rate", f"Pronóstico de la tasa {label}", {"rate": rate},
-                 unit, "rate", res, detail,
-                 meta={"rate": rate, "rate_label": label,
-                       "rates_available": list(RATE_SERIES)})
+    out = _wrap("exchange_rate", f"Pronóstico de la tasa {label}", {"rate": rate},
+                unit, "rate", res, detail,
+                meta={"rate": rate, "rate_label": label,
+                      "rates_available": list(RATE_SERIES)})
+    # Las tasas pueden estar exceptuadas del corte: se informa SU corte, no el global.
+    out["training_cutoff"] = datasets.cutoff_info(for_rates=True)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1101,23 +1104,19 @@ def _own_price_panel() -> dict[str, dict[str, float]]:
     }
 
 
-def _benchmark_range_block(start, end) -> dict:
+def _benchmark_range_block(start, end, *, competitor: str | None = None,
+                           requested: tuple | None = None, adjusted: bool = False) -> dict:
     """Bloque ``range`` (mismas claves que el panel de Inicio) para el módulo de
-    benchmarking, con los límites de datos tomados de ``CompetitorMarketData``."""
-    from django.db.models import Max, Min
+    benchmarking, con los límites de datos tomados de ``CompetitorMarketData``.
 
-    from apps.benchmarking.models import CompetitorMarketData
-
-    from .datasets import EXCLUDED_COMPETITOR_SOURCES, effective_obs_date
-
-    bounds = (
-        CompetitorMarketData.objects.filter(price_usd__isnull=False)
-        .exclude(source__in=EXCLUDED_COMPETITOR_SOURCES)
-        .annotate(effective_at=effective_obs_date())
-        .aggregate(lo=Min("effective_at"), hi=Max("effective_at"))
-    )
-    data_from = bounds["lo"].date().isoformat() if bounds["lo"] else (start.isoformat() if start else None)
-    data_to = bounds["hi"].date().isoformat() if bounds["hi"] else (end.isoformat() if end else None)
+    ``competitor`` acota esos límites al competidor seleccionado (los datos disponibles
+    pasan a ser los suyos, que es lo que debe guiar al selector de fechas cuando se
+    filtra por uno). ``requested``/``adjusted`` reportan la ventana que pidió el usuario
+    cuando se auto-ajustó a los datos disponibles."""
+    data_from_d, data_to_d = datasets.competitor_data_bounds(competitor)
+    data_from = data_from_d.isoformat() if data_from_d else (start.isoformat() if start else None)
+    data_to = data_to_d.isoformat() if data_to_d else (end.isoformat() if end else None)
+    req_from, req_to = requested if requested else (start, end)
     return {
         "from": start.isoformat() if start else data_from,
         "to": end.isoformat() if end else data_to,
@@ -1125,7 +1124,33 @@ def _benchmark_range_block(start, end) -> dict:
         "to_label": period_label(period_of(end)) if end else None,
         "data_from": data_from,
         "data_to": data_to,
+        # Auto-ajuste del rango (exclusivo de esta pestaña, ver `competitor_forecast`).
+        "auto_adjusted": bool(adjusted),
+        "requested_from": req_from.isoformat() if req_from else None,
+        "requested_to": req_to.isoformat() if req_to else None,
     }
+
+
+# Meses distintos mínimos para construir una serie de mercado. Los datos scrapeados son
+# cortos y desiguales (muchos competidores tienen 1-2 meses), así que se admite hasta un
+# solo mes en vez de exigir 3: con el umbral alto, filtrar por un competidor reciente
+# dejaba la pestaña entera en blanco. Con un único mes NO hay tendencia que estimar: la
+# recta sale plana, así que esas filas se marcan como "sin tendencia" (`n_periods`) para
+# no vender un nivel constante como si fuera un pronóstico.
+MIN_MARKET_PERIODS = 1
+
+
+def _blank_forecast_window(obs, wanted: str | None, selected: str | None) -> bool:
+    """¿La ventana elegida deja la pestaña de predicciones de benchmarking sin nada que
+    pintar? (el competidor elegido no tiene observaciones en ella, no hay productos con
+    equivalente propio, o no alcanza para una serie de mercado)."""
+    if wanted and not selected:
+        return True
+    if obs.empty:
+        return True
+    if not obs["matched_product_id"].notna().any():
+        return True
+    return int(obs["period"].nunique()) < MIN_MARKET_PERIODS
 
 
 def competitor_forecast(start=None, end=None, horizon: int = 6, category: str | None = None,
@@ -1142,15 +1167,45 @@ def competitor_forecast(start=None, end=None, horizon: int = 6, category: str | 
     ``competitor`` (nombre exacto) acota el "mercado" a UN solo competidor (el promedio
     pasa a ser el de ese competidor); ``None``/``"__all__"`` usa todos (por defecto). La
     lista completa de competidores del rango se devuelve en ``competitors`` y los
-    ``matched_products`` quedan acotados al competidor elegido."""
+    ``matched_products`` quedan acotados al competidor elegido.
+
+    **Auto-ajuste del rango:** los datos scrapeados son escasos y desiguales entre
+    competidores, así que una ventana que sirve para uno deja a otro sin nada. Si el
+    rango pedido dejaría la pestaña vacía (ver ``_blank_forecast_window``), se **amplía
+    automáticamente a la ventana de datos disponibles de esa selección** y se reporta en
+    ``range.auto_adjusted`` (con la ventana original en ``requested_from``/``requested_to``).
+    Es propio de esta pestaña: "Comparaciones" respeta siempre el rango elegido."""
     title = "Pronóstico de mercado vs. nuestros precios"
-    obs_all = datasets.competitor_observations(start=start, end=end)
-    competitors = sorted(obs_all["competitor"].dropna().unique().tolist()) if not obs_all.empty else []
-    selected = competitor if (competitor and competitor != "__all__" and competitor in competitors) else None
-    obs = obs_all[obs_all["competitor"] == selected] if selected else obs_all
+    wanted = competitor if (competitor and competitor != "__all__") else None
+
+    def load(s, e):
+        df = datasets.competitor_observations(start=s, end=e)
+        comps = sorted(df["competitor"].dropna().unique().tolist()) if not df.empty else []
+        sel = wanted if (wanted and wanted in comps) else None
+        return df, comps, sel, (df[df["competitor"] == sel] if sel else df)
+
+    requested = (start, end)
+    obs_all, competitors, selected, obs = load(start, end)
+    adjusted = False
+    if _blank_forecast_window(obs, wanted, selected):
+        lo, hi = datasets.competitor_data_bounds(wanted)
+        if lo and hi and (lo != start or hi != end):
+            start, end = lo, hi
+            obs_all, competitors, selected, obs = load(start, end)
+            adjusted = True
+
     all_obs = datasets.competitor_observations()
     categories = sorted(all_obs["category"].dropna().unique().tolist()) if not all_obs.empty else []
-    range_block = _benchmark_range_block(start, end)
+    range_block = _benchmark_range_block(start, end, competitor=selected,
+                                         requested=requested, adjusted=adjusted)
+    # Nota de auto-ajuste: encabeza la narrativa incluso si no hay nada que pronosticar.
+    notes = []
+    if adjusted:
+        notes.append(
+            "El rango se ajustó automáticamente a la ventana con datos"
+            + (f" de {selected}" if selected else "")
+            + f" ({range_block['from_label']} – {range_block['to_label']}) para que los gráficos no queden vacíos."
+        )
 
     # Productos propios con equivalente en la competencia (para el selector de la UI),
     # acotados al competidor elegido cuando aplica.
@@ -1170,7 +1225,7 @@ def competitor_forecast(start=None, end=None, horizon: int = 6, category: str | 
         "target": "competitor_forecast", "title": title, "range": range_block,
         "horizon": horizon, "categories": categories, "matched_products": matched_products,
         "competitors": competitors, "selected_competitor": selected or "__all__",
-        "narrative": [],
+        "narrative": list(notes),
     }
     if obs.empty:
         return {**base, "market_overall": None, "by_category": [], "model": None,
@@ -1182,7 +1237,7 @@ def competitor_forecast(start=None, end=None, horizon: int = 6, category: str | 
         if df.empty:
             return None
         s = df.groupby("period")["price_usd"].mean()
-        if s.index.nunique() < 3:
+        if s.index.nunique() < MIN_MARKET_PERIODS:
             return None
         periods = month_range(s.index.min(), s.index.max())
         s = s.reindex(periods).interpolate().ffill().bfill()
@@ -1203,6 +1258,9 @@ def competitor_forecast(start=None, end=None, horizon: int = 6, category: str | 
         return {
             "history": fc["history"], "forecast": fc["forecast"],
             "model": fc["model"], "own_series": own_series,
+            # Meses observados: con 1 la "tendencia" es plana (no hay pendiente que
+            # estimar) y la UI lo dice en vez de presentarlo como pronóstico.
+            "n_periods": len(periods),
         }
 
     market_overall = build_chart(obs, "__ALL__")
@@ -1230,19 +1288,27 @@ def competitor_forecast(start=None, end=None, horizon: int = 6, category: str | 
         proj_own = own[-1] if own else None
         cur_gap = gap_pct(cur_own, cur_market)
         proj_gap = gap_pct(proj_own, proj_market)
+        trendless = int(chart.get("n_periods") or 0) < 2
         by_category.append({
             "category": cat, **chart,
             "current_market": cur_market, "projected_market": proj_market,
             "current_own": cur_own, "projected_own": proj_own,
             "current_gap_pct": cur_gap, "projected_gap_pct": proj_gap,
-            "verdict": _gap_verdict(cur_gap, proj_gap),
+            "verdict": ({"key": "flat", "label": "Sin tendencia (1 mes observado)"}
+                        if trendless else _gap_verdict(cur_gap, proj_gap)),
         })
 
     # Resumen automatizado (data storytelling), 3-5 frases — igual que el panel de Inicio.
-    narrative = []
+    narrative = list(notes)
     if selected:
         narrative.append(f"Comparación enfocada en {selected} (no en el promedio de mercado).")
-    slope = (market_overall.get("model") or {}).get("slope_usd_per_month")
+    single_month = int(market_overall.get("n_periods") or 0) < 2
+    slope = None if single_month else (market_overall.get("model") or {}).get("slope_usd_per_month")
+    if single_month:
+        narrative.append(
+            "Solo hay un mes con observaciones para esta selección: se muestra el nivel de precios "
+            "actual, sin tendencia proyectada."
+        )
     if slope is not None:
         if slope > 0.5:
             narrative.append(f"El precio promedio de mercado sube ~${abs(slope):.1f}/mes según la tendencia.")
@@ -1286,7 +1352,12 @@ def competitor_product_forecast(
     para usar el **promedio de todos los competidores** de ese producto como objetivo.
     El precio interno reutiliza ``forecast_product_price`` (Ridge log-lineal). El
     histórico interno se recorta a la ventana de la competencia para que ambas líneas
-    sean comparables."""
+    sean comparables.
+
+    Igual que ``competitor_forecast``, **auto-ajusta el rango**: si en la ventana pedida
+    ese producto no tiene observaciones del competidor elegido, la amplía a la ventana de
+    datos disponible para ese par (producto, competidor) y lo reporta en
+    ``meta.auto_adjusted`` + ``meta.range_from``/``range_to``."""
     from apps.core.models import Product
 
     product = Product.objects.filter(id=product_id).first()
@@ -1296,10 +1367,22 @@ def competitor_product_forecast(
                 "meta": {"insufficient_data": True, "n_obs": 0}}
     subject = {"id": product.id, "name": product.name, "sku": product.sku}
 
-    df = datasets.competitor_observations(product_id=product_id, start=start, end=end)
-    competitors = sorted(df["competitor"].dropna().unique().tolist()) if not df.empty else []
     sel = competitor if (competitor and competitor != "__all__") else None
-    cdf = df[df["competitor"] == sel] if sel else df
+
+    def load(s, e):
+        df = datasets.competitor_observations(product_id=product_id, start=s, end=e)
+        comps = sorted(df["competitor"].dropna().unique().tolist()) if not df.empty else []
+        # Ojo: con `df` vacío no hay columnas, así que no se puede filtrar por competidor.
+        return comps, (df[df["competitor"] == sel] if (sel and not df.empty) else df)
+
+    competitors, cdf = load(start, end)
+    auto_adjusted = False
+    if cdf.empty:
+        lo, hi = datasets.competitor_data_bounds(sel, product_id=product_id)
+        if lo and hi and (lo != start or hi != end):
+            start, end = lo, hi
+            competitors, cdf = load(start, end)
+            auto_adjusted = bool(not cdf.empty)
 
     competitor_series, comp_periods = None, None
     if not cdf.empty:
@@ -1336,7 +1419,10 @@ def competitor_product_forecast(
         "competitor_series": competitor_series,
         "own_series": own_series,
         "meta": {"n_obs": int(len(cdf)), "n_competitors": len(competitors),
-                 "insufficient_data": competitor_series is None},
+                 "insufficient_data": competitor_series is None,
+                 "auto_adjusted": auto_adjusted,
+                 "range_from": start.isoformat() if start else None,
+                 "range_to": end.isoformat() if end else None},
     }
 
 

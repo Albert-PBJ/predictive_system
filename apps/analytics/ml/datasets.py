@@ -14,7 +14,7 @@ import logging
 from datetime import date, timedelta
 
 import pandas as pd
-from django.db.models import Count, Sum
+from django.db.models import Count, Max, Min, Q, Sum
 from django.db.models.functions import Coalesce, TruncMonth
 
 from apps.benchmarking.models import CompetitorMarketData
@@ -64,6 +64,22 @@ def configured_cutoff():
         return None
 
 
+def rates_exempt_from_cutoff() -> bool:
+    """¿Las series de TASA DE CAMBIO se saltan el corte? (interruptor de configuración).
+
+    El corte suele existir porque hay ventas de prueba recientes; las tasas, en cambio,
+    se cargan a diario y son reales, así que se pueden entrenar hasta la fecha más
+    reciente. Nunca lanza.
+    """
+    try:
+        from apps.core import system_settings
+
+        return system_settings.rates_ignore_training_cutoff()
+    except Exception as exc:  # pragma: no cover - configuración/BD no disponible
+        logger.debug("No se pudo leer la excepción de corte para tasas (%s).", exc)
+        return False
+
+
 def snap_cutoff(raw: date | None) -> date | None:
     """Ajusta el corte al **último día de un mes completo**.
 
@@ -81,20 +97,30 @@ def snap_cutoff(raw: date | None) -> date | None:
     return raw.replace(day=1) - timedelta(days=1)
 
 
-def training_cutoff() -> date | None:
-    """Fecha de corte **efectiva** que aplican las series de entrenamiento."""
+def training_cutoff(*, for_rates: bool = False) -> date | None:
+    """Fecha de corte **efectiva** que aplican las series de entrenamiento.
+
+    ``for_rates=True`` la consultan las series de tasa de cambio, que pueden quedar
+    exceptuadas del corte por configuración (ver ``rates_exempt_from_cutoff``).
+    """
+    if for_rates and rates_exempt_from_cutoff():
+        return None
     return snap_cutoff(configured_cutoff())
 
 
-def cutoff_info() -> dict:
+def cutoff_info(*, for_rates: bool = False) -> dict:
     """Bloque informativo del corte, para exponerlo en la API/UI.
 
     ``configured`` es lo que eligió el usuario y ``effective`` lo que realmente se aplica
     (ajustado a mes completo por ``snap_cutoff``); son distintos cuando se eligió una
-    fecha a mitad de mes.
+    fecha a mitad de mes. Con ``for_rates=True`` refleja la excepción de las tasas:
+    ``active`` queda en False y ``rates_exempt`` avisa de por qué.
     """
     raw = configured_cutoff()
     eff = snap_cutoff(raw)
+    exempt = bool(for_rates and rates_exempt_from_cutoff())
+    if exempt:
+        eff = None
     period = period_of(eff) if eff else None
     return {
         "active": eff is not None,
@@ -103,6 +129,8 @@ def cutoff_info() -> dict:
         "effective_period": period,
         "effective_label": period_label(period) if period else None,
         "adjusted": bool(raw and eff and raw != eff),
+        # True solo en el bloque de las tasas cuando el corte existe pero se exceptúan.
+        "rates_exempt": bool(exempt and raw is not None),
     }
 
 
@@ -267,9 +295,15 @@ def monthly_exchange_rate() -> pd.DataFrame:
     calculando sobre el paralelo (``_rate_shock_map``): es la tasa que refleja el valor
     real del dinero y por tanto la que explica las caídas de demanda.
 
-    Respeta la fecha de corte del entrenamiento (ver ``training_cutoff``)."""
+    Respeta la fecha de corte del entrenamiento, salvo que las tasas estén exceptuadas
+    (``rates_exempt_from_cutoff``), en cuyo caso llega hasta el dato más reciente.
+
+    Nota: ampliar el final de esta serie **no altera** el ``shock_cambiario`` de meses
+    anteriores — se calcula con ``pct_change``/``rolling().shift()``, que solo miran
+    hacia atrás — y los modelos de ventas/utilidad/demanda solo consultan los meses de
+    su propia serie (cortada). Por eso la excepción no mueve sus métricas."""
     qs = ExchangeRate.objects.all()
-    cutoff = training_cutoff()
+    cutoff = training_cutoff(for_rates=True)
     if cutoff:
         qs = qs.filter(date__lte=cutoff)
     rows = list(qs.values("date", "bcv_rate", "eur_bcv_rate", "parallel_rate").order_by("date"))
@@ -291,7 +325,7 @@ def exchange_rate_for_month(period: str):
     """Registros de tasa de un mes (desglose)."""
     year, month = period.split("-")
     qs = ExchangeRate.objects.filter(date__year=int(year), date__month=int(month))
-    cutoff = training_cutoff()
+    cutoff = training_cutoff(for_rates=True)
     if cutoff:
         qs = qs.filter(date__lte=cutoff)
     return list(qs.order_by("date"))
@@ -454,3 +488,33 @@ def competitor_observations(
     # Última observación por anuncio (ya viene ordenado desc por la fecha efectiva).
     df = df.drop_duplicates(subset="listing_key", keep="first")
     return df
+
+
+def competitor_data_bounds(competitor: str | None = None,
+                           product_id: int | None = None) -> tuple[date | None, date | None]:
+    """Primera/última fecha EFECTIVA con observación de precio, opcionalmente acotada a
+    un competidor y/o a un producto propio ya emparejado.
+
+    Es la ventana de datos REALMENTE disponible para esa selección. La usa el módulo de
+    benchmarking (pestaña "Predicciones") para **auto-ajustar** el rango cuando el
+    elegido dejaría los gráficos vacíos, y para reportar los límites del selector de
+    fechas del competidor filtrado.
+
+    El nombre del competidor se busca igual que se muestra: el de la ficha normalizada
+    (``competitor.name``) o, si la fila no tiene ficha, el ``competitor_name`` scrapeado.
+    """
+    qs = (
+        CompetitorMarketData.objects.filter(price_usd__isnull=False)
+        .exclude(source__in=EXCLUDED_COMPETITOR_SOURCES)
+        .annotate(effective_at=effective_obs_date())
+    )
+    if competitor:
+        qs = qs.filter(
+            Q(competitor__name=competitor)
+            | Q(competitor__isnull=True, competitor_name=competitor)
+        )
+    if product_id:
+        qs = qs.filter(product_id=product_id)
+    agg = qs.aggregate(lo=Min("effective_at"), hi=Max("effective_at"))
+    lo, hi = agg["lo"], agg["hi"]
+    return (lo.date() if lo else None, hi.date() if hi else None)

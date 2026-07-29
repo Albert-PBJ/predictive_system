@@ -367,6 +367,17 @@ The ML layer turns the seeded history into decision-support forecasts. Code live
   doesn't drop rows, it adds the boolean **`in_training`** (the classifier fits/scores only on
   those, while the open pipeline keeps post-cutoff quotes — they're the ones being predicted);
   and `competitor_observations` is **not** cut (external data, own explicit `start`/`end`).
+  **Rate exemption:** `training_cutoff(for_rates=True)` / `cutoff_info(for_rates=True)` honour
+  `SystemSettings.rates_ignore_training_cutoff` (via `rates_exempt_from_cutoff()`, default off),
+  used by `monthly_exchange_rate` + `exchange_rate_for_month` so the **rate models only** can
+  train up to the freshest data. This is isolated by construction: extending the tail of the
+  rate series cannot change `_rate_shock_map` values at earlier months (`pct_change` and
+  `rolling().shift()` look strictly backwards), and the sales/profit/demand/quote models read
+  the shock only at months of their own (cut) series. Measured: every other metric is unchanged;
+  only tasa moves (0.845 → 0.768, because the holdout then includes the real Jun–Jul jump).
+  Both the flag and the cutoff are in `registry.data_fingerprint()`, so toggling invalidates
+  the cache. `forecast_exchange_rate` overrides its `training_cutoff` block with the
+  rate-specific one (carrying `rates_exempt`) so the chart can explain which rule applied.
 - **`ml/features.py`** — period helpers (`"YYYY-MM"`), Spanish labels, calendar features
   (month sin/cos, quarter, time index).
 - **`ml/estimators.py`** — the estimator factory: `"linear"`→Ridge (scaled Pipeline) /
@@ -388,7 +399,16 @@ The ML layer turns the seeded history into decision-support forecasts. Code live
   `competitors` list. Passing `competitor` scopes the "market" to that single competitor (the
   average becomes its own, `matched_products` narrows to it); `competitor_product_forecast(product_id,
   competitor, …)` compares one product's competitor price (a specific one, or the mean of all) vs.
-  our internal price, aligning both to the same months. The descriptive `benchmarking.comparison(start,
+  our internal price, aligning both to the same months. **Both auto-fit the range** (only these two —
+  scraped coverage per competitor is uneven, so a fixed window often left the "Predicciones" page
+  blank): when the requested window would leave nothing to draw (`_blank_forecast_window` — competitor
+  absent from it, no product matched to our catalog, or fewer than `MIN_MARKET_PERIODS` observed
+  months), they recompute over that selection's real data window from the new
+  `datasets.competitor_data_bounds(competitor, product_id=None)` and report it (`range.auto_adjusted` +
+  `requested_from`/`requested_to`; `meta.auto_adjusted` + `range_from`/`range_to` on the product one).
+  `MIN_MARKET_PERIODS = 1`, so a single observed month still yields a table — that chart carries
+  `n_periods: 1` and its category verdict is *"Sin tendencia (1 mes observado)"* (the flat line is not
+  sold as a forecast). `range.data_from`/`data_to` narrow to the selected competitor. The descriptive `benchmarking.comparison(start,
   end, competitor=None)` takes the same optional single-competitor filter and always returns the full
   `competitors` list (computed before filtering) so the UI selector stays populated. `forecast_quote_conversion` is a
   **classifier** (probability + expected pipeline). The descriptive side of benchmarking lives in
@@ -486,7 +506,7 @@ Jan-2026 shock, seasonality, price elasticity, and the retail-vs-institutional s
 - **DB-manda, sembrada del `.env`.** `get_settings()` does `get_or_create(pk=1, defaults=_env_defaults())` — the first access seeds the row from the current env vars; after that the **DB row wins** and the env vars are only *bootstrap defaults*. If the table doesn't exist yet (before `migrate`) or the DB errors, the getters return an **unsaved** instance built from env — they never raise, so no consumer breaks on config.
 - **Secrets never go in the DB.** `deepseek_api_key()` (and `APIFY_API_KEY`, DB creds, `SECRET_KEY`) are read straight from the environment; the API exposes only *presence* (`deepseek_key_present`), never the value.
 - **Cached** in `django.core.cache` for 30 s; `save()` deletes the key, so a PATCH from the UI takes effect immediately.
-- **Typed getters** (`llm_enrichment_enabled`, `deepseek_model`, `vision_ocr_enabled`, `ocr_*`, `discard_instagram_without_price`, `price_bands`, `rate_basis`/`effective_rate`, `rate_max_age_days`, `exchange_rate_api_url`, `default_iva_pct`, `default_quote_expiry_days`, `scraper_default_limit`, `report_narrative_enabled`, `company_info`, plus `training_cutoff_date`/`set_training_cutoff_date` — the ML training cutoff, consumed by `analytics.ml.datasets`) are what consumers call. The env-reading modules were refactored from module-level constants to these getters: `enrichment/deepseek.py` (`use_llm_enrichment()`/`current_model()`/`current_base_url()`; the scrapers' log lines call them too), `enrichment/image_ocr.py` (switch + `ocr_*()`), `scrapers/validation.py` (`_discard_instagram_without_price()` + `band_for_category()` reads `price_bands()`), `analytics/report_narrative.py` (its own `enable_llm_report_narrative` switch + model), `sales/services.py` (`effective_rate` by `rate_basis`, IVA + expiry defaults in `create_quote`), `core/views.LatestExchangeRateView`, `competitor_market_data/views.ScraperStartView` (default limit), and `core/management/commands/fetch_exchange_rate` (threshold + API URL). The **price-validation bands** (`price_bands`, a JSON `{categories: {<cat>: {min, max}}, default}`) seed from `apps/core/price_band_defaults.py` and are editable from the Configuración UI; the PATCH serializer validates them (numeric, ≥0, min ≤ max) and `meta.price_band_categories` (the scraper `CATEGORY_NAMES`) populates the editor.
+- **Typed getters** (`llm_enrichment_enabled`, `deepseek_model`, `vision_ocr_enabled`, `ocr_*`, `discard_instagram_without_price`, `price_bands`, `rate_basis`/`effective_rate`, `rate_max_age_days`, `exchange_rate_api_url`, `default_iva_pct`, `default_quote_expiry_days`, `scraper_default_limit`, `report_narrative_enabled`, `company_info`, plus `training_cutoff_date`/`set_training_cutoff_date` and `rates_ignore_training_cutoff` — the ML training cutoff and its rate-only exemption, consumed by `analytics.ml.datasets`) are what consumers call. The env-reading modules were refactored from module-level constants to these getters: `enrichment/deepseek.py` (`use_llm_enrichment()`/`current_model()`/`current_base_url()`; the scrapers' log lines call them too), `enrichment/image_ocr.py` (switch + `ocr_*()`), `scrapers/validation.py` (`_discard_instagram_without_price()` + `band_for_category()` reads `price_bands()`), `analytics/report_narrative.py` (its own `enable_llm_report_narrative` switch + model), `sales/services.py` (`effective_rate` by `rate_basis`, IVA + expiry defaults in `create_quote`), `core/views.LatestExchangeRateView`, `competitor_market_data/views.ScraperStartView` (default limit), and `core/management/commands/fetch_exchange_rate` (threshold + API URL). The **price-validation bands** (`price_bands`, a JSON `{categories: {<cat>: {min, max}}, default}`) seed from `apps/core/price_band_defaults.py` and are editable from the Configuración UI; the PATCH serializer validates them (numeric, ≥0, min ≤ max) and `meta.price_band_categories` (the scraper `CATEGORY_NAMES`) populates the editor.
 - **`effective_rate(rate)`** centralizes the USD→VES rate choice (`rate_basis` ∈ **BCV** (default, Dólar BCV) / **EUR** (Euro BCV) / PAR (paralelo) / AVG (promedio Dólar BCV-paralelo)), degrading to the Dólar BCV when the chosen one isn't loaded.
 - **API** (`settings_api.py`): `SystemSettingsView` (GET `IsManager` / PATCH `IsAdmin`, returns `{settings, meta}`; `meta.training_data` carries the last sale/rate date + the effective ML cutoff so the admin can pick one, and `training_cutoff_date` uses a `NullableDateField` that reads `""` as "sin corte", since the UI form sends an empty string when the field is cleared), `ExchangeRateSetView`/`ExchangeRateFetchView` (Admin; the fetch uses `fetch_exchange_rate.fetch_rates` — **pyDolarVenezuela library primary**, pyDolarVe HTTP fallback — + `check_rate_freshness`), `SettingsLLMTestView` (Admin, reuses `deepseek.check_connection`), `CompanyInfoView` (`IsViewer`). Registered in `apps/core/urls.py`; admin-registered as a no-add/no-delete singleton.
 

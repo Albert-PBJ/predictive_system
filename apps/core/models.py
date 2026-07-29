@@ -463,6 +463,15 @@ class SystemSettings(models.Model):
             "recientes que no deben contaminar los modelos. Vacío = usar todo el historial."
         ),
     )
+    rates_ignore_training_cutoff = models.BooleanField(
+        default=False,
+        help_text=_(
+            "Exceptúa a los pronósticos de TASA DE CAMBIO de la fecha de corte: se "
+            "entrenan siempre con las tasas más recientes. Se usa cuando el corte existe "
+            "por datos de prueba de ventas, pero las tasas cargadas sí son reales. No "
+            "afecta a los demás modelos."
+        ),
+    )
 
     updated_at = models.DateTimeField(auto_now=True)
 

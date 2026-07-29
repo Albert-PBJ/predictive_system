@@ -78,6 +78,7 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
             "default_quote_expiry_days",
             # Módulo predictivo
             "training_cutoff_date",
+            "rates_ignore_training_cutoff",
             # Empresa
             "company_name",
             "company_rif",
@@ -148,6 +149,8 @@ def _training_data_block() -> dict:
         "last_sale_date": last_sale.isoformat() if last_sale else None,
         "last_rate_date": last_rate.isoformat() if last_rate else None,
         "cutoff": cutoff_info(),
+        # Corte que realmente aplican las series de tasa (puede estar exceptuado).
+        "rates_cutoff": cutoff_info(for_rates=True),
     }
 
 
