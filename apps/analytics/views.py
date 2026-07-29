@@ -2,7 +2,9 @@
 
 Vistas ``APIView`` (estilo dict, como las del scraper) que exponen cada pronóstico.
 Todas requieren rol **Gerente o Administrador** (``IsManager``): los pronósticos son
-herramientas de decisión estratégica "para el dueño".
+herramientas de decisión estratégica "para el dueño". La excepción es
+``RetrainModelsView``, que es **solo Administrador** (reentrenar es administración del
+sistema, no consulta).
 
 El servicio entrena bajo demanda y cachea el resultado (``ml.registry.cached``),
 invalidándolo cuando cambian los datos. Se puede sobreescribir el modelo por
@@ -21,7 +23,7 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.permissions import IsManager, IsViewer
+from apps.accounts.permissions import IsAdmin, IsManager, IsViewer
 from apps.audit import services as audit
 from apps.audit.models import ActionChoices
 from apps.core import system_settings
@@ -370,7 +372,12 @@ class RetrainModelsView(_BaseForecastView):
     reescribe ``PredictionLog`` (marcando activa la técnica asignada) y **limpia la caché
     en memoria**, de modo que los siguientes pronósticos se sirvan con los modelos recién
     entrenados. El entrenamiento es de sub-segundo por modelo con estos datos, así que se
-    ejecuta de forma síncrona. Gerente/Administrador (``IsManager``).
+    ejecuta de forma síncrona.
+
+    **Solo Administrador** (``IsAdmin``) — a diferencia del resto del módulo predictivo, que
+    es Gerente+. Reentrenar reescribe el registro de modelos y, con el ``cutoff``, cambia la
+    configuración global del entrenamiento: es una operación de administración del sistema,
+    no de consulta. El Gerente ve los pronósticos y el registro, pero no los reentrena.
 
     Cuerpo opcional ``{"cutoff": "YYYY-MM-DD" | null}`` — **fecha de corte del
     entrenamiento**: los datos posteriores se excluyen de las series y el pronóstico
@@ -379,6 +386,8 @@ class RetrainModelsView(_BaseForecastView):
     conserva el corte ya configurado. Se guarda en la configuración del sistema, así que
     también aplica a los pronósticos que se sirven después.
     """
+
+    permission_classes = [IsAdmin]
 
     _UNSET = object()
 
