@@ -23,6 +23,13 @@ class InventoryMovement(models.Model):
     quantity = models.IntegerField(
         help_text=_("Cantidad movida (positivo=entrada, negativo=salida)"),
     )
+    cost_invoice_file = models.FileField(
+        upload_to="facturas_compra/%Y/%m/", null=True, blank=True,
+        help_text=_(
+            "Archivo de la factura de compra del proveedor (PDF o imagen) que respalda el "
+            "costo unitario de la entrada. El nº de factura va en `reference`."
+        ),
+    )
     unit_cost_usd = models.DecimalField(
         max_digits=10, decimal_places=2, null=True, blank=True,
         help_text=_(

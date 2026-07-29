@@ -453,6 +453,17 @@ class SystemSettings(models.Model):
     company_website = models.CharField(max_length=150, blank=True, help_text=_("Sitio web."))
     company_logo_url = models.URLField(max_length=500, blank=True, help_text=_("URL del logo (PNG/JPG) para los documentos."))
 
+    # ── Operación ─────────────────────────────────────────────────────────────
+    go_live_date = models.DateField(
+        null=True, blank=True,
+        help_text=_(
+            "Fecha de puesta en marcha del sistema. Lo registrado ANTES de esta fecha se "
+            "considera carga histórica inicial y no genera tareas pendientes (p. ej. las "
+            "entradas de inventario anteriores no se piden costear, porque nunca tuvieron "
+            "factura asociada). Vacío = tratar todo el historial como operación real."
+        ),
+    )
+
     # ── Módulo predictivo (ML) ────────────────────────────────────────────────
     training_cutoff_date = models.DateField(
         null=True, blank=True,

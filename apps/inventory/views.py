@@ -1,10 +1,11 @@
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.permissions import IsOperational, IsStockVerifier, IsWarehouse
+from apps.accounts.permissions import IsManager, IsOperational, IsStockVerifier, IsWarehouse
 from apps.audit import services as audit
 from apps.audit.models import ActionChoices
 from apps.core.models import SERVICE_SKU_PREFIX, Product
@@ -12,10 +13,17 @@ from apps.core.models import SERVICE_SKU_PREFIX, Product
 from .models import InventoryMovement
 from .serializers import (
     InventoryMovementSerializer,
+    MovementCostSerializer,
     MovementCreateSerializer,
     ProductStockSerializer,
 )
-from .services import InsufficientStockError, apply_movement
+from .services import (
+    CostableMovementError,
+    InsufficientStockError,
+    apply_movement,
+    pending_cost_movements,
+    set_movement_cost,
+)
 
 
 class InventoryMovementViewSet(viewsets.ModelViewSet):
@@ -23,6 +31,8 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
 
     - GET  /api/inventory/movements/        → historial (auditoría) paginado y filtrable.
     - POST /api/inventory/movements/        → registra una entrada, ajuste o devolución.
+    - POST /api/inventory/movements/{id}/costo/ → carga el costo de compra de una entrada
+      ya registrada (cuando llega la factura del proveedor).
 
     Acceso: **consultar** el historial es para personal operativo (vendedores +
     encargados de inventario + gerentes/admin); **registrar** un movimiento queda
@@ -35,6 +45,12 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
     serializer_class = InventoryMovementSerializer
     http_method_names = ["get", "post", "head", "options"]
 
+    def get_parsers(self):
+        # Costear puede traer el archivo de la factura de compra (multipart); el resto es JSON.
+        if getattr(self, "action", None) == "costear":
+            return [MultiPartParser(), FormParser(), JSONParser()]
+        return super().get_parsers()
+
     def get_permissions(self):
         # Ver el historial: operativo (incluye vendedores). Registrar movimientos:
         # solo quien gestiona el inventario. **Verificar** un movimiento: solo almacén
@@ -43,6 +59,11 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
             return [IsWarehouse()]
         if self.action == "verificar":
             return [IsStockVerifier()]
+        if self.action == "costear":
+            # Cargar el costo de una entrada es tarea de gerencia/administración: es
+            # quien recibe y administra las facturas de compra. Almacén registra la
+            # mercancía que llega; el dato económico lo carga la gerencia.
+            return [IsManager()]
         return super().get_permissions()
 
     def get_queryset(self):
@@ -71,6 +92,13 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
         search = (params.get("search") or "").strip()
         if search:
             qs = qs.filter(product__name__icontains=search)
+
+        # Bandeja de trabajo de la gerencia: entradas por compra a las que aún no se les
+        # cargó el costo de la factura del proveedor (definición compartida con el panel
+        # de inicio; respeta la fecha de puesta en marcha).
+        pending_cost = params.get("pending_cost")
+        if pending_cost is not None and str(pending_cost).lower() in ("1", "true", "yes", "si", "sí"):
+            qs = pending_cost_movements(qs)
 
         return qs
 
@@ -115,8 +143,72 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
             },
         )
         return Response(
-            InventoryMovementSerializer(movement).data,
+            InventoryMovementSerializer(movement, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"], url_path="costo")  # permiso IsManager (ver get_permissions)
+    def costear(self, request, pk=None):
+        """Carga el costo de compra de una entrada ya registrada (llegó la factura).
+
+        En la operación diaria la mercancía llega al almacén antes que la factura del
+        proveedor: almacén registra la entrada (cantidad) y días después la gerencia
+        —que administra las facturas— carga el costo unitario. Al hacerlo se recalcula
+        el **costo promedio ponderado** del producto desde el historial de movimientos,
+        como si el costo se hubiera conocido al recibir la mercancía.
+
+        Cuerpo (JSON o ``multipart/form-data``): ``{"unit_cost": "120.00",
+        "reference": "F-00123", "notes": "…", "invoice_file": <archivo>}`` — todo opcional
+        salvo el costo; ``reference``/``notes`` reemplazan las del movimiento e
+        ``invoice_file`` adjunta la factura de compra escaneada (PDF o imagen, ≤10 MB).
+        Sin archivo se conserva el que ya tuviera.
+        Responde el movimiento actualizado más el promedio antes/después, para que la UI
+        pueda mostrar el efecto del costeo. Solo Gerente/Administrador (``IsManager``).
+        """
+        movement = self.get_object()
+        serializer = MovementCostSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            movement, average_before, average_after = set_movement_cost(
+                movement=movement,
+                unit_cost=data["unit_cost"],
+                reference=data.get("reference"),
+                notes=data.get("notes"),
+                invoice_file=data.get("invoice_file"),
+            )
+        except CostableMovementError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        audit.log(
+            request=request,
+            action=ActionChoices.INVENTORY_COST,
+            description=(
+                f"Cargó el costo de compra ({movement.unit_cost_usd} USD/u) de la entrada "
+                f"de {movement.quantity:+d} sobre «{movement.product.name}». "
+                f"Costo promedio: {average_before} → {average_after} USD."
+            ),
+            target=movement,
+            metadata={
+                "movement_type": movement.movement_type,
+                "quantity": movement.quantity,
+                "product": movement.product.name,
+                "product_id": movement.product_id,
+                "unit_cost_usd": str(movement.unit_cost_usd),
+                "reference": movement.reference,
+                "has_file": bool(movement.cost_invoice_file),
+                "average_cost_before": str(average_before) if average_before is not None else None,
+                "average_cost_after": str(average_after) if average_after is not None else None,
+            },
+        )
+        return Response(
+            {
+                "movement": InventoryMovementSerializer(movement, context={"request": request}).data,
+                "average_cost_before": average_before,
+                "average_cost_after": average_after,
+            },
+            status=status.HTTP_200_OK,
         )
 
     @action(detail=True, methods=["post"])  # permiso IsStockVerifier (ver get_permissions)
@@ -158,7 +250,7 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
             },
         )
         return Response(
-            InventoryMovementSerializer(movement).data,
+            InventoryMovementSerializer(movement, context={"request": request}).data,
             status=status.HTTP_200_OK,
         )
 

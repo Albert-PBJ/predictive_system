@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from apps.core.models import Product
@@ -18,6 +20,8 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
     )
     responsible_name = serializers.SerializerMethodField()
     verified_by_name = serializers.SerializerMethodField()
+    pending_cost = serializers.SerializerMethodField()
+    cost_invoice_url = serializers.SerializerMethodField()
 
     class Meta:
         model = InventoryMovement
@@ -30,6 +34,8 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
             "movement_type_display",
             "quantity",
             "unit_cost_usd",
+            "pending_cost",
+            "cost_invoice_url",
             "sale",
             "reference",
             "responsible",
@@ -43,6 +49,25 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
             "verified_at",
             "created_at",
         )
+
+    def get_pending_cost(self, obj):
+        # Entrada por compra a la que todavía no se le cargó el costo de la factura del
+        # proveedor (la mercancía llega antes que la factura). Es la bandeja de trabajo
+        # de la gerencia: solo entradas ENT, nunca salidas ni devoluciones/ajustes.
+        return (
+            obj.movement_type == InventoryMovement.MovementTypeChoices.ENTRY
+            and obj.sale_id is None
+            and obj.quantity > 0
+            and obj.unit_cost_usd is None
+        )
+
+    def get_cost_invoice_url(self, obj):
+        """URL absoluta de la factura de compra adjunta (o None si no tiene)."""
+        if not obj.cost_invoice_file:
+            return None
+        url = obj.cost_invoice_file.url
+        request = self.context.get("request")
+        return request.build_absolute_uri(url) if request else url
 
     def get_verified_by_name(self, obj):
         # Nombre real de quien verificó (desde su UserProfile); cae al username.
@@ -121,6 +146,33 @@ class MovementCreateSerializer(serializers.Serializer):
                 {"quantity": "Para entradas y devoluciones la cantidad debe ser positiva."}
             )
         return attrs
+
+
+class MovementCostSerializer(serializers.Serializer):
+    """Carga del costo de compra sobre una entrada ya registrada (llegó la factura).
+
+    La cantidad y el producto no se tocan: el movimiento ya ocurrió y el inventario es
+    append-only. Aquí solo se completa el dato económico que faltaba, más —opcionalmente—
+    la referencia (nº de factura del proveedor), el **archivo de la factura** y una nota.
+    Acepta `multipart/form-data` porque puede traer el adjunto.
+    """
+
+    unit_cost = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0.01"))
+    reference = serializers.CharField(required=False, allow_blank=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
+    invoice_file = serializers.FileField(required=False, allow_null=True)
+
+    def validate_invoice_file(self, value):
+        # Mismo criterio que el adjunto de la factura de venta (apps/sales).
+        if value is None:
+            return value
+        name = (value.name or "").lower()
+        allowed = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
+        if not name.endswith(allowed):
+            raise serializers.ValidationError("El archivo debe ser PDF o imagen (PDF, PNG, JPG, WEBP).")
+        if value.size and value.size > 10 * 1024 * 1024:
+            raise serializers.ValidationError("El archivo no puede superar los 10 MB.")
+        return value
 
 
 class ProductStockSerializer(serializers.ModelSerializer):

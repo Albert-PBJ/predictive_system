@@ -17,6 +17,7 @@ from datetime import date, timedelta
 
 from django.db.models import Avg, Count, F, Max, Min, Q, Sum
 from django.db.models.functions import Coalesce, TruncDay, TruncMonth
+from django.utils import timezone
 
 from apps.core.models import SERVICE_SKU_PREFIX, Customer, ExchangeRate, Product
 from apps.sales.models import Quote, Sale, SaleItem
@@ -228,6 +229,45 @@ def _build_narrative(start, end, cur, prev, type_split, no_demand_count, at_risk
             f"presionando la demanda."
         )
     return out[:5]
+
+
+def _pending_costs(limit: int = 8) -> dict:
+    """Entradas de mercancía recibidas cuya factura de proveedor aún no se ha cargado.
+
+    Es la tarea pendiente de la gerencia (ver `apps.inventory.services.set_movement_cost`):
+    almacén registra la cantidad al recibir, la gerencia carga el costo cuando llega la
+    factura. Se muestra en el panel de inicio como tabla accionable, de las **más
+    antiguas primero** (son las que llevan más tiempo sin costear y las que están
+    distorsionando el costo promedio). Excluye la carga histórica inicial según la fecha
+    de puesta en marcha (lo resuelve `pending_cost_movements`).
+    """
+    from apps.inventory.services import pending_cost_movements
+
+    qs = pending_cost_movements().select_related("product", "responsible__profile")
+    total = qs.count()
+    rows = []
+    today = timezone.localdate()
+    for m in qs.order_by("movement_date", "id")[:limit]:
+        profile = getattr(m.responsible, "profile", None)
+        who = None
+        if profile:
+            who = f"{profile.first_name} {profile.last_name}".strip() or None
+        if not who and m.responsible:
+            who = m.responsible.username
+        rows.append({
+            "id": m.id,
+            "product": m.product_id,
+            "product_name": m.product.name,
+            "product_sku": m.product.sku,
+            "quantity": m.quantity,
+            "movement_date": m.movement_date.isoformat(),
+            "days_waiting": (today - m.movement_date).days,
+            "responsible_name": who,
+            "reference": m.reference or "",
+            "notes": m.notes or "",
+            "unit_cost_usd": None,
+        })
+    return {"count": total, "rows": rows}
 
 
 def executive_dashboard(start: date, end: date, *, sensitive: bool, personal: bool = False, seller=None) -> dict:
@@ -657,6 +697,10 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool, personal: bo
         "exchange_rate": exchange_rate,
         "competitive": competitive,
         "alerts": alerts,
+        # Tarea operativa de la gerencia: entradas recibidas sin la factura cargada.
+        # Solo para quien puede costearlas (Gerente/Admin = sensitive) y nunca en la
+        # vista personal del vendedor.
+        "pending_costs": _pending_costs() if (sensitive and not personal) else None,
         "model_health": model_health,
         "customers_by_state": customers_by_state,
         "recent_sales": recent_sales,

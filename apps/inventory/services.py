@@ -12,6 +12,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from django.db import transaction
 from django.utils import timezone
 
+from apps.core import system_settings
 from apps.core.models import Product
 
 from .models import InventoryMovement
@@ -51,6 +52,131 @@ def _recompute_average_cost(*, prev_stock, prev_avg, quantity, entry_cost):
     prev_value = Decimal(prev_stock) * Decimal(base_avg)
     added_value = Decimal(quantity) * Decimal(entry_cost)
     return _money((prev_value + added_value) / Decimal(new_stock))
+
+
+class CostableMovementError(Exception):
+    """El movimiento indicado no admite carga de costo de compra."""
+
+
+def pending_cost_movements(queryset=None):
+    """Entradas por compra a las que aún no se les cargó el costo de la factura.
+
+    Es la bandeja de trabajo de la gerencia (la mercancía llega antes que la factura del
+    proveedor). Definición única, compartida por el listado de inventario y el panel de
+    inicio, para que ambos cuenten exactamente lo mismo.
+
+    Excluye lo anterior a la **fecha de puesta en marcha** (`SystemSettings.go_live_date`):
+    los movimientos de la carga histórica inicial nunca tuvieron factura asociada, así que
+    pedir que se costeen sería ruido. Sin fecha configurada no se filtra nada.
+    """
+    qs = queryset if queryset is not None else InventoryMovement.objects.all()
+    qs = qs.filter(
+        movement_type=InventoryMovement.MovementTypeChoices.ENTRY,
+        quantity__gt=0,
+        sale__isnull=True,
+        unit_cost_usd__isnull=True,
+    )
+    go_live = system_settings.go_live_date()
+    if go_live:
+        qs = qs.filter(movement_date__gte=go_live)
+    return qs
+
+
+def replay_average_cost(product):
+    """Recalcula el costo promedio del producto recorriendo su historial de movimientos.
+
+    El inventario es *append-only*: los movimientos son la fuente de verdad, así que el
+    promedio siempre se puede reconstruir a partir de ellos. Se recorre el historial en
+    orden y se aplica la misma regla que `apply_movement` (solo las entradas con costo
+    conocido mueven el promedio); las entradas sin costo cargado se ignoran, igual que
+    cuando se registraron.
+
+    Se usa al **cargar la factura de una entrada ya registrada**: como el costo llega
+    después, hay que rehacer el cálculo desde el historial en lugar de aplicarlo sobre el
+    promedio actual (que ya incorpora movimientos posteriores). Es idempotente: volver a
+    ejecutarlo sobre los mismos datos da el mismo resultado, y corregir un costo mal
+    cargado basta para que el promedio se reconstruya bien.
+    """
+    movements = (
+        InventoryMovement.objects.filter(product=product)
+        .order_by("movement_date", "created_at", "id")
+        .values_list("quantity", "unit_cost_usd")
+    )
+    # El promedio arranca en el precio de compra de referencia del producto (lo mismo
+    # que hace `Product.save()` la primera vez).
+    average = product.purchase_price_usd
+    stock = 0
+    for quantity, unit_cost in movements:
+        if quantity > 0 and unit_cost is not None:
+            average = _recompute_average_cost(
+                prev_stock=stock, prev_avg=average, quantity=quantity, entry_cost=unit_cost
+            )
+        stock += quantity
+    return _money(average) if average is not None else None
+
+
+@transaction.atomic
+def set_movement_cost(*, movement, unit_cost, reference=None, notes=None, invoice_file=None):
+    """Carga el costo de compra de una entrada **ya registrada** (llegó la factura).
+
+    En la operación real la mercancía entra al almacén antes que la factura del
+    proveedor: el encargado de almacén registra la entrada (cantidad) y el costo se
+    conoce días después. Esta función es el segundo paso de ese flujo —la gerencia
+    (que administra las facturas) carga el costo unitario— y deja el promedio ponderado
+    del producto como si el costo se hubiera conocido desde el principio, recalculándolo
+    desde el historial (`replay_average_cost`).
+
+    El respaldo documental va junto al costo: `reference` guarda el nº de factura del
+    proveedor e `invoice_file` (opcional) el **archivo escaneado** (PDF o imagen). Si no se
+    envía archivo, se conserva el que el movimiento ya tuviera.
+
+    Solo aplica a **entradas por compra/reposición** (`ENT`): son las que responden a una
+    factura de proveedor. Las devoluciones y los ajustes reingresan mercancía que ya se
+    había costeado, así que no se costean aquí. Devuelve
+    `(movimiento, promedio_antes, promedio_después)`.
+
+    **Alcance de la corrección:** el promedio se corrige de aquí en adelante. Las ventas
+    que ya se registraron conservan el costo (CMV) que se les aplicó en su momento —no
+    se reescriben utilidades ni comisiones ya reportadas—; por eso conviene cargar la
+    factura antes de vender la mercancía recibida.
+    """
+    if movement.movement_type != InventoryMovement.MovementTypeChoices.ENTRY or movement.sale_id is not None:
+        raise CostableMovementError(
+            "Solo se puede cargar el costo de una entrada por compra o reposición: las "
+            "salidas por venta se costean con el promedio vigente, y las devoluciones y "
+            "ajustes reingresan mercancía ya costeada."
+        )
+    if movement.quantity <= 0:
+        raise CostableMovementError("La entrada debe sumar existencias.")
+
+    unit_cost = _money(unit_cost)
+    if unit_cost <= 0:
+        raise CostableMovementError("El costo unitario debe ser mayor que cero.")
+
+    # Bloquea el producto para que un movimiento simultáneo no pise el recálculo.
+    product = Product.objects.select_for_update().order_by().get(pk=movement.product_id)
+    average_before = product.average_cost_usd
+
+    movement.unit_cost_usd = unit_cost
+    update_fields = ["unit_cost_usd"]
+    if reference is not None:
+        movement.reference = reference
+        update_fields.append("reference")
+    if notes is not None:
+        movement.notes = notes
+        update_fields.append("notes")
+    # El adjunto solo se toca si viene uno nuevo: al corregir un costo sin volver a
+    # subir el archivo, la factura ya cargada se conserva.
+    if invoice_file is not None:
+        movement.cost_invoice_file = invoice_file
+        update_fields.append("cost_invoice_file")
+    movement.save(update_fields=update_fields)
+
+    product.average_cost_usd = replay_average_cost(product)
+    product.save(update_fields=["average_cost_usd", "updated_at"])
+    movement.product = product
+
+    return movement, average_before, product.average_cost_usd
 
 
 @transaction.atomic
@@ -111,8 +237,16 @@ def apply_movement(
         # Salida/ajuste con costo explícito (p. ej. el CMV que pasa la venta): se
         # registra en el movimiento, pero no altera el promedio.
         movement_unit_cost = unit_cost
+    elif movement_type == InventoryMovement.MovementTypeChoices.ENTRY:
+        # Entrada de compra SIN costo: se deja en NULL a propósito. La mercancía llegó
+        # pero la factura del proveedor todavía no; sellarle el promedio vigente fingiría
+        # un costo de compra que nadie registró y la entrada nunca aparecería como
+        # pendiente. Queda a la espera de que la gerencia cargue el costo real
+        # (`set_movement_cost`), que entonces recalcula el promedio.
+        movement_unit_cost = None
     elif avg_before is not None:
-        # Sin costo explícito: se sella el promedio vigente para dejar rastro del CMV.
+        # Salidas (y devoluciones/ajustes que no son compras) sin costo explícito: se
+        # sella el promedio vigente para dejar rastro del CMV aplicado.
         movement_unit_cost = _money(avg_before)
 
     movement = InventoryMovement.objects.create(

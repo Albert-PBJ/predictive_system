@@ -48,6 +48,8 @@ class NullableDateField(serializers.DateField):
 class SystemSettingsSerializer(serializers.ModelSerializer):
     # Fecha de corte del entrenamiento: opcional y borrable desde la UI.
     training_cutoff_date = NullableDateField(required=False, allow_null=True)
+    # Fecha de puesta en marcha: igual de opcional y borrable.
+    go_live_date = NullableDateField(required=False, allow_null=True)
 
     class Meta:
         model = SystemSettings
@@ -76,6 +78,8 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
             # Valores por defecto de negocio
             "default_iva_pct",
             "default_quote_expiry_days",
+            # Operación
+            "go_live_date",
             # Módulo predictivo
             "training_cutoff_date",
             "rates_ignore_training_cutoff",
@@ -154,12 +158,41 @@ def _training_data_block() -> dict:
     }
 
 
+def _operations_block() -> dict:
+    """Datos para elegir la fecha de puesta en marcha del sistema.
+
+    Muestra hasta dónde llega el movimiento de inventario cargado y cuántas entradas
+    quedarían pendientes de costear con la frontera vigente, para que el administrador
+    vea el efecto de la fecha antes y después de fijarla.
+    """
+    from django.db.models import Max
+
+    from apps.inventory.models import InventoryMovement
+    from apps.inventory.services import pending_cost_movements
+
+    # La referencia útil para elegir la frontera es la última ENTRADA cargada (no un
+    # movimiento cualquiera): es la que marca dónde termina el histórico de compras.
+    last_entry = (
+        InventoryMovement.objects.filter(
+            movement_type=InventoryMovement.MovementTypeChoices.ENTRY
+        ).aggregate(d=Max("movement_date"))["d"]
+    )
+    go_live = system_settings.go_live_date()
+    return {
+        "last_entry_date": last_entry.isoformat() if last_entry else None,
+        "go_live_date": go_live.isoformat() if go_live else None,
+        # Con la fecha vigente (si no hay, cuenta todo el historial).
+        "pending_cost_count": pending_cost_movements().count(),
+    }
+
+
 def _meta_block() -> dict:
     """Estado de integraciones para la UI (sin exponer secretos)."""
     rate = ExchangeRate.objects.order_by("-date").first()
     eff = system_settings.effective_rate(rate) if rate else None
     return {
         "training_data": _training_data_block(),
+        "operations": _operations_block(),
         # Sólo presencia de la clave (secreto): nunca su valor.
         "deepseek_key_present": bool(system_settings.deepseek_api_key()),
         "openai_installed": _package_available("openai"),

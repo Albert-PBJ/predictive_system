@@ -230,6 +230,17 @@ def default_quote_expiry_days() -> int:
     return int(get_settings().default_quote_expiry_days or 15)
 
 
+def go_live_date():
+    """Fecha de puesta en marcha del sistema (``date``) o ``None``.
+
+    Separa la **carga histórica inicial** de la operación real: lo registrado antes de
+    esta fecha no genera tareas pendientes. Hoy la consume el inventario, para no pedir
+    que se costeen las entradas del histórico (que nunca tuvieron factura de proveedor).
+    ``None`` = sin frontera, todo el historial cuenta como operación real.
+    """
+    return getattr(get_settings(), "go_live_date", None)
+
+
 def training_cutoff_date():
     """Fecha de corte del entrenamiento de los modelos (``date``) o ``None``.
 

@@ -20,6 +20,7 @@ class ActionChoices(models.TextChoices):
     DISPATCH_UPDATE = "DISPATCH_UPDATE", _("Orden de despacho actualizada")
     INVENTORY_MOVEMENT = "INVENTORY_MOVEMENT", _("Movimiento de inventario")
     INVENTORY_VERIFY = "INVENTORY_VERIFY", _("Movimiento de inventario verificado")
+    INVENTORY_COST = "INVENTORY_COST", _("Costo de compra cargado")
     SCRAPE_START = "SCRAPE_START", _("Scraping iniciado")
     SCRAPE_STOP = "SCRAPE_STOP", _("Scraping detenido")
     REPORT_GENERATE = "REPORT_GENERATE", _("Reporte ejecutivo generado")
@@ -69,6 +70,7 @@ ACTION_CATEGORY = {
     ActionChoices.DISPATCH_UPDATE: CategoryChoices.VENTAS,
     ActionChoices.INVENTORY_MOVEMENT: CategoryChoices.INVENTARIO,
     ActionChoices.INVENTORY_VERIFY: CategoryChoices.INVENTARIO,
+    ActionChoices.INVENTORY_COST: CategoryChoices.INVENTARIO,
     ActionChoices.SCRAPE_START: CategoryChoices.SCRAPERS,
     ActionChoices.SCRAPE_STOP: CategoryChoices.SCRAPERS,
     ActionChoices.REPORT_GENERATE: CategoryChoices.REPORTES,
