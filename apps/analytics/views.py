@@ -131,7 +131,7 @@ class ProfitForecastView(_BaseForecastView):
 class ExchangeRateForecastView(_BaseForecastView):
     def get(self, request):
         rate = request.query_params.get("rate", "bcv")
-        rate = rate if rate in ("bcv", "parallel") else "bcv"
+        rate = rate if rate in F.RATE_SERIES else "bcv"
         h, m = _horizon(request), _model(request)
         key = f"rate:{rate}:{h}:{m}"
         return Response(registry.cached(key, lambda: F.forecast_exchange_rate(rate, h, m)))
@@ -193,7 +193,7 @@ class ForecastAdviceView(_BaseForecastView):
             builder = lambda: F.forecast_profit(h, m)  # noqa: E731
         elif target == "exchange-rate":
             rate = request.query_params.get("rate", "bcv")
-            rate = rate if rate in ("bcv", "parallel") else "bcv"
+            rate = rate if rate in F.RATE_SERIES else "bcv"
             fc_key = f"rate:{rate}:{h}:{m}"
             builder = lambda: F.forecast_exchange_rate(rate, h, m)  # noqa: E731
         elif target == "product-price":
@@ -297,6 +297,7 @@ class OverviewView(_BaseForecastView):
     def _build():
         sales = F.forecast_sales("revenue", 6)
         bcv = F.forecast_exchange_rate("bcv", 6)
+        eur = F.forecast_exchange_rate("eur", 6)
         parallel = F.forecast_exchange_rate("parallel", 6)
         quote = F.forecast_quote_conversion()
 
@@ -345,6 +346,7 @@ class OverviewView(_BaseForecastView):
                 "next_revenue": first(sales),
                 "revenue_model": sales.get("model"),
                 "next_bcv": first(bcv),
+                "next_eur": first(eur),
                 "next_parallel": first(parallel),
                 "pipeline": quote.get("pipeline"),
                 "quote_conversion_rate": quote.get("historical_conversion_rate"),

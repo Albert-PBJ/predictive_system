@@ -205,11 +205,19 @@ def _compact_facts(d: dict, ov: dict | None, sensitive: bool) -> str:
     # --- Tipo de cambio ---
     er = d.get("exchange_rate")
     if er:
+        eur_txt = ""
+        if er.get("start_eur") is not None or er.get("end_eur") is not None:
+            eur_txt = (
+                f"; Euro BCV de {_ves(er.get('start_eur'))} a {_ves(er.get('end_eur'))} "
+                f"({_signed_pct(er.get('eur_change_pct'))})"
+            )
         lines.append(
-            f"\nTIPO DE CAMBIO en el periodo: BCV de {_ves(er.get('start_bcv'))} a {_ves(er.get('end_bcv'))} "
-            f"({_signed_pct(er.get('bcv_change_pct'))}); Euro BCV de {_ves(er.get('start_parallel'))} a "
+            f"\nTIPO DE CAMBIO en el periodo: Dólar BCV de {_ves(er.get('start_bcv'))} a "
+            f"{_ves(er.get('end_bcv'))} ({_signed_pct(er.get('bcv_change_pct'))})"
+            f"{eur_txt}; dólar paralelo de {_ves(er.get('start_parallel'))} a "
             f"{_ves(er.get('end_parallel'))} ({_signed_pct(er.get('parallel_change_pct'))}). "
-            "Un Euro BCV al alza encarece los productos y suele frenar la demanda."
+            "Se factura con las tasas oficiales del BCV; el paralelo es la referencia del "
+            "valor real del dinero y, al dispararse, encarece los productos y frena la demanda."
         )
 
     # --- Competitividad de precio (sensible) ---
@@ -250,10 +258,12 @@ def _compact_facts(d: dict, ov: dict | None, sensitive: bool) -> str:
             r2 = (h.get("revenue_model") or {}).get("r2")
             r2_txt = f", confianza R² {_num(r2):.2f}" if _num(r2) is not None else ""
             lines.append(f"- Ingresos del próximo mes (proyección): {_usd(nr.get('value'))}{rng_txt}{r2_txt}.")
-        if h.get("next_bcv") or h.get("next_parallel"):
+        if h.get("next_bcv") or h.get("next_eur") or h.get("next_parallel"):
             lines.append(
-                f"- Tipo de cambio próximo mes (proyección): BCV {_ves((h.get('next_bcv') or {}).get('value'))}, "
-                f"Euro BCV {_ves((h.get('next_parallel') or {}).get('value'))}."
+                "- Tipo de cambio próximo mes (proyección): "
+                f"Dólar BCV {_ves((h.get('next_bcv') or {}).get('value'))}, "
+                f"Euro BCV {_ves((h.get('next_eur') or {}).get('value'))}, "
+                f"paralelo {_ves((h.get('next_parallel') or {}).get('value'))}."
             )
         pipe = h.get("pipeline")
         if pipe:

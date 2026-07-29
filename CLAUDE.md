@@ -65,7 +65,7 @@ python manage.py seed_company_data                 # carga completa (recomendado
 python manage.py seed_company_data --scale 1.5     # más volumen de ventas
 python manage.py seed_company_data --purge-demo    # elimina además los datos de seed_demo_data
 python manage.py seed_company_data --no-fresh      # añade sin borrar la historia previa
-python manage.py seed_company_data --update-only    # NO borra/regenera: solo actualiza sobre lo existente (nº factura/control + enlace presupuesto→venta)
+python manage.py seed_company_data --update-only    # NO borra/regenera: solo actualiza sobre lo existente (relleno del Euro BCV + nº factura/control + enlace presupuesto→venta)
 python manage.py seed_company_data --resources "C:/ruta/resources" --seed 7
 
 # Genera datos de mercado de competidores SIMULADOS para los 10 principales del
@@ -102,15 +102,16 @@ python manage.py train_models --product 133          # producto base para demand
 python manage.py train_models --cutoff 2026-05-31    # entrena hasta mayo; junio+ = pronóstico
 python manage.py train_models --cutoff none          # sin corte (todo el historial)
 
-# Update the exchange rate (BCV + parallel) and raise a freshness Alert if stale.
-# Primary source: the **pyDolarVenezuela** library (`fetch_rates_from_library` — stable
-# official BCV + best-effort, sanity-checked parallel; some upstream parallel scrapers
-# are flaky, so parallel may come back null → system falls back to BCV). Only if the
-# library can't get the BCV does it fall back to the HTTP API in
-# `SystemSettings.exchange_rate_api_url` (pyDolarVe). Degrades gracefully with no
-# network. --bcv/--parallel load manually; --check-only just verifies freshness.
+# Update the THREE exchange rates (Dólar BCV, Euro BCV, paralelo) and raise a freshness
+# Alert if stale. Primary source: the **pyDolarVenezuela** library
+# (`fetch_rates_from_library` — stable official USD+EUR from the BCV page, best-effort,
+# sanity-checked parallel; some upstream parallel scrapers are flaky, so parallel may
+# come back null → the system falls back to the Dólar BCV). Only if the library can't get
+# the Dólar BCV does it fall back to the HTTP API in `SystemSettings.exchange_rate_api_url`
+# (pyDolarVe; the euro monitor is looked up as eur/euro/bcv_eur). Degrades gracefully with
+# no network. --bcv/--eur/--parallel load manually; --check-only just verifies freshness.
 python manage.py fetch_exchange_rate
-python manage.py fetch_exchange_rate --bcv 36.5 --parallel 40   # carga manual (offline)
+python manage.py fetch_exchange_rate --bcv 36.5 --eur 39.4 --parallel 40  # carga manual
 python manage.py fetch_exchange_rate --check-only               # solo verifica frescura
 
 # Run scrapers via CLI
@@ -486,7 +487,7 @@ Jan-2026 shock, seasonality, price elasticity, and the retail-vs-institutional s
 - **Secrets never go in the DB.** `deepseek_api_key()` (and `APIFY_API_KEY`, DB creds, `SECRET_KEY`) are read straight from the environment; the API exposes only *presence* (`deepseek_key_present`), never the value.
 - **Cached** in `django.core.cache` for 30 s; `save()` deletes the key, so a PATCH from the UI takes effect immediately.
 - **Typed getters** (`llm_enrichment_enabled`, `deepseek_model`, `vision_ocr_enabled`, `ocr_*`, `discard_instagram_without_price`, `price_bands`, `rate_basis`/`effective_rate`, `rate_max_age_days`, `exchange_rate_api_url`, `default_iva_pct`, `default_quote_expiry_days`, `scraper_default_limit`, `report_narrative_enabled`, `company_info`, plus `training_cutoff_date`/`set_training_cutoff_date` — the ML training cutoff, consumed by `analytics.ml.datasets`) are what consumers call. The env-reading modules were refactored from module-level constants to these getters: `enrichment/deepseek.py` (`use_llm_enrichment()`/`current_model()`/`current_base_url()`; the scrapers' log lines call them too), `enrichment/image_ocr.py` (switch + `ocr_*()`), `scrapers/validation.py` (`_discard_instagram_without_price()` + `band_for_category()` reads `price_bands()`), `analytics/report_narrative.py` (its own `enable_llm_report_narrative` switch + model), `sales/services.py` (`effective_rate` by `rate_basis`, IVA + expiry defaults in `create_quote`), `core/views.LatestExchangeRateView`, `competitor_market_data/views.ScraperStartView` (default limit), and `core/management/commands/fetch_exchange_rate` (threshold + API URL). The **price-validation bands** (`price_bands`, a JSON `{categories: {<cat>: {min, max}}, default}`) seed from `apps/core/price_band_defaults.py` and are editable from the Configuración UI; the PATCH serializer validates them (numeric, ≥0, min ≤ max) and `meta.price_band_categories` (the scraper `CATEGORY_NAMES`) populates the editor.
-- **`effective_rate(rate)`** centralizes the USD→VES rate choice (`rate_basis` ∈ PAR/BCV/AVG, default PAR = "paralela si existe, si no BCV") — previously a hard-coded `parallel_rate or bcv_rate`.
+- **`effective_rate(rate)`** centralizes the USD→VES rate choice (`rate_basis` ∈ **BCV** (default, Dólar BCV) / **EUR** (Euro BCV) / PAR (paralelo) / AVG (promedio Dólar BCV-paralelo)), degrading to the Dólar BCV when the chosen one isn't loaded.
 - **API** (`settings_api.py`): `SystemSettingsView` (GET `IsManager` / PATCH `IsAdmin`, returns `{settings, meta}`; `meta.training_data` carries the last sale/rate date + the effective ML cutoff so the admin can pick one, and `training_cutoff_date` uses a `NullableDateField` that reads `""` as "sin corte", since the UI form sends an empty string when the field is cleared), `ExchangeRateSetView`/`ExchangeRateFetchView` (Admin; the fetch uses `fetch_exchange_rate.fetch_rates` — **pyDolarVenezuela library primary**, pyDolarVe HTTP fallback — + `check_rate_freshness`), `SettingsLLMTestView` (Admin, reuses `deepseek.check_connection`), `CompanyInfoView` (`IsViewer`). Registered in `apps/core/urls.py`; admin-registered as a no-add/no-delete singleton.
 
 ### System logs (auditoría) (`apps/audit`)
@@ -594,7 +595,13 @@ rechazan). No hay falsos positivos con referencias propias del usuario mientras 
 
 ### Key Design Decisions
 
-**Dual-currency everywhere:** Venezuela's economy requires tracking both official BCV rate and parallel market rate. Sale, Quote, ProductPriceHistory, and ExchangeRate all carry both `bcv_rate` and `parallel_rate`. All prices are stored in USD; VES values are derived or stored alongside.
+**Dual-currency with THREE rates:** Venezuela's economy requires tracking the official BCV rates and the parallel market. `ExchangeRate`, `Sale`, `Quote` and `ProductPriceHistory` all carry `bcv_rate` (**Dólar BCV**, Bs/USD), `eur_bcv_rate` (**Euro BCV**, Bs/EUR) and `parallel_rate` (**Paralelo**, Bs/USD). All prices are stored in USD; VES values are derived or stored alongside.
+
+The three are **not interchangeable**: the two BCV rates are **operational** (what the company bills with — the BCV publishes both, and pricing in euros is a common local hedge), while the **parallel is analytical** — it is the read on the real value of money, it explains demand shocks, and it is the series that feeds the models' `shock_cambiario` (`ml/forecasters._rate_shock_map`). Which rate converts USD→VES is the **global** `SystemSettings.rate_basis` (`BCV` default, plus `EUR`/`PAR`/`AVG`), resolved by `system_settings.effective_rate`; there is deliberately **no per-sale rate picker** — the seller sees the active basis on the form badge (`rateBasisLabel`). Migration `core/0010` moved the stored basis from `PAR` to `BCV`; already-registered sales keep their own snapshot and totals.
+
+**The Euro BCV history is real.** The BCV derives its euro rate by crossing its dollar rate with the EUR/USD parity, so `seed_company_data` does the same: `EUR_USD_PARITY` (keyed `YYYY-MM`) holds actual monthly parity — measured from real published BCV dollar/euro pairs for Jun-2025→Jul-2026 (e.g. 2025-12: USD 298,14 / EUR 351,24 → 1,1781; 2026-01: USD 301,37 / EUR 354,49 → 1,1763), and real market EUR/USD for 2022→May-2025 (including the sub-parity dip of Sep–Oct 2022 at ~0,98). Crossing keeps the euro coherent with the already-established dollar anchors instead of pasting values that would imply an impossible dollar/euro ratio. `RateModel.eur_parity`/`eur_for_date` expose it, `_build_exchange_rates` writes it on a fresh seed, and **`seed_company_data --update-only` backfills it on an existing DB** (rates + sale/quote/price-history snapshots) writing **only** the new column — `bcv_rate`, `parallel_rate` and every amount are untouched, so all model metrics stay bit-for-bit identical (verified).
+
+`ml/forecasters.RATE_SERIES` maps the three to forecastable series (`?rate=bcv|eur|parallel`, each with its own unit); `forecast_product_price` derives its VES equivalent at the **operational** rate (`_operational_rate_key`, from the configured basis), not the parallel.
 
 **Competitor normalization:** `CompetitorMarketData` has an optional FK to a normalized `Competitor` record *plus* a fallback `competitor_name` CharField. This handles scraped data that doesn't match any known competitor.
 

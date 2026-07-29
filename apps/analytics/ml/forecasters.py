@@ -227,6 +227,23 @@ def forecast_series(
     }
 
 
+def _operational_rate_key() -> str:
+    """Clave de ``RATE_SERIES`` correspondiente a la base de conversión configurada.
+
+    Solo se usa para derivar importes en Bs (presentación); **no** entra en ninguna
+    variable de los modelos. Nunca lanza: si la configuración no está disponible cae al
+    Dólar BCV.
+    """
+    try:
+        from apps.core import system_settings
+
+        return {"BCV": "bcv", "EUR": "eur", "PAR": "parallel", "AVG": "bcv"}.get(
+            system_settings.rate_basis(), "bcv"
+        )
+    except Exception:  # pragma: no cover - configuración/BD no disponible
+        return "bcv"
+
+
 def _rate_shock_map() -> dict[str, float]:
     """Mapa periodo -> shock cambiario: devaluación mensual de la tasa paralela por
     encima de su norma reciente (3 meses). Captura las caídas de demanda asociadas a
@@ -336,15 +353,28 @@ def forecast_profit(horizon: int = 6, model: str | None = None) -> dict:
 # --------------------------------------------------------------------------- #
 # 3) Tasa de cambio (BCV / paralela)
 # --------------------------------------------------------------------------- #
+# Las tres tasas pronosticables: clave de API -> (columna, etiqueta, unidad).
+# Dólar BCV y Euro BCV son las operativas; el paralelo es la referencia analítica.
+RATE_SERIES = {
+    "bcv": ("bcv_rate", "Dólar BCV", "Bs/USD"),
+    "eur": ("eur_bcv_rate", "Euro BCV", "Bs/EUR"),
+    "parallel": ("parallel_rate", "Paralelo", "Bs/USD"),
+}
+
+
 def forecast_exchange_rate(rate: str = "bcv", horizon: int = 6, model: str | None = None) -> dict:
     df = datasets.monthly_exchange_rate()
     if df.empty or len(df) < 8:
         return _empty("exchange_rate", "Pronóstico de la tasa de cambio")
     model_key = model or ASSIGNED_MODEL["exchange_rate"]
-    col = "bcv_rate" if rate == "bcv" else "parallel_rate"
-    label = "BCV" if rate == "bcv" else "Euro BCV"
+    col, label, unit = RATE_SERIES.get(rate, RATE_SERIES["bcv"])
     periods = list(df.index)
-    values = [float(v) for v in df[col].tolist()]
+    series = df[col]
+    # Una tasa puede no estar cargada en todo el histórico (p. ej. el Euro BCV antes de
+    # empezar a registrarlo): sin datos no se pronostica, en vez de fallar con NaN.
+    if series.isna().all():
+        return _empty("exchange_rate", f"Pronóstico de la tasa {label}", subject={"rate": rate})
+    values = [float(v) for v in series.tolist()]
     # La tasa crece de forma exponencial -> regresión lineal sobre log, sin estacionalidad.
     res = forecast_series(periods, values, model_key=model_key, horizon=horizon,
                           log_target=True, seasonal=False, nonneg=True)
@@ -353,15 +383,18 @@ def forecast_exchange_rate(rate: str = "bcv", horizon: int = 6, model: str | Non
         recs = datasets.exchange_rate_for_month(p)
         detail[p] = {
             "kind": "history",
-            "columns": ["Fecha", "BCV", "Euro BCV", "Fuente"],
+            "columns": ["Fecha", "Dólar BCV", "Euro BCV", "Paralelo", "Fuente"],
             "rows": [[r.date.isoformat(), float(r.bcv_rate),
+                      float(r.eur_bcv_rate) if r.eur_bcv_rate is not None else None,
                       float(r.parallel_rate) if r.parallel_rate is not None else None,
                       r.get_source_display()] for r in recs],
             "summary": {"tasa": round(float(df.loc[p, col]), 4)},
         }
     _attach_forecast_detail(detail, res["forecast"])
     return _wrap("exchange_rate", f"Pronóstico de la tasa {label}", {"rate": rate},
-                 "Bs/USD", "rate", res, detail, meta={"rate": rate, "rates_available": ["bcv", "parallel"]})
+                 unit, "rate", res, detail,
+                 meta={"rate": rate, "rate_label": label,
+                       "rates_available": list(RATE_SERIES)})
 
 
 # --------------------------------------------------------------------------- #
@@ -383,13 +416,17 @@ def forecast_product_price(product_id: int, horizon: int = 6, model: str | None 
     res = forecast_series(periods, values, model_key=model_key, horizon=horizon,
                           log_target=True, seasonal=False, lags=(1, 2, 3), nonneg=True)
 
-    # Precio en Bs derivado (USD pronosticado × tasa paralela pronosticada).
-    rate_fc = forecast_exchange_rate("parallel", horizon=horizon)
+    # Precio en Bs derivado (USD pronosticado × tasa pronosticada). Se usa la tasa
+    # **operativa** configurada (la misma con la que se factura), no el paralelo: el
+    # paralelo quedó como referencia analítica.
+    rate_key = _operational_rate_key()
+    rate_col = RATE_SERIES[rate_key][0]
+    rate_fc = forecast_exchange_rate(rate_key, horizon=horizon)
     rate_by_period = {f["period"]: f["value"] for f in rate_fc.get("forecast", [])}
     latest_rate = None
     rate_df = datasets.monthly_exchange_rate()
-    if not rate_df.empty:
-        latest_rate = float(rate_df["parallel_rate"].iloc[-1])
+    if not rate_df.empty and not rate_df[rate_col].isna().all():
+        latest_rate = float(rate_df[rate_col].ffill().iloc[-1])
     for f in res["forecast"]:
         r = rate_by_period.get(f["period"], latest_rate)
         f["value_ves"] = round(f["value"] * r, 2) if r else None
@@ -407,7 +444,8 @@ def forecast_product_price(product_id: int, horizon: int = 6, model: str | None 
     _attach_forecast_detail(detail, res["forecast"])
     return _wrap("product_price", "Pronóstico de precio de producto", subject,
                  "USD", "usd", res, detail,
-                 meta={"current_price_usd": float(product.sale_price_usd or 0)})
+                 meta={"current_price_usd": float(product.sale_price_usd or 0),
+                       "ves_rate": rate_key, "ves_rate_label": RATE_SERIES[rate_key][1]})
 
 
 # --------------------------------------------------------------------------- #

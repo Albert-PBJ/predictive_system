@@ -124,12 +124,14 @@ class Command(BaseCommand):
             date=date.today(),
             defaults={
                 "bcv_rate": Decimal("36.5000"),
+                "eur_bcv_rate": Decimal("39.4200"),   # ≈ Dólar BCV × paridad EUR/USD
                 "parallel_rate": Decimal("40.0000"),
                 "source": ExchangeRate.SourceChoices.BCV,
             },
         )
         self.stdout.write(self.style.SUCCESS(
-            f"Tasa de cambio {rate.date}: BCV {rate.bcv_rate} | Paralela {rate.parallel_rate}"
+            f"Tasa de cambio {rate.date}: Dólar BCV {rate.bcv_rate} | "
+            f"Euro BCV {rate.eur_bcv_rate} | Paralelo {rate.parallel_rate}"
         ))
 
         # Vendedor ligado al admin: permite registrar ventas como el usuario admin

@@ -64,9 +64,11 @@ class LatestExchangeRateView(APIView):
             {
                 "date": rate.date.isoformat(),
                 "bcv_rate": str(rate.bcv_rate),
+                "eur_bcv_rate": str(rate.eur_bcv_rate) if rate.eur_bcv_rate is not None else None,
                 "parallel_rate": str(rate.parallel_rate) if rate.parallel_rate is not None else None,
                 # Tasa efectiva usada para convertir USD→VES, según la base configurada
-                # (paralela por defecto; también BCV o promedio — ver SystemSettings).
+                # (Dólar BCV por defecto; también Euro BCV, paralelo o promedio — ver
+                # SystemSettings).
                 "effective_rate": str(eff) if eff is not None else None,
                 "rate_basis": system_settings.rate_basis(),
                 "source": rate.source,

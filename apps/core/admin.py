@@ -47,7 +47,7 @@ class SellerAdmin(admin.ModelAdmin):
 
 @admin.register(ExchangeRate)
 class ExchangeRateAdmin(admin.ModelAdmin):
-    list_display = ("date", "bcv_rate", "parallel_rate", "source")
+    list_display = ("date", "bcv_rate", "eur_bcv_rate", "parallel_rate", "source")
     date_hierarchy = "date"
 
 

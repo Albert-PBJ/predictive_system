@@ -1,4 +1,10 @@
-"""Ingesta automática de la tasa de cambio (BCV + paralela) con alerta de frescura.
+"""Ingesta automática de las tasas de cambio con alerta de frescura.
+
+Se manejan **tres** tasas: las dos **operativas** y oficiales del BCV — *Dólar BCV*
+(`bcv_rate`, Bs/USD) y *Euro BCV* (`eur_bcv_rate`, Bs/EUR) — y el *paralelo*
+(`parallel_rate`, Bs/USD), que es **solo referencia analítica** (sirve para leer el
+valor real del dinero y alimenta el `shock_cambiario` de los modelos), no se factura
+con él salvo que se elija esa base a propósito.
 
 La tasa de cambio era 100% manual: si nadie la cargaba, una tasa vieja distorsiona
 en silencio todas las cifras en VES **y** la validación de precios scrapeados (que
@@ -8,13 +14,13 @@ pública y, además, vigila su frescura: si la última tasa está vencida, crea 
 
 Uso:
     python manage.py fetch_exchange_rate                      # baja de la API y upserta hoy
-    python manage.py fetch_exchange_rate --bcv 36.5 --parallel 40   # carga manual (offline)
+    python manage.py fetch_exchange_rate --bcv 36.5 --eur 39.4 --parallel 40  # carga manual
     python manage.py fetch_exchange_rate --check-only         # solo verifica frescura
     python manage.py fetch_exchange_rate --max-age-days 1     # umbral de "vencida" más estricto
 
 Fuente: la librería **pyDolarVenezuela** (paquete `pyDolarVenezuela`) es la primaria
-—obtiene la BCV oficial de forma estable y, best-effort, la paralela—. Solo si la
-librería no logra ni la BCV (no instalada o sus fuentes caídas) se cae a la **API
+—obtiene las oficiales (dólar y euro) de forma estable y, best-effort, el paralelo—.
+Solo si la librería no logra ni el Dólar BCV (no instalada o sus fuentes caídas) se cae a la **API
 HTTP** configurada en `SystemSettings.exchange_rate_api_url` (pyDolarVe). Si todo
 falla, el comando no se cae: registra el fallo y corre igualmente la verificación de
 frescura (que avisará). Ver `fetch_rates` / `fetch_rates_from_library`.
@@ -51,25 +57,31 @@ def _to_decimal(value):
 
 
 def fetch_rates_from_api(url: str) -> tuple:
-    """Baja (BCV, paralela) de la API pública. Retorna (Decimal|None, Decimal|None).
+    """Baja (Dólar BCV, Euro BCV, paralelo) de la API pública. Cada uno ``Decimal|None``.
 
     pyDolarVe devuelve ``{"monitors": {"bcv": {"price": …}, "enparalelovzla": {"price": …}}}``.
-    Es tolerante a variantes del nombre del monitor paralelo.
+    Es tolerante a variantes del nombre del monitor paralelo y del monitor del euro
+    (según la versión del endpoint el euro oficial aparece como ``eur``/``euro``/``bcv_eur``).
     """
     req = urllib.request.Request(url, headers={"User-Agent": "maescar-predictive/1.0"})
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         data = json.loads(resp.read().decode("utf-8"))
 
     monitors = data.get("monitors", data) if isinstance(data, dict) else {}
+
+    def _first(keys):
+        for key in keys:
+            node = monitors.get(key)
+            if isinstance(node, dict):
+                value = _to_decimal(node.get("price"))
+                if value is not None:
+                    return value
+        return None
+
     bcv = _to_decimal((monitors.get("bcv") or {}).get("price"))
-    parallel = None
-    for key in ("enparalelovzla", "paralelo", "bitcoin", "dolartoday"):
-        node = monitors.get(key)
-        if isinstance(node, dict):
-            parallel = _to_decimal(node.get("price"))
-            if parallel is not None:
-                break
-    return bcv, parallel
+    eur = _first(("eur", "euro", "bcv_eur", "eur_bcv"))
+    parallel = _first(("enparalelovzla", "paralelo", "bitcoin", "dolartoday"))
+    return bcv, eur, parallel
 
 
 def _plausible_parallel(parallel, bcv) -> bool:
@@ -84,14 +96,14 @@ def _plausible_parallel(parallel, bcv) -> bool:
 
 
 def fetch_rates_from_library() -> tuple:
-    """Obtiene (BCV, paralela) con la librería **pyDolarVenezuela**. Best-effort:
-    nunca lanza; retorna ``(Decimal|None, Decimal|None)``.
+    """Obtiene (Dólar BCV, Euro BCV, paralelo) con **pyDolarVenezuela**. Best-effort:
+    nunca lanza; retorna una tupla de ``Decimal|None``.
 
-    La BCV oficial es estable (página ``BCV``, monitor ``usd``). La paralela es menos
-    fiable —según el momento, algunos scrapers de la librería están caídos o devuelven
-    valores inválidos—, así que se prueban varias fuentes y se valida el resultado;
-    si ninguna sirve, la paralela queda en None (el sistema usa la BCV). Importa la
-    librería de forma diferida (dependencia opcional).
+    Las dos oficiales del BCV son estables (página ``BCV``, monitores ``usd`` y ``eur``).
+    El paralelo es menos fiable —según el momento, algunos scrapers de la librería están
+    caídos o devuelven valores inválidos—, así que se prueban varias fuentes y se valida
+    el resultado; si ninguna sirve, queda en None (es solo referencia analítica). Importa
+    la librería de forma diferida (dependencia opcional).
     """
     try:
         from pyDolarVenezuela import Monitor
@@ -102,7 +114,7 @@ def fetch_rates_from_library() -> tuple:
             "Instálalo con: pip install pyDolarVenezuela",
             exc,
         )
-        return None, None
+        return None, None, None
 
     bcv = None
     try:
@@ -110,6 +122,20 @@ def fetch_rates_from_library() -> tuple:
         bcv = _to_decimal(getattr(official, "price", None))
     except Exception as exc:  # red, scraping roto, etc.
         logger.warning("No se pudo obtener la BCV oficial de pyDolarVenezuela: %s", exc)
+
+    # Euro BCV: el BCV publica la tasa oficial del euro junto a la del dólar. La librería
+    # la expone como el monitor `eur` de la misma página (moneda EUR).
+    eur = None
+    for currency, key in (("EUR", "eur"), ("USD", "eur")):
+        try:
+            node = Monitor(BCV, currency).get_value_monitors(key)
+            eur = _to_decimal(getattr(node, "price", None))
+            if eur is not None:
+                break
+        except Exception as exc:
+            logger.debug("Euro BCV no disponible vía %s/%s: %s", currency, key, exc)
+    if eur is None:
+        logger.info("pyDolarVenezuela: no se obtuvo la tasa Euro BCV; puedes cargarla a mano.")
 
     parallel = None
     # Se prueban varias fuentes de paralela y se toma la primera plausible.
@@ -130,28 +156,27 @@ def fetch_rates_from_library() -> tuple:
     if parallel is None:
         logger.info(
             "pyDolarVenezuela: no hay una tasa paralela válida disponible ahora; se "
-            "carga solo la BCV (puedes cargar la paralela manualmente)."
+            "cargan solo las oficiales (puedes cargar el paralelo manualmente)."
         )
-    return bcv, parallel
+    return bcv, eur, parallel
 
 
 def fetch_rates(url: str | None = None) -> tuple:
-    """Obtiene (BCV, paralela, fuente) priorizando **pyDolarVenezuela**.
+    """Obtiene (Dólar BCV, Euro BCV, paralelo, fuente) priorizando **pyDolarVenezuela**.
 
-    Si la librería logra la BCV, se usa su resultado (con la paralela que haya podido
-    validar, posiblemente None). Solo si la librería no consigue ni la BCV (no
-    instalada o todas sus fuentes caídas) se cae a la **API HTTP** configurada
-    (``url``, pyDolarVe). Ese respaldo puede lanzar (red/DNS): los llamadores lo
-    manejan. Retorna ``(Decimal|None, Decimal|None, str)`` donde el tercer valor
-    describe la fuente usada.
+    Si la librería logra el Dólar BCV, se usa su resultado (con el Euro BCV y el paralelo
+    que haya podido validar, posiblemente None). Solo si la librería no consigue ni el
+    Dólar BCV (no instalada o todas sus fuentes caídas) se cae a la **API HTTP**
+    configurada (``url``, pyDolarVe). Ese respaldo puede lanzar (red/DNS): los llamadores
+    lo manejan. El cuarto valor describe la fuente usada.
     """
-    bcv, parallel = fetch_rates_from_library()
+    bcv, eur, parallel = fetch_rates_from_library()
     if bcv is not None:
-        return bcv, parallel, "pyDolarVenezuela"
+        return bcv, eur, parallel, "pyDolarVenezuela"
     if url:
-        api_bcv, api_parallel = fetch_rates_from_api(url)
-        return api_bcv, api_parallel, url
-    return None, None, "pyDolarVenezuela"
+        api_bcv, api_eur, api_parallel = fetch_rates_from_api(url)
+        return api_bcv, api_eur, api_parallel, url
+    return None, None, None, "pyDolarVenezuela"
 
 
 def check_rate_freshness(max_age_days: int = DEFAULT_MAX_AGE_DAYS) -> dict:
@@ -220,11 +245,12 @@ def check_rate_freshness(max_age_days: int = DEFAULT_MAX_AGE_DAYS) -> dict:
 
 
 class Command(BaseCommand):
-    help = "Actualiza la tasa de cambio (BCV + paralela) y vigila su frescura."
+    help = "Actualiza las tasas de cambio (Dólar BCV, Euro BCV y paralelo) y vigila su frescura."
 
     def add_arguments(self, parser):
-        parser.add_argument("--bcv", type=str, help="Tasa BCV manual (Bs/USD); omite la API.")
-        parser.add_argument("--parallel", type=str, help="Tasa paralela manual (Bs/USD).")
+        parser.add_argument("--bcv", type=str, help="Tasa Dólar BCV manual (Bs/USD); omite la API.")
+        parser.add_argument("--eur", type=str, help="Tasa Euro BCV manual (Bs/EUR).")
+        parser.add_argument("--parallel", type=str, help="Tasa paralela manual (Bs/USD, referencial).")
         parser.add_argument("--date", type=str, help="Fecha de la tasa (YYYY-MM-DD); por defecto hoy.")
         parser.add_argument(
             "--max-age-days", type=int, default=None,
@@ -269,6 +295,7 @@ class Command(BaseCommand):
                 return
 
         bcv = _to_decimal(options.get("bcv"))
+        eur = _to_decimal(options.get("eur"))
         parallel = _to_decimal(options.get("parallel"))
 
         if bcv is None:
@@ -276,22 +303,23 @@ class Command(BaseCommand):
 
             url = system_settings.exchange_rate_api_url()
             try:
-                api_bcv, api_parallel, provider = fetch_rates(url)
+                api_bcv, api_eur, api_parallel, provider = fetch_rates(url)
                 bcv = bcv or api_bcv
+                eur = eur or api_eur
                 parallel = parallel or api_parallel
                 self.stdout.write(self.style.SUCCESS(
-                    f"Fuente ({provider}): BCV={bcv}, Paralela={parallel}"
+                    f"Fuente ({provider}): Dólar BCV={bcv}, Euro BCV={eur}, Paralelo={parallel}"
                 ))
             except Exception as exc:  # red, parseo, timeout: no abortamos
                 logger.warning("No se pudo obtener la tasa automáticamente: %s", exc)
                 self.stderr.write(self.style.WARNING(
                     f"No se pudo obtener la tasa: {exc}. "
-                    "Pasa --bcv/--parallel para cargarla manualmente."
+                    "Pasa --bcv/--eur/--parallel para cargarla manualmente."
                 ))
 
         if bcv is None:
             self.stderr.write(self.style.ERROR(
-                "Sin tasa BCV (ni de la API ni manual); no se cargó nada."
+                "Sin tasa Dólar BCV (ni de la API ni manual); no se cargó nada."
             ))
             return
 
@@ -299,11 +327,13 @@ class Command(BaseCommand):
             date=target_date,
             defaults={
                 "bcv_rate": bcv,
+                "eur_bcv_rate": eur,
                 "parallel_rate": parallel,
                 "source": ExchangeRate.SourceChoices.BCV,
             },
         )
         verb = "creada" if created else "actualizada"
         self.stdout.write(self.style.SUCCESS(
-            f"Tasa {verb} {rate.date}: BCV={rate.bcv_rate} | Paralela={rate.parallel_rate}"
+            f"Tasa {verb} {rate.date}: Dólar BCV={rate.bcv_rate} | "
+            f"Euro BCV={rate.eur_bcv_rate} | Paralelo={rate.parallel_rate}"
         ))

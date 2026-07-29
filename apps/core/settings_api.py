@@ -166,6 +166,7 @@ def _meta_block() -> dict:
         "latest_rate": None if rate is None else {
             "date": rate.date.isoformat(),
             "bcv_rate": str(rate.bcv_rate),
+            "eur_bcv_rate": str(rate.eur_bcv_rate) if rate.eur_bcv_rate is not None else None,
             "parallel_rate": str(rate.parallel_rate) if rate.parallel_rate is not None else None,
             "effective_rate": str(eff) if eff is not None else None,
             "source": rate.source,
@@ -238,6 +239,7 @@ def _rate_payload(rate, freshness=None):
     payload = {
         "date": rate.date.isoformat(),
         "bcv_rate": str(rate.bcv_rate),
+        "eur_bcv_rate": str(rate.eur_bcv_rate) if rate.eur_bcv_rate is not None else None,
         "parallel_rate": str(rate.parallel_rate) if rate.parallel_rate is not None else None,
         "effective_rate": str(eff) if eff is not None else None,
         "rate_basis": system_settings.rate_basis(),
@@ -252,21 +254,23 @@ def _rate_payload(rate, freshness=None):
 
 
 class ExchangeRateSetView(APIView):
-    """POST /api/settings/exchange-rate — carga MANUAL de la tasa (Admin).
+    """POST /api/settings/exchange-rate — carga MANUAL de las tasas (Admin).
 
-    Cuerpo: ``{"bcv": "36.5", "parallel": "40", "date": "YYYY-MM-DD"}`` (parallel y
-    date opcionales). Hace upsert de la ``ExchangeRate`` del día y reevalúa la alerta
-    de frescura.
+    Cuerpo: ``{"bcv": "36.5", "eur": "39.4", "parallel": "40", "date": "YYYY-MM-DD"}``
+    (``eur``, ``parallel`` y ``date`` opcionales). ``bcv`` es el **Dólar BCV** (Bs/USD) y
+    ``eur`` el **Euro BCV** (Bs/EUR), ambas operativas; ``parallel`` es referencial. Hace
+    upsert de la ``ExchangeRate`` del día y reevalúa la alerta de frescura.
     """
 
     permission_classes = [IsAdmin]
 
     def post(self, request):
         bcv = _to_decimal(request.data.get("bcv"))
+        eur = _to_decimal(request.data.get("eur"))
         parallel = _to_decimal(request.data.get("parallel"))
         if bcv is None:
             return Response(
-                {"error": "La tasa BCV es obligatoria y debe ser un número."},
+                {"error": "La tasa Dólar BCV es obligatoria y debe ser un número."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -285,6 +289,7 @@ class ExchangeRateSetView(APIView):
             date=target_date,
             defaults={
                 "bcv_rate": bcv,
+                "eur_bcv_rate": eur,
                 "parallel_rate": parallel,
                 "source": ExchangeRate.SourceChoices.BCV,
             },
@@ -294,13 +299,17 @@ class ExchangeRateSetView(APIView):
             request=request,
             action=ActionChoices.RATE_UPDATE,
             description=(
-                f"Cargó manualmente la tasa de cambio del {target_date.isoformat()}: "
-                f"BCV {bcv}" + (f", Euro BCV {parallel}" if parallel is not None else "") + "."
+                f"Cargó manualmente las tasas del {target_date.isoformat()}: "
+                f"Dólar BCV {bcv}"
+                + (f", Euro BCV {eur}" if eur is not None else "")
+                + (f", Paralelo {parallel}" if parallel is not None else "")
+                + "."
             ),
             target=rate,
             metadata={
                 "date": target_date.isoformat(),
                 "bcv": str(bcv),
+                "eur": str(eur) if eur is not None else None,
                 "parallel": str(parallel) if parallel is not None else None,
                 "manual": True,
             },
@@ -319,8 +328,8 @@ class ExchangeRateFetchView(APIView):
         url = system_settings.exchange_rate_api_url()
         try:
             # Prioriza la librería pyDolarVenezuela; cae a la API HTTP solo si la
-            # librería no consigue la BCV.
-            bcv, parallel, provider = fetch_rates(url)
+            # librería no consigue el Dólar BCV.
+            bcv, eur, parallel, provider = fetch_rates(url)
         except Exception as exc:  # red, parseo, timeout (respaldo HTTP)
             return Response(
                 {"error": f"No se pudo obtener la tasa: {exc}", "api_url": url},
@@ -328,7 +337,7 @@ class ExchangeRateFetchView(APIView):
             )
         if bcv is None:
             return Response(
-                {"error": "No se obtuvo una tasa BCV válida de ninguna fuente.", "api_url": url},
+                {"error": "No se obtuvo una tasa Dólar BCV válida de ninguna fuente.", "api_url": url},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
@@ -336,6 +345,7 @@ class ExchangeRateFetchView(APIView):
             date=date.today(),
             defaults={
                 "bcv_rate": bcv,
+                "eur_bcv_rate": eur,
                 "parallel_rate": parallel,
                 "source": ExchangeRate.SourceChoices.BCV,
             },
@@ -347,13 +357,16 @@ class ExchangeRateFetchView(APIView):
             request=request,
             action=ActionChoices.RATE_UPDATE,
             description=(
-                f"Actualizó la tasa de cambio desde la fuente «{provider}»: BCV {bcv}"
-                + (f", Euro BCV {parallel}" if parallel is not None else "") + "."
+                f"Actualizó las tasas desde la fuente «{provider}»: Dólar BCV {bcv}"
+                + (f", Euro BCV {eur}" if eur is not None else "")
+                + (f", Paralelo {parallel}" if parallel is not None else "")
+                + "."
             ),
             target=rate,
             metadata={
                 "date": rate.date.isoformat(),
                 "bcv": str(bcv),
+                "eur": str(eur) if eur is not None else None,
                 "parallel": str(parallel) if parallel is not None else None,
                 "provider": provider,
                 "manual": False,

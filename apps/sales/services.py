@@ -164,6 +164,7 @@ def create_sale(
         installation_cost_usd=installation_cost,
         delivery_cost_usd=delivery_cost,
         bcv_rate=rate.bcv_rate if rate else None,
+        eur_bcv_rate=rate.eur_bcv_rate if rate else None,
         parallel_rate=rate.parallel_rate if rate else None,
     )
 
@@ -679,6 +680,7 @@ def create_quote(
         issued_date=issued_date,
         expiry_date=expiry_date,
         bcv_rate=rate.bcv_rate if rate else None,
+        eur_bcv_rate=rate.eur_bcv_rate if rate else None,
         parallel_rate=rate.parallel_rate if rate else None,
         includes_installation=installation_cost > 0,
         includes_delivery=delivery_cost > 0,

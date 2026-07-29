@@ -192,26 +192,34 @@ def exchange_rate_api_url() -> str:
 
 
 def rate_basis() -> str:
-    return get_settings().rate_basis or "PAR"
+    return get_settings().rate_basis or "BCV"
 
 
 def effective_rate(rate) -> Decimal | None:
-    """Tasa para convertir USD→VES según ``rate_basis`` (paralela / BCV / promedio).
+    """Tasa para convertir USD→VES según ``rate_basis``.
 
-    ``rate`` es un ``ExchangeRate`` (o None). Degrada con tolerancia: si la base
-    elegida no tiene valor, cae a la otra disponible.
+    Bases posibles: ``BCV`` (Dólar BCV, por defecto), ``EUR`` (Euro BCV), ``PAR``
+    (paralelo, referencial) y ``AVG`` (promedio Dólar BCV/paralelo). Las dos oficiales
+    son las **operativas** (con las que se factura); el paralelo se conserva como base
+    elegible pero su papel principal es analítico.
+
+    ``rate`` es un ``ExchangeRate`` (o None). Degrada con tolerancia: si la base elegida
+    no tiene valor cargado, cae al Dólar BCV y, en su defecto, a la que haya.
     """
     if not rate:
         return None
     basis = rate_basis()
     bcv = rate.bcv_rate
+    eur = getattr(rate, "eur_bcv_rate", None)
     par = rate.parallel_rate
-    if basis == "BCV":
-        return bcv or par
+    if basis == "EUR":
+        return eur or bcv or par
+    if basis == "PAR":
+        return par or bcv
     if basis == "AVG" and bcv is not None and par is not None:
         return (Decimal(bcv) + Decimal(par)) / Decimal("2")
-    # PARALLEL (default) o promedio sin ambas tasas: paralela y, si no, BCV.
-    return par or bcv
+    # BCV (por defecto) o promedio sin ambas tasas: Dólar BCV y, si no, lo que haya.
+    return bcv or par
 
 
 def default_iva_pct() -> Decimal:

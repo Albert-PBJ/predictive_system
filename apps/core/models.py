@@ -156,8 +156,9 @@ class ProductPriceHistory(models.Model):
     sale_price_usd = models.DecimalField(max_digits=10, decimal_places=2, help_text=_("Precio de venta en USD"))
     purchase_price_ves = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True, help_text=_("Precio de compra en Bolívares"))
     sale_price_ves = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True, help_text=_("Precio de venta en Bolívares"))
-    bcv_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa BCV oficial en el momento del cambio"))
-    parallel_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa paralela en el momento del cambio"))
+    bcv_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa Dólar BCV en el momento del cambio"))
+    eur_bcv_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa Euro BCV en el momento del cambio"))
+    parallel_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa paralela en el momento del cambio (referencial)"))
     changed_at = models.DateField(help_text=_("Fecha del cambio de precio"))
     reason = models.CharField(
         max_length=255, blank=True,
@@ -270,14 +271,21 @@ class ExchangeRate(models.Model):
         OTHER = "OTH", _("Otra Fuente")
 
     date = models.DateField(unique=True, help_text=_("Fecha de la tasa de cambio"))
+    # Las dos tasas OPERATIVAS (oficiales del BCV) con las que se factura, y la
+    # PARALELA, que es solo referencia analítica del valor real del dinero.
     bcv_rate = models.DecimalField(
         max_digits=12, decimal_places=4,
-        help_text=_("Tasa BCV oficial (Bs por 1 USD)"),
+        help_text=_("Tasa Dólar BCV oficial (Bs por 1 USD) — operativa"),
+    )
+    eur_bcv_rate = models.DecimalField(
+        max_digits=12, decimal_places=4,
+        null=True, blank=True,
+        help_text=_("Tasa Euro BCV oficial (Bs por 1 EUR) — operativa"),
     )
     parallel_rate = models.DecimalField(
         max_digits=12, decimal_places=4,
         null=True, blank=True,
-        help_text=_("Tasa paralela referencial (Bs por 1 USD)"),
+        help_text=_("Tasa paralela referencial (Bs por 1 USD) — solo análisis, no se factura con ella"),
     )
     source = models.CharField(max_length=3, choices=SourceChoices.choices, default=SourceChoices.BCV)
 
@@ -293,7 +301,10 @@ class ExchangeRate(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.date}: BCV={self.bcv_rate} | Paralela={self.parallel_rate}"
+        return (
+            f"{self.date}: Dólar BCV={self.bcv_rate} | Euro BCV={self.eur_bcv_rate} "
+            f"| Paralelo={self.parallel_rate}"
+        )
 
 
 # Clave de caché del singleton de configuración. Se busca/borra desde
@@ -321,14 +332,20 @@ class SystemSettings(models.Model):
     """
 
     class RateBasisChoices(models.TextChoices):
-        PARALLEL = "PAR", _("Paralela")
-        BCV = "BCV", _("BCV (oficial)")
-        AVERAGE = "AVG", _("Promedio BCV/Paralela")
+        BCV = "BCV", _("Dólar BCV (oficial)")
+        EUR_BCV = "EUR", _("Euro BCV (oficial)")
+        PARALLEL = "PAR", _("Paralelo (referencial)")
+        AVERAGE = "AVG", _("Promedio Dólar BCV/Paralelo")
 
     # ── Tasa de cambio ────────────────────────────────────────────────────────
+    # Dólar BCV y Euro BCV son las tasas OPERATIVAS (con las que se factura); el
+    # paralelo queda como referencia analítica del valor real del dinero.
     rate_basis = models.CharField(
-        max_length=3, choices=RateBasisChoices.choices, default=RateBasisChoices.PARALLEL,
-        help_text=_("Qué tasa usar para convertir USD→VES en ventas, presupuestos y reportes."),
+        max_length=3, choices=RateBasisChoices.choices, default=RateBasisChoices.BCV,
+        help_text=_(
+            "Qué tasa usar para convertir USD→VES en ventas, presupuestos y reportes. "
+            "Lo normal es una de las oficiales (Dólar BCV o Euro BCV)."
+        ),
     )
     rate_max_age_days = models.PositiveSmallIntegerField(
         default=2,

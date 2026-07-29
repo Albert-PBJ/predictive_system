@@ -220,9 +220,11 @@ def _build_narrative(start, end, cur, prev, type_split, no_demand_count, at_risk
             out.append(f"{len(at_risk)} de tus clientes llevan más de 6 meses sin comprarte (riesgo de fuga).")
         else:
             out.append(f"{len(at_risk)} clientes activos llevan más de 6 meses sin comprar (riesgo de fuga).")
+    # El paralelo es el termómetro del valor real del dinero: es el que explica las
+    # caídas de demanda, aunque no sea la tasa con la que se factura.
     if rate and rate.get("parallel_change_pct") is not None and abs(rate["parallel_change_pct"]) >= 5:
         out.append(
-            f"El Euro BCV varió {rate['parallel_change_pct']:+.0f}% en el periodo, "
+            f"El dólar paralelo varió {rate['parallel_change_pct']:+.0f}% en el periodo, "
             f"presionando la demanda."
         )
     return out[:5]
@@ -465,7 +467,7 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool, personal: bo
     # Contexto cambiario en el rango (explica caídas de demanda como el shock de ene-2026).
     rate_rows = list(
         ExchangeRate.objects.filter(date__gte=start, date__lte=end)
-        .values("date", "bcv_rate", "parallel_rate")
+        .values("date", "bcv_rate", "eur_bcv_rate", "parallel_rate")
         .order_by("date")
     )
     by_month_rate: dict[str, dict] = {}
@@ -476,6 +478,7 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool, personal: bo
             "period": p,
             "label": period_label(p),
             "bcv": _f(by_month_rate[p]["bcv_rate"]) if p in by_month_rate else None,
+            "eur": _f(by_month_rate[p]["eur_bcv_rate"]) if p in by_month_rate else None,
             "parallel": _f(by_month_rate[p]["parallel_rate"]) if p in by_month_rate else None,
         }
         for p in periods
@@ -486,9 +489,12 @@ def executive_dashboard(start: date, end: date, *, sensitive: bool, personal: bo
         exchange_rate = {
             "start_bcv": _f(lo["bcv_rate"]),
             "end_bcv": _f(hi["bcv_rate"]),
+            "start_eur": _f(lo["eur_bcv_rate"]),
+            "end_eur": _f(hi["eur_bcv_rate"]),
             "start_parallel": _f(lo["parallel_rate"]),
             "end_parallel": _f(hi["parallel_rate"]),
             "bcv_change_pct": _pct(_f(hi["bcv_rate"]), _f(lo["bcv_rate"])),
+            "eur_change_pct": _pct(_f(hi["eur_bcv_rate"]), _f(lo["eur_bcv_rate"])),
             "parallel_change_pct": _pct(_f(hi["parallel_rate"]), _f(lo["parallel_rate"])),
             "series": rate_series,
         }

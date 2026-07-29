@@ -102,9 +102,11 @@ class Sale(models.Model):
         help_text=_("Comisión generada (% de la utilidad según tasa del vendedor)"),
     )
 
-    # Tasas de cambio vigentes al momento de la venta
-    bcv_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa BCV al momento de la venta"))
-    parallel_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa paralela al momento de la venta"))
+    # Tasas de cambio vigentes al momento de la venta (las dos oficiales operativas +
+    # el paralelo, que se guarda solo como referencia analítica del valor del dinero).
+    bcv_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa Dólar BCV al momento de la venta"))
+    eur_bcv_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa Euro BCV al momento de la venta"))
+    parallel_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa paralela al momento de la venta (referencial)"))
 
     status = models.CharField(max_length=4, choices=StatusChoices.choices, default=StatusChoices.COMPLETED)
     notes = models.TextField(blank=True)
@@ -281,8 +283,9 @@ class Quote(models.Model):
     issued_date = models.DateField(help_text=_("Fecha de emisión del presupuesto"))
     expiry_date = models.DateField(null=True, blank=True, help_text=_("Fecha de vencimiento del presupuesto"))
 
-    bcv_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa BCV vigente al emitir"))
-    parallel_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa paralela vigente al emitir"))
+    bcv_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa Dólar BCV vigente al emitir"))
+    eur_bcv_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa Euro BCV vigente al emitir"))
+    parallel_rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True, help_text=_("Tasa paralela vigente al emitir (referencial)"))
 
     includes_installation = models.BooleanField(default=False, help_text=_("¿El presupuesto incluye servicio de instalación?"))
     includes_delivery = models.BooleanField(default=False, help_text=_("¿El presupuesto incluye despacho/flete?"))

@@ -203,6 +203,41 @@ PREMIUM_ANCHORS = [
 ]
 
 # --------------------------------------------------------------------------- #
+#  Tasa EURO BCV (Bs por 1 EUR) — la otra tasa OFICIAL/operativa.             #
+#                                                                             #
+#  El BCV publica el euro como una cruzada de su tasa del dólar por la paridad #
+#  EUR/USD del mercado, así que aquí se modela igual: euro = Dólar BCV ×       #
+#  paridad del mes. Los valores son REALES:                                    #
+#   · jun-2025 → jul-2026 se derivan de pares oficiales BCV publicados         #
+#     (p. ej. 2025-12: USD 298,14 y EUR 351,24 → 1,1781; 2026-01: USD 301,37   #
+#     y EUR 354,49 → 1,1763; 2026-06: USD 554,42 y EUR 645,67 → 1,1646).       #
+#   · 2022-01 → 2025-05 usan la paridad EUR/USD real de mercado de cada mes    #
+#     (incluida la caída bajo la paridad de sep-oct 2022, ~0,98).              #
+#                                                                             #
+#  IMPORTANTE: esto NO toca `bcv_rate` ni `parallel_rate`, así que las series  #
+#  que consumen los modelos (y su `shock_cambiario`, calculado sobre el        #
+#  paralelo) quedan idénticas: las métricas predictivas no se mueven.          #
+# --------------------------------------------------------------------------- #
+EUR_USD_PARITY = {
+    "2022-01": 1.131, "2022-02": 1.134, "2022-03": 1.101, "2022-04": 1.082,
+    "2022-05": 1.058, "2022-06": 1.057, "2022-07": 1.018, "2022-08": 1.012,
+    "2022-09": 0.990, "2022-10": 0.983, "2022-11": 1.021, "2022-12": 1.059,
+    "2023-01": 1.078, "2023-02": 1.072, "2023-03": 1.070, "2023-04": 1.096,
+    "2023-05": 1.087, "2023-06": 1.084, "2023-07": 1.107, "2023-08": 1.091,
+    "2023-09": 1.068, "2023-10": 1.056, "2023-11": 1.081, "2023-12": 1.089,
+    "2024-01": 1.091, "2024-02": 1.079, "2024-03": 1.087, "2024-04": 1.073,
+    "2024-05": 1.081, "2024-06": 1.076, "2024-07": 1.084, "2024-08": 1.101,
+    "2024-09": 1.110, "2024-10": 1.090, "2024-11": 1.063, "2024-12": 1.047,
+    "2025-01": 1.035, "2025-02": 1.041, "2025-03": 1.081, "2025-04": 1.135,
+    "2025-05": 1.129,
+    # Desde aquí, paridades medidas sobre pares oficiales BCV reales (USD y EUR).
+    "2025-06": 1.1514, "2025-07": 1.1588, "2025-08": 1.1613, "2025-09": 1.1773,
+    "2025-10": 1.1614, "2025-11": 1.1552, "2025-12": 1.1781,
+    "2026-01": 1.1763, "2026-02": 1.1872, "2026-03": 1.1741, "2026-04": 1.1520,
+    "2026-05": 1.1726, "2026-06": 1.1646, "2026-07": 1.1420,
+}
+
+# --------------------------------------------------------------------------- #
 #  Trayectorias de negocio por segmento (detal vs institucional/proyectos).    #
 #  El relato: el DETAL se estanca y cae (clientes pequeños se van a la          #
 #  competencia más barata), mientras lo INSTITUCIONAL (proyectos) crece y       #
@@ -607,12 +642,31 @@ class RateModel:
                 return v0 + (v1 - v0) * t
         return p[-1][1]
 
+    @staticmethod
+    def eur_parity(d: date) -> float:
+        """Paridad EUR/USD del mes (real). Fuera de rango, el extremo más cercano."""
+        key = f"{d.year:04d}-{d.month:02d}"
+        if key in EUR_USD_PARITY:
+            return EUR_USD_PARITY[key]
+        keys = sorted(EUR_USD_PARITY)
+        return EUR_USD_PARITY[keys[0] if key < keys[0] else keys[-1]]
+
+    def eur(self, d: date) -> float:
+        """Tasa Euro BCV (Bs por 1 EUR) = Dólar BCV × paridad EUR/USD del mes."""
+        return self.bcv(d) * self.eur_parity(d)
+
     def for_date(self, d: date):
         """Devuelve (bcv, paralela) como Decimal(4) para una fecha dada."""
         if d == TODAY_RATE[0]:
             return TODAY_RATE[1], TODAY_RATE[2]
         bcv = self.bcv(d)
         return d4(bcv), d4(bcv * self.premium(d))
+
+    def eur_for_date(self, d: date):
+        """Tasa Euro BCV como Decimal(4). Se deriva del Dólar BCV vigente ese día, así
+        que es consistente con la serie oficial sin alterarla."""
+        bcv = TODAY_RATE[1] if d == TODAY_RATE[0] else d4(self.bcv(d))
+        return d4(float(bcv) * self.eur_parity(d))
 
 
 def price_factor(d: date) -> Decimal:
@@ -738,11 +792,13 @@ class Command(BaseCommand):
 
         # Modo actualización: no borra ni regenera; solo aplica sobre los datos
         # existentes las actualizaciones idempotentes (facturación + enlace de
-        # presupuestos). No necesita los recursos ni toca el catálogo/clientes/ventas.
+        # presupuestos + relleno del Euro BCV). No necesita los recursos ni toca el
+        # catálogo/clientes/ventas, así que las métricas predictivas no se mueven.
         if opt.get("update_only"):
             self.stdout.write(self.style.MIGRATE_HEADING(
                 "Modo actualización (--update-only): no se borra ni regenera nada."))
             with transaction.atomic():
+                self._backfill_eur_rates()
                 self._link_and_invoice_sales()
             self.stdout.write(self.style.SUCCESS("Actualización completada."))
             return
@@ -761,6 +817,9 @@ class Command(BaseCommand):
             self._import_customers(openpyxl, res, opt["max_customers"])
             sellers = self._ensure_sellers()
             self._build_exchange_rates()
+            # Completa el Euro BCV en tasas preexistentes (p. ej. cargadas a mano o por
+            # `fetch_exchange_rate` antes de que existiera el campo).
+            self._backfill_eur_rates()
 
             active = self._active_customer_pool()
             admin = User.objects.filter(is_superuser=True).order_by("id").first()
@@ -1108,13 +1167,50 @@ class Command(BaseCommand):
         for key in sorted(BCV_ANCHORS):
             d = date(int(key[:4]), int(key[5:]), 1)
             bcv, par = self.rates.for_date(d)
-            objs.append(ExchangeRate(date=d, bcv_rate=d4(BCV_ANCHORS[key]),
+            # El Euro BCV se cruza sobre el ANCLA de dólar de ese mes (no sobre la
+            # interpolación), para que el par dólar/euro sea el oficial de la fecha.
+            eur = d4(BCV_ANCHORS[key] * self.rates.eur_parity(d))
+            objs.append(ExchangeRate(date=d, bcv_rate=d4(BCV_ANCHORS[key]), eur_bcv_rate=eur,
                                      parallel_rate=par, source=ExchangeRate.SourceChoices.BCV))
         # Fila del día de hoy con el dato real actual.
         objs.append(ExchangeRate(date=TODAY_RATE[0], bcv_rate=TODAY_RATE[1],
-                                 parallel_rate=TODAY_RATE[2], source=ExchangeRate.SourceChoices.BCV))
+                                 eur_bcv_rate=self.rates.eur_for_date(TODAY_RATE[0]),
+                                 parallel_rate=TODAY_RATE[2],
+                                 source=ExchangeRate.SourceChoices.BCV))
         ExchangeRate.objects.bulk_create(objs, ignore_conflicts=True)
-        self.stdout.write(self.style.SUCCESS(f"Tasas de cambio: {len(objs)} (2022 a hoy)."))
+        self.stdout.write(self.style.SUCCESS(
+            f"Tasas de cambio: {len(objs)} (2022 a hoy) — Dólar BCV, Euro BCV y paralelo."))
+
+    def _backfill_eur_rates(self):
+        """Rellena el **Euro BCV** donde falte: en las tasas y en las fotos que guardan
+        ventas, presupuestos e historial de precios.
+
+        Pensado para bases ya cargadas (y para ``--update-only``): cruza el Dólar BCV ya
+        guardado en cada fila con la paridad EUR/USD **real** de ese mes. Solo escribe la
+        columna nueva: no toca ``bcv_rate``, ``parallel_rate`` ni ningún importe, así que
+        ninguna serie que consuman los modelos cambia y las métricas quedan intactas.
+        """
+        def _fill(model, date_field, label):
+            pending = list(
+                model.objects.filter(eur_bcv_rate__isnull=True, bcv_rate__isnull=False)
+                .only("id", date_field, "bcv_rate")
+            )
+            for row in pending:
+                row.eur_bcv_rate = d4(
+                    float(row.bcv_rate) * self.rates.eur_parity(getattr(row, date_field))
+                )
+            if pending:
+                model.objects.bulk_update(pending, ["eur_bcv_rate"], batch_size=500)
+            return f"{len(pending)} {label}"
+
+        done = [
+            _fill(ExchangeRate, "date", "tasa(s)"),
+            _fill(Sale, "sale_date", "venta(s)"),
+            _fill(Quote, "issued_date", "presupuesto(s)"),
+            _fill(ProductPriceHistory, "changed_at", "cambio(s) de precio"),
+        ]
+        self.stdout.write(self.style.SUCCESS(
+            "Euro BCV completado (cruce Dólar BCV × paridad EUR/USD real): " + ", ".join(done) + "."))
 
     # ----------------------------------------------------------- ventas ---- #
     def _make_sale_dict(self, d, customer, seller, items_spec, *, sale_type, status=None):
@@ -1147,10 +1243,13 @@ class Command(BaseCommand):
         return dict(customer=customer, seller=seller, sale_date=d, sale_type=sale_type,
                     status=status, total_sale_usd=d2(total_sale), total_cost_usd=d2(total_cost),
                     total_profit_usd=profit, total_discount_usd=d2(total_disc),
-                    total_sale_ves=d2(total_sale * par), commission_usd=commission,
+                    # Los importes en Bs se calculan con la tasa OPERATIVA (Dólar BCV),
+                    # igual que los presupuestos; el paralelo solo se guarda de referencia.
+                    total_sale_ves=d2(total_sale * bcv), commission_usd=commission,
                     iva_rate=iva_rate, iva_amount_usd=iva_amount,
-                    total_with_iva_usd=total_with_iva, total_with_iva_ves=d2(total_with_iva * par),
-                    bcv_rate=bcv, parallel_rate=par, items=items)
+                    total_with_iva_usd=total_with_iva, total_with_iva_ves=d2(total_with_iva * bcv),
+                    bcv_rate=bcv, eur_bcv_rate=self.rates.eur_for_date(d), parallel_rate=par,
+                    items=items)
 
     def _basket(self, d, segment):
         """Cesta verosímil según el segmento.
@@ -1415,7 +1514,8 @@ class Command(BaseCommand):
                 rows.append(ProductPriceHistory(
                     product=p, purchase_price_usd=buy, sale_price_usd=sell,
                     purchase_price_ves=d2(buy * bcv), sale_price_ves=d2(sell * bcv),
-                    bcv_rate=bcv, parallel_rate=par, changed_at=pd,
+                    bcv_rate=bcv, eur_bcv_rate=self.rates.eur_for_date(pd),
+                    parallel_rate=par, changed_at=pd,
                     reason=rng.choice(PRICE_HISTORY_REASONS)))
         ProductPriceHistory.objects.bulk_create(rows, batch_size=1000)
         self.stdout.write(self.style.SUCCESS(f"Historial de precios: {len(rows)} registros."))
@@ -1680,7 +1780,8 @@ class Command(BaseCommand):
                 rows.append(ProductPriceHistory(
                     product=p, purchase_price_usd=buy, sale_price_usd=sell,
                     purchase_price_ves=d2(buy * bcv), sale_price_ves=d2(sell * bcv),
-                    bcv_rate=bcv, parallel_rate=par, changed_at=pd_,
+                    bcv_rate=bcv, eur_bcv_rate=self.rates.eur_for_date(pd_),
+                    parallel_rate=par, changed_at=pd_,
                     reason="Actualización de lista de precios"))
         ProductPriceHistory.objects.bulk_create(rows, batch_size=1000)
 
@@ -1850,7 +1951,7 @@ class Command(BaseCommand):
             quote_objs.append(Quote(
                 quote_number=number, customer=sp["customer"], seller=sp["seller"],
                 issued_date=issued, expiry_date=issued + timedelta(days=self.rng.randint(5, 15)),
-                bcv_rate=bcv, parallel_rate=par,
+                bcv_rate=bcv, eur_bcv_rate=self.rates.eur_for_date(issued), parallel_rate=par,
                 includes_installation=sp["installation"], includes_delivery=sp["delivery"],
                 subtotal_usd=d2(subtotal), subtotal_ves=d2(subtotal * bcv),
                 iva_rate=Decimal("16.00"), iva_amount_usd=iva,

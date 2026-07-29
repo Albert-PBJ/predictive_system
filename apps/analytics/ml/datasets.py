@@ -260,24 +260,31 @@ def sales_for_month(period: str):
 # Tasa de cambio
 # --------------------------------------------------------------------------- #
 def monthly_exchange_rate() -> pd.DataFrame:
-    """Serie mensual de la tasa BCV y paralela (último valor del mes, arrastrado).
+    """Serie mensual de las tres tasas (último valor del mes, arrastrado).
+
+    Columnas: ``bcv_rate`` (Dólar BCV), ``eur_bcv_rate`` (Euro BCV) y ``parallel_rate``
+    (paralelo, referencial). El **shock cambiario** que consumen los modelos se sigue
+    calculando sobre el paralelo (``_rate_shock_map``): es la tasa que refleja el valor
+    real del dinero y por tanto la que explica las caídas de demanda.
 
     Respeta la fecha de corte del entrenamiento (ver ``training_cutoff``)."""
     qs = ExchangeRate.objects.all()
     cutoff = training_cutoff()
     if cutoff:
         qs = qs.filter(date__lte=cutoff)
-    rows = list(qs.values("date", "bcv_rate", "parallel_rate").order_by("date"))
+    rows = list(qs.values("date", "bcv_rate", "eur_bcv_rate", "parallel_rate").order_by("date"))
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     df["period"] = df["date"].map(period_of)
-    df["bcv_rate"] = df["bcv_rate"].astype(float)
-    df["parallel_rate"] = df["parallel_rate"].astype(float)
+    for col in ("bcv_rate", "eur_bcv_rate", "parallel_rate"):
+        df[col] = df[col].astype(float)
     # Último valor de cada mes (las filas ya vienen ordenadas por fecha).
     df = df.groupby("period", as_index=False).last()
-    df = df[["period", "bcv_rate", "parallel_rate"]]
-    return _reindex_monthly(df, {"bcv_rate": "ffill", "parallel_rate": "ffill"})
+    df = df[["period", "bcv_rate", "eur_bcv_rate", "parallel_rate"]]
+    return _reindex_monthly(
+        df, {"bcv_rate": "ffill", "eur_bcv_rate": "ffill", "parallel_rate": "ffill"}
+    )
 
 
 def exchange_rate_for_month(period: str):
